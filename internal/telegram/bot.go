@@ -57,6 +57,7 @@ func NewBot(cfg BotCfg) *Bot {
 // Run запускает long polling до отмены ctx.
 func (b *Bot) Run(ctx context.Context) error {
 	if err := b.api.SetMyCommands(ctx, []BotCommand{
+		{Command: "start", Description: "Показать статус моделей"},
 		{Command: "status", Description: "Общий статус всех моделей"},
 		{Command: "subscribe", Description: "Настройка уведомлений"},
 		{Command: "help", Description: "Справка"},

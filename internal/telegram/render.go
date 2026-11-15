@@ -16,12 +16,13 @@ var MSK = time.FixedZone("MSK", 3*60*60)
 
 const (
 	absent      = "N/A"
-	maxPanelErr = 80 // максимальная длина сообщения провайдера в строке панели
+	maxPanelErr = 30 // панель — одна строка на десктопе; полный текст в /status model-id
 )
 
 func fmtClockMSK(t time.Time) string { return t.In(MSK).Format("15:04:05") }
 
-func fmtSecs(us int64) string { return fmt.Sprintf("%.2fs", float64(us)/1e6) }
+func fmtSecs(us int64) string  { return fmt.Sprintf("%.2fs", float64(us)/1e6) }
+func fmtSecs1(us int64) string { return fmt.Sprintf("%.1fs", float64(us)/1e6) }
 
 // EscapeHTML экранирует любые внешние строки перед отправкой в Telegram.
 func EscapeHTML(s string) string { return html.EscapeString(s) }
@@ -80,9 +81,9 @@ func modelLine(m storage.Model, c storage.Check) string {
 	case c.ErrorType == "notfound":
 		return emoji + " " + EscapeHTML(m.ID) + " — нет модели"
 	case c.ErrorType == "perf":
-		return emoji + " " + EscapeHTML(m.ID) + " — " + metricsTail(c) + " | деградация производительности"
+		return emoji + " " + EscapeHTML(m.ID) + " — " + metricsTail(c) + "·деградация"
 	case c.ErrorType == "empty":
-		return emoji + " " + EscapeHTML(m.ID) + " — HTTP 200 | пустая генерация"
+		return emoji + " " + EscapeHTML(m.ID) + " — HTTP 200·пустая генерация"
 	case c.ErrorType != "":
 		return emoji + " " + EscapeHTML(m.ID) + " — " + errorHead(c)
 	default:
@@ -109,32 +110,33 @@ func errorHead(c storage.Check) string {
 		return head
 	}
 	msg := trunc(oneLine(c.ErrorMessage), maxPanelErr)
-	return head + " | " + EscapeHTML(msg)
+	return head + "·" + EscapeHTML(msg)
 }
 
 func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-// metricsTail — метрики успешной/деградировавшей по производительности модели.
+// metricsTail — компактные метрики строки панели: разделитель «·»,
+// одна десятичная секунды, токены «in/out» без слов (полные подписи — ТЗ §8).
 func metricsTail(c storage.Check) string {
 	var parts []string
 	if c.LatencyUS != nil {
-		parts = append(parts, fmtSecs(*c.LatencyUS))
+		parts = append(parts, fmtSecs1(*c.LatencyUS))
 	} else {
 		parts = append(parts, absent)
 	}
 	if c.TTFTUS != nil {
-		parts = append(parts, "TTFT "+fmtSecs(*c.TTFTUS))
+		parts = append(parts, "TTFT "+fmtSecs1(*c.TTFTUS))
 	} else {
 		parts = append(parts, "TTFT "+absent)
 	}
 	tps, _ := f64Ptr(c.TPS)
 	parts = append(parts, tps+" TPS")
 	if c.InputTokens != nil && c.OutputTokens != nil {
-		parts = append(parts, fmt.Sprintf("%d in / %d out", *c.InputTokens, *c.OutputTokens))
+		parts = append(parts, fmt.Sprintf("%d/%d", *c.InputTokens, *c.OutputTokens))
 	}
-	return strings.Join(parts, " | ")
+	return strings.Join(parts, "·")
 }
 
 // detailErrorLine — полная строка последней ошибки (без обрезки).
@@ -294,23 +296,16 @@ func RenderSubscribePanel(models []storage.Model, subscribed map[string]bool) (s
 	b.WriteString("Выберите модели, об изменениях состояния\nкоторых хотите получать уведомления.\n")
 
 	rows := make([][]InlineButton, 0, len(models)+1)
-	family := ""
 	selected := 0
 	for i, m := range models {
-		if m.Family != family {
-			family = m.Family
-			b.WriteString("\n" + EscapeHTML(family) + "\n")
-		}
-		prefix := "  "
+		label := EscapeHTML(m.ID)
 		if subscribed[m.ID] {
-			prefix = "✓ "
+			label = "✓ " + label
 			selected++
 		}
-		b.WriteString(prefix + EscapeHTML(m.ID) + "\n")
-		rows = append(rows, []InlineButton{{
-			Text:         strings.TrimPrefix(prefix, "  ") + EscapeHTML(m.ID),
-			CallbackData: fmt.Sprintf("s:%d", i),
-		}})
+		rows = append(rows, []InlineButton{
+			{Text: label, CallbackData: fmt.Sprintf("s:%d", i)},
+		})
 	}
 	b.WriteString("\nВыбрано: " + pluralModels(selected))
 	rows = append(rows, []InlineButton{{Text: "Сохранить", CallbackData: "save"}})

@@ -359,9 +359,9 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 55, "s:0")); err != nil {
 		t.Fatal(err)
 	}
-	editText := fmt.Sprint(m.lastBody("editMessageText")["text"])
-	if !strings.Contains(editText, "✓ gpt-6-astra") {
-		t.Fatalf("toggle must be reflected: %q", editText)
+	editMarkup := fmt.Sprint(m.lastBody("editMessageText")["reply_markup"])
+	if !strings.Contains(editMarkup, "✓ gpt-6-astra") {
+		t.Fatalf("toggle must be reflected in the keyboard: %q", editMarkup)
 	}
 	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 55, "s:1")); err != nil {
 		t.Fatal(err)

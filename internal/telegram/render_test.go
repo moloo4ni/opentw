@@ -39,10 +39,10 @@ func TestPanelFormatSuccess(t *testing.T) {
 		"Следующая проверка: 16:30:00 MSK",
 		"",
 		"GPT",
-		"🟢 gpt-6-astra — 2.70s | TTFT 0.42s | 42.3 TPS | 154 in / 96 out",
+		"🟢 gpt-6-astra — 2.7s·TTFT 0.4s·42.3 TPS·154/96",
 		"",
 		"GLM",
-		"🟢 glm-5.3 — 4.20s | TTFT 0.63s | 54.1 TPS",
+		"🟢 glm-5.3 — 4.2s·TTFT 0.6s·54.1 TPS",
 	}
 	got := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	if len(got) != len(wantLines) {
@@ -93,17 +93,17 @@ func TestPanelErrorLinesAndNA(t *testing.T) {
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	for _, want := range []string{
-		"🟡 gpt-6-sol — HTTP 429 | Upstream rate limit",
+		"🟡 gpt-6-sol — HTTP 429·Upstream rate limit",
 		"🔴 glm-5.3-fast — нет модели",
 		"⚪ claude-opus-5 — ошибка монитора",
 		"🔴 un — Timeout",
-		"🟢 glm-5.3 — 3.10s | TTFT N/A | N/A TPS",
+		"🟢 glm-5.3 — 3.1s·TTFT N/A·N/A TPS",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("panel missing line %q\npanel:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "glm-5.3 — 3.10s | TTFT N/A | N/A TPS |") {
+	if strings.Contains(text, "glm-5.3 — 3.1s·TTFT N/A·N/A TPS·") {
 		t.Error("tokens block must be omitted when tokens are unknown")
 	}
 }
@@ -120,8 +120,8 @@ func TestPanelPerfDegradedAndEmptyAndNoData(t *testing.T) {
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	for _, want := range []string{
-		"🟡 a-perf — 30.00s | TTFT 3.00s | 12.3 TPS | деградация производительности",
-		"🟡 a-empty — HTTP 200 | пустая генерация",
+		"🟡 a-perf — 30.0s·TTFT 3.0s·12.3 TPS·деградация",
+		"🟡 a-empty — HTTP 200·пустая генерация",
 		"⚪ a-new — нет данных",
 	} {
 		if !strings.Contains(text, want) {
@@ -153,7 +153,7 @@ func TestPanelTruncatesLongError(t *testing.T) {
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	lineIdx := strings.Index(text, "🔴 m —")
 	line := text[lineIdx:]
-	if strings.Count(line, "a") > 120 {
+	if strings.Count(line, "a") > 40 {
 		t.Fatalf("long error not truncated: %s", line)
 	}
 	if !strings.HasSuffix(strings.TrimSpace(line), "…") {
