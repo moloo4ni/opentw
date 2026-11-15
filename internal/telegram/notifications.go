@@ -92,8 +92,6 @@ func notifyErrorBody(c storage.Check) string {
 			line += "\n" + EscapeHTML(oneLine(c.ErrorMessage))
 		}
 		b.WriteString(line)
-	case "notfound":
-		b.WriteString("нет модели")
 	case "empty":
 		b.WriteString("HTTP 200\nпустая генерация")
 	case "timeout":

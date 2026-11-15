@@ -39,10 +39,10 @@ func TestPanelFormatSuccess(t *testing.T) {
 		"Следующая проверка: 16:30:00 MSK",
 		"",
 		"<b>GPT</b>",
-		"🟢 <code>gpt-6-astra</code> - 2.7s | TTFT 0.4s | 42.3 TPS | 154/96",
+		"🟢 <code>gpt-6-astra</code> - 2.7s | 42.3 TPS | 154/96",
 		"",
 		"<b>GLM</b>",
-		"🟢 <code>glm-5.3</code> - 4.2s | TTFT 0.6s | 54.1 TPS",
+		"🟢 <code>glm-5.3</code> - 4.2s | 54.1 TPS",
 	}
 	got := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	if len(got) != len(wantLines) {
@@ -86,7 +86,7 @@ func TestPanelErrorLinesAndNA(t *testing.T) {
 	}
 	checks := map[string]storage.Check{
 		"gpt-6-sol":     {Status: status.Degraded, HTTPStatus: 429, ErrorType: "http", ErrorMessage: "Upstream rate limit"},
-		"glm-5.3-fast":  {Status: status.Down, ErrorType: "notfound", ErrorMessage: "нет модели"},
+		"glm-5.3-fast":  {Status: status.Down, HTTPStatus: 404, ErrorType: "http", ErrorMessage: "Invalid model."},
 		"claude-opus-5": {Status: status.Unknown, ErrorType: "invalid", ErrorMessage: "unparseable response body"},
 		"glm-5.3":       {Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(3_100_000)},
 		"un":            {Status: status.Down, ErrorType: "timeout", ErrorMessage: "context deadline exceeded"},
@@ -94,16 +94,16 @@ func TestPanelErrorLinesAndNA(t *testing.T) {
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	for _, want := range []string{
 		"🟡 <code>gpt-6-sol</code> - HTTP 429 | Upstream rate limit",
-		"🔴 <code>glm-5.3-fast</code> - нет модели",
+		"🔴 <code>glm-5.3-fast</code> - HTTP 404 | Invalid model.",
 		"⚪ <code>claude-opus-5</code> - ошибка монитора",
 		"🔴 <code>un</code> - Timeout",
-		"🟢 <code>glm-5.3</code> - 3.1s | TTFT N/A | N/A TPS",
+		"🟢 <code>glm-5.3</code> - 3.1s | N/A TPS",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("panel missing line %q\npanel:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "glm-5.3</code> - 3.1s | TTFT N/A | N/A TPS |") {
+	if strings.Contains(text, "glm-5.3</code> - 3.1s | N/A TPS |") {
 		t.Error("tokens block must be omitted when tokens are unknown")
 	}
 }
@@ -120,7 +120,7 @@ func TestPanelPerfDegradedAndEmptyAndNoData(t *testing.T) {
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	for _, want := range []string{
-		"🟡 <code>a-perf</code> - 30.0s | TTFT 3.0s | 12.3 TPS | деградация",
+		"🟡 <code>a-perf</code> - 30.0s | 12.3 TPS | деградация",
 		"🟡 <code>a-empty</code> - HTTP 200 | пустая генерация",
 		"⚪ <code>a-new</code> - нет данных",
 	} {

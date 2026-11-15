@@ -81,8 +81,6 @@ func modelLine(m storage.Model, c storage.Check) string {
 	emoji := c.Status.Emoji()
 
 	switch {
-	case c.ErrorType == "notfound":
-		return emoji + " " + codeID(m.ID) + " - нет модели"
 	case c.ErrorType == "perf":
 		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c) + " | деградация"
 	case c.ErrorType == "empty":
@@ -129,11 +127,6 @@ func metricsTail(c storage.Check) string {
 	} else {
 		parts = append(parts, absent)
 	}
-	if c.TTFTUS != nil {
-		parts = append(parts, "TTFT "+fmtSecs1(*c.TTFTUS))
-	} else {
-		parts = append(parts, "TTFT "+absent)
-	}
 	tps, _ := f64Ptr(c.TPS)
 	parts = append(parts, tps+" TPS")
 	if c.InputTokens != nil && c.OutputTokens != nil {
@@ -154,14 +147,12 @@ func detailErrorLine(c storage.Check) string {
 		head = "Connection refused"
 	case "invalid":
 		head = "Некорректный ответ API"
-	case "notfound":
-		head = "нет модели"
 	case "empty":
 		head = "HTTP 200 | пустая генерация"
 	default:
 		head = c.ErrorType
 	}
-	if c.ErrorMessage != "" && c.ErrorType != "notfound" && c.ErrorType != "invalid" && c.ErrorType != "empty" {
+	if c.ErrorMessage != "" && c.ErrorType != "invalid" && c.ErrorType != "empty" {
 		return head + " | " + EscapeHTML(oneLine(c.ErrorMessage))
 	}
 	return head

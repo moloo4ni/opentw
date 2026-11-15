@@ -48,9 +48,6 @@ func Classify(res api.RawResult) Status {
 			// Other 4xx: incompatible request/response shape — monitoring issue.
 			return StatusUnknown
 		}
-	case "notfound":
-		// Configured model disappeared from the API catalog.
-		return StatusDown
 	case "timeout", "connrefused":
 		return StatusDown
 	case "invalid":

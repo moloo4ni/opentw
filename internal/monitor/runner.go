@@ -181,13 +181,12 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 // checkModel runs one model check and records it; it returns the stored check
 // and, when a notifiable state change occurred, the transition.
 func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[string]bool, catalogOK bool, prev storage.Model, now time.Time) (storage.Check, *Transition, error) {
-	var raw *api.RawResult
 	if catalogOK && !catalog[m.ID] {
-		// Модель исчезла из каталога — генерирующий запрос не отправляем.
-		raw = &api.RawResult{ModelID: m.ID, Timestamp: now, ErrorKind: "notfound", ErrorMessage: "нет модели"}
-	} else {
-		raw = r.cfg.API.Generate(ctx, m.ID, r.cfg.MaxTokens)
+		// исчезла из каталога — проверяем всё равно: вердикт должен
+		// быть реальным ответом API, а не синтетической заглушкой
+		r.log.Warn("monitor: model missing from catalog, probing anyway", "model", m.ID)
 	}
+	raw := r.cfg.API.Generate(ctx, m.ID, r.cfg.MaxTokens)
 	if raw.ErrorKind == "cancelled" {
 		return storage.Check{}, nil, errCancelled
 	}
@@ -280,11 +279,11 @@ func (r *Runner) applyIncident(modelID string, prev, cur status.Status, at time.
 	return closed, opened
 }
 
-// measuredLatency returns the real measured latency or nil when no request
-// was made (catalog-absent model).
+// measuredLatency returns the measured latency of the real request.
 func (r *Runner) measuredLatency(raw *api.RawResult) *int64 {
-	if raw.ErrorKind == "notfound" {
-		return nil
+	if raw.ErrorKind == "" || raw.ErrorKind == "empty" || raw.ErrorKind == "http" || raw.ErrorKind == "timeout" || raw.ErrorKind == "connrefused" {
+		v := raw.LatencyUS
+		return &v
 	}
 	v := raw.LatencyUS
 	return &v

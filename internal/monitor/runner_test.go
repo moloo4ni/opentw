@@ -211,30 +211,28 @@ func TestDownToDegradedPartialRecovery(t *testing.T) {
 	}
 }
 
-func TestCatalogAbsenceSkipsGeneration(t *testing.T) {
+func TestCatalogAbsenceStillChecks(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"}) // model-b отсутствует в каталоге
-	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	f.hook = func(id string) *api.RawResult {
+		if id == "model-b" {
+			return errResult(id, 404, "Invalid model.")
+		}
+		return okResult(id, 1_000_000, 40)
+	}
 	r, _ := newRunner(t, f, basicModels())
 	res, err := r.RunCycle(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.calls("model-b") != 0 {
-		t.Fatalf("generation must not be called for catalog-absent model, got %d", f.calls("model-b"))
-	}
-	if f.calls("model-a") != 1 {
-		t.Fatal("present model must be checked once")
-	}
-	if len(res.Checks) != 2 {
-		t.Fatalf("absent model must still produce a check row: %+v", res.Checks)
+	if f.calls("model-b") != 1 {
+		t.Fatalf("absent model must get a real request, got %d calls", f.calls("model-b"))
 	}
 	last, _ := r.Store().LastChecks()
-	if last["model-b"].ErrorType != "notfound" {
-		t.Fatalf("absent model check = %+v", last["model-b"])
+	if last["model-b"].HTTPStatus != 404 || last["model-b"].ErrorMessage != "Invalid model." {
+		t.Fatalf("real API verdict must be recorded, got %+v", last["model-b"])
 	}
-	m, _ := r.Store().Model("model-b")
-	if m.LastStatus != StatusDown {
-		t.Fatalf("absent model status = %q", m.LastStatus)
+	if len(res.Checks) != 2 {
+		t.Fatalf("checks = %+v", res.Checks)
 	}
 }
 

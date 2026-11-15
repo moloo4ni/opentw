@@ -19,7 +19,7 @@ func TestPanelCompactOneLine(t *testing.T) {
 			InputTokens: ptr1(5), OutputTokens: ptr1(1)},
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
-	want := "🟢 <code>deepseek-v4.1-flash-1017</code> - 7.5s | TTFT 7.5s | 12.5 TPS | 5/1"
+	want := "🟢 <code>deepseek-v4.1-flash-1017</code> - 7.5s | 12.5 TPS | 5/1"
 	if !strings.Contains(text, want) {
 		t.Fatalf("compact line:\nwant: %q\ngot:  %q", want, text)
 	}
