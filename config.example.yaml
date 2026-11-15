@@ -1,0 +1,79 @@
+# OpenTW — конфигурация (без секретов; секреты только в .env).
+
+# Базовый URL API; ENV API_BASE_URL имеет приоритет над этим значением.
+api_base_url: https://kube943.prod.tonworld.ru
+
+# Интервал мониторинга (первый цикл стартует сразу после запуска).
+interval: 15m
+
+# HTTP timeout для одного запроса проверки.
+http_timeout: 60s
+
+# Максимум одновременных проверок моделей.
+concurrency: 4
+
+# Лимит выходных токенов тестового запроса (экономия квоты).
+max_tokens: 8
+
+# Использовать streaming (нужно для TTFT/TPS); false — только latency.
+streaming: true
+
+# Путь к SQLite.
+sqlite_path: opentw.db
+
+# Пороги деградации производительности: консервативные, по истории
+# конкретной модели; деградация не назначается при недостатке выборки.
+degradation:
+  # Минимум успешных измерений в истории для сравнения.
+  min_samples: 12
+  # Latency хуже p95 истории в столько раз — деградация.
+  latency_factor: 3.0
+  # TPS ниже доли от медианы истории — деградация.
+  tps_share: 0.4
+
+# Мониторируемые модели: точные model ID из каталога API, сгруппированные
+# по семействам для отображения. Модели, исчезнувшие из каталога,
+# показываются как недоступные («нет модели»). Новые модели добавляются
+# правкой этого списка (перечень берётся из GET /v1/models).
+models:
+  - family: GPT
+    ids:
+      - gpt-6-astra
+      - gpt-6.1-sol
+      - gpt-6-sol
+  - family: Claude
+    ids:
+      - claude-opus-5.5
+      - claude-fable-5.1
+      - claude-opus-5
+  - family: GLM
+    ids:
+      - glm-5.3
+      - glm-5.3-prime
+      - glm-5.3-flash
+      - glm-5.3-fast
+  - family: DeepSeek
+    ids:
+      - deepseek-v4.1-flash
+      - deepseek-v4-pro
+      - deepseek-v4.1-flash-1017
+  - family: Qwen
+    ids:
+      - qwen3.8-max
+      - qwen3.8-flash
+      - qwen3.8-omni-flash
+  - family: Kimi
+    ids:
+      - kimi-k3
+      - kimi-k2.6
+      - kimi-k2.5
+  - family: MiniMax
+    ids:
+      - minimax-m3
+      - minimax-m2.7
+      - minimax-m2.5
+  - family: Grok
+    ids:
+      - grok-4.7
+      - grok-4.6
+      - grok-4.5
