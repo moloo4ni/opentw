@@ -1,16 +1,19 @@
 // Package monitor orchestrates model checks and determines statuses.
 package monitor
 
-import "opentw/internal/api"
+import (
+	"opentw/internal/api"
+	"opentw/internal/status"
+)
 
-// Status is one of the four model states.
-type Status string
+// Status aliases the shared status type for monitor-internal use.
+type Status = status.Status
 
 const (
-	StatusOperational Status = "operational"
-	StatusDegraded    Status = "degraded"
-	StatusDown        Status = "down"
-	StatusUnknown     Status = "unknown"
+	StatusOperational = status.Operational
+	StatusDegraded    = status.Degraded
+	StatusDown        = status.Down
+	StatusUnknown     = status.Unknown
 )
 
 // Classify maps one raw check result to a status, per ТЗ §5.
@@ -40,39 +43,14 @@ func Classify(res api.RawResult) Status {
 			// Other 4xx: incompatible request/response shape — monitoring issue.
 			return StatusUnknown
 		}
+	case "notfound":
+		// Configured model disappeared from the API catalog.
+		return StatusDown
 	case "timeout", "connrefused":
 		return StatusDown
 	case "invalid":
 		return StatusUnknown
 	default:
 		return StatusUnknown
-	}
-}
-
-// Emoji returns the status icon shown in messages.
-func (s Status) Emoji() string {
-	switch s {
-	case StatusOperational:
-		return "🟢"
-	case StatusDegraded:
-		return "🟡"
-	case StatusDown:
-		return "🔴"
-	default:
-		return "⚪"
-	}
-}
-
-// Title returns the human status name for statuses.
-func (s Status) Title() string {
-	switch s {
-	case StatusOperational:
-		return "Operational"
-	case StatusDegraded:
-		return "Degraded"
-	case StatusDown:
-		return "Down"
-	default:
-		return "Unknown"
 	}
 }

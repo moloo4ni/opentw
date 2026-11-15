@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/monitor"
+	"opentw/internal/status"
 )
 
 func ptrInt64(v int64) *int64     { return &v }
@@ -74,14 +74,14 @@ func TestModelStateRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	at := time.Now()
-	if err := s.SetModelState("glm-5.3", monitor.StatusDown, "http", "Service Unavailable", at); err != nil {
+	if err := s.SetModelState("glm-5.3", status.Down, "http", "Service Unavailable", at); err != nil {
 		t.Fatal(err)
 	}
 	m, err := s.Model("glm-5.3")
 	if err != nil || m == nil {
 		t.Fatalf("model gone: %v %v", m, err)
 	}
-	if m.LastStatus != monitor.StatusDown || m.ErrorType != "http" || m.ErrorMessage != "Service Unavailable" {
+	if m.LastStatus != status.Down || m.ErrorType != "http" || m.ErrorMessage != "Service Unavailable" {
 		t.Fatalf("state = %+v", m)
 	}
 	if m.LastCheckAt == nil || !m.LastCheckAt.Equal(at) {
@@ -97,14 +97,14 @@ func TestChecksRoundtrip(t *testing.T) {
 	base := time.Now()
 	older := Check{
 		ModelID: "glm-5.3", At: base.Add(-2 * time.Hour), HTTPStatus: 200,
-		Status: monitor.StatusOperational, LatencyUS: ptrInt64(1_200_000), TPS: ptrFloat(42.0),
+		Status: status.Operational, LatencyUS: ptrInt64(1_200_000), TPS: ptrFloat(42.0),
 		InputTokens: ptrInt64(10), OutputTokens: ptrInt64(4),
 	}
 	newer := Check{
 		ModelID: "glm-5.3", At: base, HTTPStatus: 503,
-		Status: monitor.StatusDown, ErrorType: "http", ErrorMessage: "Service Unavailable",
+		Status: status.Down, ErrorType: "http", ErrorMessage: "Service Unavailable",
 	}
-	other := Check{ModelID: "kimi-k3", At: base, HTTPStatus: 200, Status: monitor.StatusOperational}
+	other := Check{ModelID: "kimi-k3", At: base, HTTPStatus: 200, Status: status.Operational}
 	for _, c := range []Check{older, newer, other} {
 		if err := s.InsertCheck(c); err != nil {
 			t.Fatal(err)
@@ -117,7 +117,7 @@ func TestChecksRoundtrip(t *testing.T) {
 	if last["glm-5.3"].HTTPStatus != 503 || last["glm-5.3"].ErrorMessage != "Service Unavailable" {
 		t.Fatalf("latest check wrong: %+v", last["glm-5.3"])
 	}
-	if last["kimi-k3"].Status != monitor.StatusOperational {
+	if last["kimi-k3"].Status != status.Operational {
 		t.Fatalf("other model check wrong: %+v", last["kimi-k3"])
 	}
 	if last["glm-5.3"].LatencyUS != nil {
@@ -136,8 +136,8 @@ func TestChecksRoundtrip(t *testing.T) {
 func TestDeleteOldChecks(t *testing.T) {
 	s := openTest(t)
 	now := time.Now()
-	old := Check{ModelID: "a", At: now.Add(-8 * 24 * time.Hour), Status: monitor.StatusDown}
-	fresh := Check{ModelID: "a", At: now.Add(-time.Hour), Status: monitor.StatusOperational}
+	old := Check{ModelID: "a", At: now.Add(-8 * 24 * time.Hour), Status: status.Down}
+	fresh := Check{ModelID: "a", At: now.Add(-time.Hour), Status: status.Operational}
 	for _, c := range []Check{old, fresh} {
 		if err := s.InsertCheck(c); err != nil {
 			t.Fatal(err)
@@ -223,21 +223,21 @@ func TestStatusMessages(t *testing.T) {
 func TestIncidents(t *testing.T) {
 	s := openTest(t)
 	start := time.Now()
-	if err := s.OpenIncident("glm-5.3", monitor.StatusOperational, start); err != nil {
+	if err := s.OpenIncident("glm-5.3", status.Operational, start); err != nil {
 		t.Fatal(err)
 	}
 	end := start.Add(30 * time.Minute)
-	inc, err := s.CloseIncident("glm-5.3", monitor.StatusDown, end)
+	inc, err := s.CloseIncident("glm-5.3", status.Down, end)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inc == nil || inc.From != monitor.StatusOperational || inc.To != monitor.StatusDown {
+	if inc == nil || inc.From != status.Operational || inc.To != status.Down {
 		t.Fatalf("incident = %+v", inc)
 	}
 	if inc.Duration != 30*time.Minute {
 		t.Fatalf("duration = %v", inc.Duration)
 	}
-	if err := s.OpenIncident("glm-5.3", monitor.StatusDown, end); err != nil {
+	if err := s.OpenIncident("glm-5.3", status.Down, end); err != nil {
 		t.Fatal(err)
 	}
 	if open, _ := s.HasOpenIncident("glm-5.3"); !open {
@@ -254,10 +254,10 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	if err := s.SyncModels([]Model{{ID: "glm-5.3", Family: "GLM"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetModelState("glm-5.3", monitor.StatusDegraded, "http", "Rate limited", time.Now()); err != nil {
+	if err := s.SetModelState("glm-5.3", status.Degraded, "http", "Rate limited", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertCheck(Check{ModelID: "glm-5.3", At: time.Now(), Status: monitor.StatusDegraded}); err != nil {
+	if err := s.InsertCheck(Check{ModelID: "glm-5.3", At: time.Now(), Status: status.Degraded}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetSubscription(300, "glm-5.3", true); err != nil {
@@ -266,7 +266,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	if err := s.SetStatusMessage(300, 999); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenIncident("glm-5.3", monitor.StatusOperational, time.Now()); err != nil {
+	if err := s.OpenIncident("glm-5.3", status.Operational, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -277,7 +277,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	}
 	defer s2.Close()
 	m, _ := s2.Model("glm-5.3")
-	if m == nil || m.LastStatus != monitor.StatusDegraded {
+	if m == nil || m.LastStatus != status.Degraded {
 		t.Fatalf("model state lost: %+v", m)
 	}
 	if subs, _ := s2.Subscriptions(300); len(subs) != 1 || subs[0] != "glm-5.3" {
@@ -286,7 +286,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	if sm, _ := s2.StatusMessage(300); sm == nil || sm.MessageID != 999 {
 		t.Fatalf("status message lost: %+v", sm)
 	}
-	if last, _ := s2.LastChecks(); last["glm-5.3"].Status != monitor.StatusDegraded {
+	if last, _ := s2.LastChecks(); last["glm-5.3"].Status != status.Degraded {
 		t.Fatalf("checks lost: %+v", last)
 	}
 	if open, _ := s2.HasOpenIncident("glm-5.3"); open != true {

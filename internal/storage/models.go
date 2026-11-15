@@ -7,14 +7,14 @@ import (
 	"fmt"
 	"time"
 
-	"opentw/internal/monitor"
+	"opentw/internal/status"
 )
 
 // Model is a monitored model with its last known state.
 type Model struct {
 	ID           string
 	Family       string
-	LastStatus   monitor.Status // "" until the first completed check
+	LastStatus   status.Status // "" until the first completed check
 	ErrorType    string
 	ErrorMessage string
 	LastCheckAt  *time.Time
@@ -25,7 +25,7 @@ type Check struct {
 	ModelID      string
 	At           time.Time
 	HTTPStatus   int
-	Status       monitor.Status
+	Status       status.Status
 	LatencyUS    *int64
 	TTFTUS       *int64
 	GenUS        *int64
@@ -53,8 +53,8 @@ type StatusMessage struct {
 // Incident is a state transition with its timeline.
 type Incident struct {
 	ModelID  string
-	From     monitor.Status
-	To       monitor.Status // empty while open
+	From     status.Status
+	To       status.Status // empty while open
 	Started  time.Time
 	Ended    *time.Time
 	Duration time.Duration
@@ -131,7 +131,7 @@ func (s *Store) Model(id string) (*Model, error) {
 }
 
 // SetModelState updates the cached state of a model after a check.
-func (s *Store) SetModelState(modelID string, status monitor.Status, errType, errMsg string, at time.Time) error {
+func (s *Store) SetModelState(modelID string, status status.Status, errType, errMsg string, at time.Time) error {
 	q := `UPDATE models SET last_status = ?, error_type = ?, error_message = ?, last_check_at = ? WHERE model_id = ?`
 	return s.exec(context.Background(), q, string(status), errType, errMsg, fmtTime(at), modelID)
 }
@@ -279,12 +279,12 @@ func (s *Store) DeleteStatusMessage(chatID int64) error {
 }
 
 // OpenIncident starts an incident when a model leaves its previous state.
-func (s *Store) OpenIncident(modelID string, from monitor.Status, at time.Time) error {
+func (s *Store) OpenIncident(modelID string, from status.Status, at time.Time) error {
 	return s.exec(context.Background(), `INSERT INTO incidents (model_id, from_status, started_at) VALUES (?, ?, ?)`, modelID, string(from), fmtTime(at))
 }
 
 // CloseIncident closes the newest open incident of the model and returns it.
-func (s *Store) CloseIncident(modelID string, to monitor.Status, at time.Time) (*Incident, error) {
+func (s *Store) CloseIncident(modelID string, to status.Status, at time.Time) (*Incident, error) {
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -307,7 +307,7 @@ func (s *Store) CloseIncident(modelID string, to monitor.Status, at time.Time) (
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("storage: close incident: %w", err)
 	}
-	inc := &Incident{ModelID: modelID, From: monitor.Status(from), To: to}
+	inc := &Incident{ModelID: modelID, From: status.Status(from), To: to}
 	if st, ok := parseTime(started); ok {
 		inc.Started = st
 		inc.Duration = at.Sub(st)
