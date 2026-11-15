@@ -1,0 +1,128 @@
+package telegram
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"opentw/internal/status"
+	"opentw/internal/storage"
+)
+
+// Панель обязана сохранять порядок моделей из конфигурации (семейства и
+// записи внутри семейства), а не алфавитный порядок БД.
+func TestPanelKeepsConfigOrder(t *testing.T) {
+	m := newMockTG(t)
+	store, err := storage.Open(t.TempDir() + "/order.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// порядок как в config.example.yaml: gpt-6-astra, gpt-6.1-sol, gpt-6-sol
+	models := []storage.Model{
+		{ID: "gpt-6-astra", Family: "GPT"},
+		{ID: "gpt-6.1-sol", Family: "GPT"},
+		{ID: "gpt-6-sol", Family: "GPT"},
+		{ID: "glm-5.3", Family: "GLM"},
+	}
+	if err := store.SyncModels(models); err != nil {
+		t.Fatal(err)
+	}
+	b := NewBot(BotCfg{API: &Client{Token: "T", BaseURL: m.url}, Store: store, Models: models})
+	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/status")); err != nil {
+		t.Fatal(err)
+	}
+	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
+	iAstra := strings.Index(text, "gpt-6-astra")
+	iDot := strings.Index(text, "gpt-6.1-sol")
+	iSol := strings.Index(text, "gpt-6-sol")
+	if iAstra < 0 || iDot < 0 || iSol < 0 {
+		t.Fatalf("missing models in panel:\n%s", text)
+	}
+	if !(iAstra < iDot && iDot < iSol) {
+		t.Fatalf("panel must keep config order (astra, 6.1-sol, 6-sol), got:\n%s", text)
+	}
+}
+
+// В канале /subscribe публикует панель с кнопками: channel_post не содержит
+// автора, поэтому права проверяются при нажатии кнопки (там автор известен).
+func TestChannelSubscribePublishesKeyboard(t *testing.T) {
+	m := newMockTG(t)
+	b, _ := newBot(t, m)
+	ctx := context.Background()
+	upd := &Update{UpdateID: 4, ChannelPost: &Message{MessageID: 700, Chat: Chat{ID: -300, Type: "channel"}, Text: "/subscribe"}}
+	if err := b.HandleUpdate(ctx, upd); err != nil {
+		t.Fatal(err)
+	}
+	body := m.lastBody("sendMessage")
+	if body["chat_id"].(float64) != -300 {
+		t.Fatalf("must publish to the channel, got %v", body["chat_id"])
+	}
+	markup, _ := body["reply_markup"].(map[string]any)
+	if markup == nil {
+		t.Fatal("channel subscribe must include an inline keyboard")
+	}
+	if !strings.Contains(fmt.Sprint(markup), "s:0") {
+		t.Fatalf("keyboard must carry model toggles: %v", markup)
+	}
+	if !strings.Contains(fmt.Sprint(body["text"]), "Настройка уведомлений") {
+		t.Fatalf("text = %v", body["text"])
+	}
+}
+
+// Нажатие кнопки в канале: администратор канала может менять подписки чата-канала.
+func TestChannelCallbackAdminToggles(t *testing.T) {
+	m := newMockTG(t)
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "getChatMember" {
+			return map[string]any{"ok": true, "result": map[string]any{"status": "administrator", "user": map[string]any{"id": 55}}}, 200
+		}
+		if method == "sendMessage" {
+			return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, 200
+		}
+		return map[string]any{"ok": true, "result": true}, 200
+	}
+	b, store := newBot(t, m)
+	ctx := context.Background()
+	if err := b.HandleUpdate(ctx, &Update{UpdateID: 5, ChannelPost: &Message{MessageID: 700, Chat: Chat{ID: -300, Type: "channel"}, Text: "/subscribe"}}); err != nil {
+		t.Fatal(err)
+	}
+	cb := &Update{UpdateID: 6, CallbackQuery: &CallbackQuery{
+		ID: "cb9", From: User{ID: 55}, Data: "s:0",
+		Message: &Message{MessageID: 700, Chat: Chat{ID: -300, Type: "channel"}},
+	}}
+	if err := b.HandleUpdate(ctx, cb); err != nil {
+		t.Fatal(err)
+	}
+	save := &Update{UpdateID: 7, CallbackQuery: &CallbackQuery{
+		ID: "cb10", From: User{ID: 55}, Data: "save",
+		Message: &Message{MessageID: 700, Chat: Chat{ID: -300, Type: "channel"}},
+	}}
+	if err := b.HandleUpdate(ctx, save); err != nil {
+		t.Fatal(err)
+	}
+	subs, _ := store.Subscriptions(-300)
+	if len(subs) != 1 || subs[0] != "gpt-6-astra" {
+		t.Fatalf("channel subscriptions = %v; admin must be able to configure them", subs)
+	}
+}
+
+// Панель подписок в канале не должна показывать статусы моделей.
+func TestChannelSubscribePanelHasNoStatuses(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	if err := store.SetModelState("glm-5.3", status.Down, "http", "boom", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleUpdate(context.Background(), &Update{UpdateID: 8, ChannelPost: &Message{MessageID: 1, Chat: Chat{ID: -300, Type: "channel"}, Text: "/subscribe"}}); err != nil {
+		t.Fatal(err)
+	}
+	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
+	for _, forbidden := range []string{"🟢", "🔴", "🟡", "⚪", "TPS", "HTTP"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("subscribe panel must not show statuses/metrics, found %q:\n%s", forbidden, text)
+		}
+	}
+}

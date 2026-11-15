@@ -17,12 +17,9 @@ var (
 	errKicked       = "bot was kicked"
 )
 
-// panelTextWith собирает текущий текст панели.
+// panelText собирает текущий текст панели (порядок моделей — из конфига).
 func (b *Bot) panelText(checks map[string]storage.Check) string {
-	models, err := b.store.Models()
-	if err != nil {
-		b.log.Error("panel: models", "err", err)
-	}
+	models := b.models
 	updated := time.Now()
 	latest := time.Time{}
 	for _, c := range checks {
@@ -131,12 +128,7 @@ func (b *Bot) cachedPanel(chatID int64) string {
 // OnCycle вызывается монитором после каждого цикла: обновляет все панели и
 // рассылает события (Task 9).
 func (b *Bot) OnCycle(ctx context.Context, res monitor.CycleResult) {
-	models, err := b.store.Models()
-	if err != nil {
-		b.log.Error("panel: models", "err", err)
-		models = nil
-	}
-	text := RenderStatusPanel(models, res.Checks, res.CycleAt, res.NextAt)
+	text := RenderStatusPanel(b.models, res.Checks, res.CycleAt, res.NextAt)
 
 	chats, err := b.store.StatusChats()
 	if err != nil {

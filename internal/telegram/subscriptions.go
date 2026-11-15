@@ -8,13 +8,20 @@ import (
 
 // handleSubscribeCommand открывает панель настройки подписок (admin-only в группах/каналах).
 func (b *Bot) handleSubscribeCommand(ctx context.Context, chat Chat, userID int64) error {
-	ok, err := b.userIsAdmin(ctx, chat, userID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		_, err := b.api.SendMessage(ctx, chat.ID, "Изменять уведомления в этом чате могут только администраторы.")
-		return err
+	// Пост /subscribe в канале пишет администратор канала (только они могут
+	// публиковать); автора Bot API не сообщает. Панель публикуется, а права
+	// каждого нажатия кнопок проверяются отдельным getChatMember по реальному
+	// пользователю из callback. В группах автор известен и проверяется сразу.
+	anonymousChannel := chat.Type == "channel" && userID == 0
+	if !anonymousChannel {
+		ok, err := b.userIsAdmin(ctx, chat, userID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			_, err := b.api.SendMessage(ctx, chat.ID, "Изменять уведомления в этом чате могут только администраторы.")
+			return err
+		}
 	}
 	subs, err := b.store.Subscriptions(chat.ID)
 	if err != nil {
@@ -28,11 +35,7 @@ func (b *Bot) handleSubscribeCommand(ctx context.Context, chat Chat, userID int6
 	b.drafts[chat.ID] = draft
 	b.mu.Unlock()
 
-	models, err := b.store.Models()
-	if err != nil {
-		return err
-	}
-	text, kb := RenderSubscribePanel(models, draft)
+	text, kb := RenderSubscribePanel(b.models, draft)
 	_, err = b.api.SendMessageWithKeyboard(ctx, chat.ID, text, kb)
 	return err
 }
@@ -99,11 +102,7 @@ func (b *Bot) handleSubscribeToggle(ctx context.Context, chat Chat, cb *Callback
 	draft := b.ensureDraft(chat.ID)
 	draft[modelID] = !draft[modelID]
 
-	models, err := b.store.Models()
-	if err != nil {
-		return err
-	}
-	text, kb := RenderSubscribePanel(models, draft)
+	text, kb := RenderSubscribePanel(b.models, draft)
 	if err := b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, text, kb); err != nil {
 		b.log.Error("subscribe: toggle edit", "chat", chat.ID, "err", err)
 	}
