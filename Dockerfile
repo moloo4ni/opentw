@@ -11,6 +11,8 @@ RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 opentw
 WORKDIR /app
 COPY --from=build /out/opentw /app/opentw
 COPY config.example.yaml /app/config.example.yaml
+# named volume наследует владелца этой директории при первой инициализации
+RUN mkdir -p /data && chown opentw:opentw /data
 USER opentw
 ENV TZ=Europe/Moscow
 VOLUME ["/data"]
