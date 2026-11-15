@@ -91,11 +91,18 @@ func TestSubscribeTextCompact(t *testing.T) {
 	if !strings.Contains(text, "Выбрано: 1 модель") {
 		t.Fatalf("selection counter missing:\n%s", text)
 	}
-	if len(kb.InlineKeyboard) != 3 { // 2 модели + Сохранить
-		t.Fatalf("keyboard rows = %d", len(kb.InlineKeyboard))
+	if len(kb.InlineKeyboard) != 2 { // пара моделей + ряд Сохранить/Отменить
+		t.Fatalf("keyboard rows = %d: %+v", len(kb.InlineKeyboard), kb.InlineKeyboard)
 	}
-	if kb.InlineKeyboard[0][0].Text != "gpt-6-astra" || kb.InlineKeyboard[1][0].Text != "✓ glm-5.3-prime" {
-		t.Fatalf("keyboard = %+v", kb.InlineKeyboard)
+	pair := kb.InlineKeyboard[0]
+	if len(pair) != 2 || pair[0].Text != "gpt-6-astra" || pair[1].Text != "+ glm-5.3-prime" ||
+		pair[0].CallbackData != "s:0" || pair[1].CallbackData != "s:1" {
+		t.Fatalf("pair row = %+v", pair)
+	}
+	last := kb.InlineKeyboard[len(kb.InlineKeyboard)-1]
+	if len(last) != 2 || last[0].Text != "Сохранить" || last[0].CallbackData != "save" ||
+		last[1].Text != "Отменить" || last[1].CallbackData != "cancel" {
+		t.Fatalf("save row = %+v", last)
 	}
 }
 
@@ -108,5 +115,39 @@ func TestNotificationFormatting(t *testing.T) {
 	}
 	if strings.Contains(text, "—") || strings.Contains(text, "·") {
 		t.Fatalf("non-ASCII punctuation in notification:\n%s", text)
+	}
+}
+
+// Сообщение провайдера, повторяющее model ID, — шум: ID уже в строке.
+// Панель и уведомление его прячут; полную ошибку по-прежнему видно в /status model-id.
+func TestErrorDuplicateHidden(t *testing.T) {
+	models := []storage.Model{{ID: "gpt-6-astra", Family: "GPT"}}
+	checks := map[string]storage.Check{
+		"gpt-6-astra": {Status: status.Down, HTTPStatus: 400, ErrorType: "http",
+			ErrorMessage: `unknown provider for model gpt-6-astra`},
+	}
+	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
+	if !strings.Contains(text, "🔴 <code>gpt-6-astra</code> - HTTP 400") {
+		t.Fatalf("line must carry code only:\n%s", text)
+	}
+	if strings.Contains(text, "unknown provider") {
+		t.Fatalf("duplicating message must be hidden:\n%s", text)
+	}
+
+	tr := transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)
+	tr.Check.HTTPStatus = 400
+	tr.Check.ErrorType = "http"
+	tr.Check.ErrorMessage = "unknown provider for model gpt-6-astra"
+	ntf := RenderNotification(tr)
+	if !strings.Contains(ntf, "HTTP 400") || strings.Contains(ntf, "unknown provider") {
+		t.Fatalf("notification must hide the duplication:\n%s", ntf)
+	}
+
+	// короткие ID не проходят фильтр: сообщение сохраняется
+	models[0].ID = "m"
+	checks["m"] = storage.Check{Status: status.Down, HTTPStatus: 500, ErrorType: "http", ErrorMessage: "boom m"}
+	text = RenderStatusPanel(models, checks, time.Now(), time.Now())
+	if !strings.Contains(text, "boom m") {
+		t.Fatalf("short-ID model must keep the message:\n%s", text)
 	}
 }

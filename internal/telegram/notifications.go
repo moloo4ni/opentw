@@ -69,10 +69,10 @@ func RenderNotification(tr monitor.Transition) string {
 		} else {
 			b.WriteString(tr.To.Emoji() + " " + codeID(tr.ModelID) + " - работает нестабильно\n\n")
 		}
-		b.WriteString(notifyErrorBody(tr.Check))
+		b.WriteString(notifyErrorBody(tr.ModelID, tr.Check))
 	default: // Down
 		b.WriteString(tr.To.Emoji() + " " + codeID(tr.ModelID) + " - недоступна\n\n")
-		b.WriteString(notifyErrorBody(tr.Check))
+		b.WriteString(notifyErrorBody(tr.ModelID, tr.Check))
 	}
 	b.WriteString("\n\nВремя: " + fmtClockMSK(tr.Check.At) + " MSK")
 	if (tr.To == status.Operational || (tr.To == status.Degraded && tr.From == status.Down)) &&
@@ -83,12 +83,12 @@ func RenderNotification(tr monitor.Transition) string {
 }
 
 // notifyErrorBody — исходные данные ошибки: HTTP-код и текст провайдера.
-func notifyErrorBody(c storage.Check) string {
+func notifyErrorBody(modelID string, c storage.Check) string {
 	var b strings.Builder
 	switch c.ErrorType {
 	case "http":
 		line := fmt.Sprintf("HTTP %d", c.HTTPStatus)
-		if c.ErrorMessage != "" {
+		if c.ErrorMessage != "" && !dupMessage(modelID, c.ErrorMessage) {
 			line += "\n" + EscapeHTML(oneLine(c.ErrorMessage))
 		}
 		b.WriteString(line)

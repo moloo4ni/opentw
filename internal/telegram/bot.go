@@ -98,7 +98,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 }
 
-// HandleUpdate路由 одного апдейта.
+// HandleUpdate маршрутизирует один апдейт.
 func (b *Bot) HandleUpdate(ctx context.Context, u *Update) error {
 	switch {
 	case u.Message != nil:

@@ -360,7 +360,7 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	editMarkup := fmt.Sprint(m.lastBody("editMessageText")["reply_markup"])
-	if !strings.Contains(editMarkup, "✓ gpt-6-astra") {
+	if !strings.Contains(editMarkup, "+ gpt-6-astra") {
 		t.Fatalf("toggle must be reflected in the keyboard: %q", editMarkup)
 	}
 	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 55, "s:1")); err != nil {
@@ -466,5 +466,47 @@ func TestHelpCommand(t *testing.T) {
 	}
 	if m.callCount("pinChatMessage") != 0 {
 		t.Fatal("help must not be pinned")
+	}
+}
+
+// Кнопка «Отменить»: изменения не сохраняются, клавиатура закрывается,
+// черновик сбрасывается (повторное /subscribe показывает сохранённое состояние).
+func TestSubscribeCancel(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	ctx := context.Background()
+
+	// уже сохранённая подписка — должна пережить отмену
+	if err := store.SetSubscription(100, "glm-5.3", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:0")); err != nil { // включили gpt-6-astra в черновике
+		t.Fatal(err)
+	}
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "cancel")); err != nil {
+		t.Fatal(err)
+	}
+	answered := fmt.Sprint(m.lastBody("answerCallbackQuery")["text"])
+	if !strings.Contains(answered, "Отменено") {
+		t.Fatalf("ack = %q", answered)
+	}
+	cancelledText := fmt.Sprint(m.lastBody("editMessageText")["text"])
+	if !strings.Contains(cancelledText, "не сохранены") {
+		t.Fatalf("cancel message = %q", cancelledText)
+	}
+	subs, _ := store.Subscriptions(100)
+	if len(subs) != 1 || subs[0] != "glm-5.3" {
+		t.Fatalf("cancel must not touch saved subscriptions: %v", subs)
+	}
+	// повторное открытие: черновик начинается заново от сохранённого состояния
+	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
+		t.Fatal(err)
+	}
+	reopened := fmt.Sprint(m.lastBody("sendMessage")["text"])
+	if !strings.Contains(reopened, "Выбрано: 1 модель") {
+		t.Fatalf("reopened draft must equal saved state: %q", reopened)
 	}
 }

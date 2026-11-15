@@ -100,14 +100,14 @@ func modelLine(m storage.Model, c storage.Check) string {
 	case c.ErrorType == "empty":
 		return emoji + " " + codeID(m.ID) + " - HTTP 200 · пустая генерация"
 	case c.ErrorType != "":
-		return emoji + " " + codeID(m.ID) + " - " + errorHead(c)
+		return emoji + " " + codeID(m.ID) + " - " + errorHead(m.ID, c)
 	default:
 		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c)
 	}
 }
 
 // errorHead формирует краткое описание ошибки для панели.
-func errorHead(c storage.Check) string {
+func errorHead(modelID string, c storage.Check) string {
 	var head string
 	switch c.ErrorType {
 	case "http":
@@ -124,8 +124,19 @@ func errorHead(c storage.Check) string {
 	if c.ErrorMessage == "" || c.ErrorType == "invalid" {
 		return head
 	}
+	if dupMessage(modelID, c.ErrorMessage) {
+		return head
+	}
 	msg := trunc(oneLine(c.ErrorMessage), maxPanelErr)
 	return head + " · " + EscapeHTML(msg)
+}
+
+// dupMessage: сообщение провайдера, повторяющее model ID, — шум: ID уже показан.
+func dupMessage(modelID, msg string) bool {
+	if len(modelID) < 4 || msg == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(msg), strings.ToLower(modelID))
 }
 
 func oneLine(s string) string {
@@ -300,23 +311,42 @@ func pluralModels(n int) string {
 // "save" — сохранение. Индексы стабильны, пока не изменён конфиг.
 func RenderSubscribePanel(models []storage.Model, subscribed map[string]bool) (string, *InlineKeyboardMarkup) {
 	var b strings.Builder
-	b.WriteString("OpenTW — Настройка уведомлений\n\n")
+	b.WriteString("OpenTW - Настройка уведомлений\n\n")
 	b.WriteString("Выберите модели, об изменениях состояния\nкоторых хотите получать уведомления.\n")
 
 	rows := make([][]InlineButton, 0, len(models)+1)
 	selected := 0
+	// пары кнопок: 25 моделей одним столбцом неудобно; длинные ID — отдельным рядом
+	var pair []InlineButton
+	flush := func() {
+		if len(pair) > 0 {
+			rows = append(rows, pair)
+			pair = nil
+		}
+	}
 	for i, m := range models {
 		label := EscapeHTML(m.ID)
 		if subscribed[m.ID] {
-			label = "✓ " + label
+			label = "+ " + label
 			selected++
 		}
-		rows = append(rows, []InlineButton{
-			{Text: label, CallbackData: fmt.Sprintf("s:%d", i)},
-		})
+		btn := InlineButton{Text: label, CallbackData: fmt.Sprintf("s:%d", i)}
+		if len([]rune(label)) <= 16 {
+			pair = append(pair, btn)
+			if len(pair) == 2 {
+				flush()
+			}
+		} else {
+			flush()
+			rows = append(rows, []InlineButton{btn})
+		}
 	}
+	flush()
 	b.WriteString("\nВыбрано: " + pluralModels(selected))
-	rows = append(rows, []InlineButton{{Text: "Сохранить", CallbackData: "save"}})
+	rows = append(rows, []InlineButton{
+		{Text: "Сохранить", CallbackData: "save"},
+		{Text: "Отменить", CallbackData: "cancel"},
+	})
 	return b.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
@@ -325,11 +355,11 @@ func RenderHelp() string {
 	return strings.Join([]string{
 		"OpenTW",
 		"",
-		"/start — показать статус моделей.",
-		"/status — общий статус всех моделей.",
-		"/status model-id — подробная информация о конкретной модели.",
-		"/subscribe — настройка уведомлений об изменениях состояния моделей.",
-		"/help — справка.",
+		"/start - показать статус моделей.",
+		"/status - общий статус всех моделей.",
+		"/status model-id - подробная информация о конкретной модели.",
+		"/subscribe - настройка уведомлений об изменениях состояния моделей.",
+		"/help - справка.",
 	}, "\n")
 }
 

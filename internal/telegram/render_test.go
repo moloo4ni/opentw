@@ -240,29 +240,29 @@ func TestSubscribePanel(t *testing.T) {
 		{ID: "glm-5.3-prime", Family: "GLM"},
 	}
 	text, kb := RenderSubscribePanel(models, map[string]bool{"gpt-6-astra": true, "glm-5.3": true})
-	if !strings.Contains(text, "OpenTW — Настройка уведомлений") {
+	if !strings.Contains(text, "OpenTW - Настройка уведомлений") {
 		t.Fatalf("header missing:\n%s", text)
 	}
 	if !strings.Contains(text, "Выбрано: 2 модели") {
 		t.Fatalf("selection counter wrong:\n%s", text)
 	}
-	// 4 model rows + save row
-	if len(kb.InlineKeyboard) != 5 {
+	// 2 ряда пар кнопок + ряд Сохранить/Отменить
+	if len(kb.InlineKeyboard) != 3 {
 		t.Fatalf("keyboard rows = %d", len(kb.InlineKeyboard))
 	}
 	first := kb.InlineKeyboard[0][0]
-	if first.Text != "✓ gpt-6-astra" || first.CallbackData != "s:0" {
+	if first.Text != "+ gpt-6-astra" || first.CallbackData != "s:0" {
 		t.Fatalf("first button = %+v", first)
 	}
-	second := kb.InlineKeyboard[1][0]
+	second := kb.InlineKeyboard[0][1]
 	if second.Text != "gpt-6.1-sol" || second.CallbackData != "s:1" {
 		t.Fatalf("second button = %+v", second)
 	}
-	third := kb.InlineKeyboard[2][0]
-	if third.Text != "✓ glm-5.3" || third.CallbackData != "s:2" {
+	third := kb.InlineKeyboard[1][0]
+	if third.Text != "+ glm-5.3" || third.CallbackData != "s:2" {
 		t.Fatalf("third button = %+v", third)
 	}
-	save := kb.InlineKeyboard[4][0]
+	save := kb.InlineKeyboard[2][0]
 	if save.Text != "Сохранить" || save.CallbackData != "save" {
 		t.Fatalf("save button = %+v", save)
 	}

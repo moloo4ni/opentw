@@ -65,6 +65,8 @@ func (b *Bot) handleCallback(ctx context.Context, cb *CallbackQuery) error {
 	switch {
 	case cb.Data == "save":
 		return b.handleSubscribeSave(ctx, chat, cb)
+	case cb.Data == "cancel":
+		return b.handleSubscribeCancel(ctx, chat, cb)
 	case strings.HasPrefix(cb.Data, "s:"):
 		idx, err := strconv.Atoi(strings.TrimPrefix(cb.Data, "s:"))
 		if err != nil || idx < 0 || idx >= len(b.models) {
@@ -107,6 +109,29 @@ func (b *Bot) handleSubscribeToggle(ctx context.Context, chat Chat, cb *Callback
 		b.log.Error("subscribe: toggle edit", "chat", chat.ID, "err", err)
 	}
 	return b.api.AnswerCallbackQuery(ctx, cb.ID, "")
+}
+
+// handleSubscribeCancel закрывает панель без сохранения черновика.
+func (b *Bot) handleSubscribeCancel(ctx context.Context, chat Chat, cb *CallbackQuery) error {
+	admin, err := b.userIsAdmin(ctx, chat, cb.From.ID)
+	if err != nil {
+		return err
+	}
+	if !admin {
+		err := b.api.AnswerCallbackQuery(ctx, cb.ID, "Только администраторы могут менять уведомления")
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+	b.mu.Lock()
+	delete(b.drafts, chat.ID)
+	b.mu.Unlock()
+	if err := b.api.AnswerCallbackQuery(ctx, cb.ID, "Отменено"); err != nil {
+		return err
+	}
+	return b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID,
+		"Настройка уведомлений закрыта. Изменения не сохранены.", nil)
 }
 
 func (b *Bot) handleSubscribeSave(ctx context.Context, chat Chat, cb *CallbackQuery) error {
