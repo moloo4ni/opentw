@@ -33,16 +33,16 @@ func TestPanelFormatSuccess(t *testing.T) {
 	}
 	text := RenderStatusPanel(models, checks, mskTime(t, 16, 15, 3), mskTime(t, 16, 30, 0))
 	wantLines := []string{
-		"OpenTW",
+		"<b>OpenTW</b>",
 		"",
 		"Обновлено: 16:15:03 MSK",
 		"Следующая проверка: 16:30:00 MSK",
 		"",
 		"<b>GPT</b>",
-		"🟢 <code>gpt-6-astra</code> - 2.7s | 42.3 TPS | 154/96",
+		"🟢 <code>gpt-6-astra</code> - 2.7s · 42.3 TPS · 154/96",
 		"",
 		"<b>GLM</b>",
-		"🟢 <code>glm-5.3</code> - 4.2s | 54.1 TPS",
+		"🟢 <code>glm-5.3</code> - 4.2s · 54.1 TPS",
 	}
 	got := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	if len(got) != len(wantLines) {
@@ -93,17 +93,17 @@ func TestPanelErrorLinesAndNA(t *testing.T) {
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	for _, want := range []string{
-		"🟡 <code>gpt-6-sol</code> - HTTP 429 | Upstream rate limit",
-		"🔴 <code>glm-5.3-fast</code> - HTTP 404 | Invalid model.",
+		"🟡 <code>gpt-6-sol</code> - HTTP 429 · Upstream rate limit",
+		"🔴 <code>glm-5.3-fast</code> - HTTP 404 · Invalid model.",
 		"⚪ <code>claude-opus-5</code> - ошибка монитора",
 		"🔴 <code>un</code> - Timeout",
-		"🟢 <code>glm-5.3</code> - 3.1s | N/A TPS",
+		"🟢 <code>glm-5.3</code> - 3.1s · N/A TPS",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("panel missing line %q\npanel:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "glm-5.3</code> - 3.1s | N/A TPS |") {
+	if strings.Contains(text, "glm-5.3</code> - 3.1s · N/A TPS ·") {
 		t.Error("tokens block must be omitted when tokens are unknown")
 	}
 }
@@ -120,8 +120,8 @@ func TestPanelPerfDegradedAndEmptyAndNoData(t *testing.T) {
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	for _, want := range []string{
-		"🟡 <code>a-perf</code> - 30.0s | 12.3 TPS | деградация",
-		"🟡 <code>a-empty</code> - HTTP 200 | пустая генерация",
+		"🟡 <code>a-perf</code> - 30.0s · 12.3 TPS · деградация",
+		"🟡 <code>a-empty</code> - HTTP 200 · пустая генерация",
 		"⚪ <code>a-new</code> - нет данных",
 	} {
 		if !strings.Contains(text, want) {
@@ -153,7 +153,7 @@ func TestPanelTruncatesLongError(t *testing.T) {
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	lineIdx := strings.Index(text, "🔴 <code>m</code> -")
 	line := text[lineIdx:]
-	if strings.Count(line, "a") > 40 {
+	if strings.Count(line, "a") > 24 {
 		t.Fatalf("long error not truncated: %s", line)
 	}
 	if !strings.HasSuffix(strings.TrimSpace(line), "...") {
@@ -184,7 +184,7 @@ func TestModelDetailFormat(t *testing.T) {
 	}
 	text := RenderModelDetail("gpt-6-astra", status.Operational, last, checks)
 	for _, want := range []string{
-		"gpt-6-astra — 🟢 Operational",
+		"<b>gpt-6-astra</b> - 🟢 работает",
 		"Последняя проверка: 16:15:03 MSK",
 		"HTTP: 200",
 		"Latency: 2.70s",
@@ -197,7 +197,7 @@ func TestModelDetailFormat(t *testing.T) {
 		"Проверок: 144",
 		"Средний latency: 2.90s",
 		"Средний TPS: 45.7",
-		"HTTP 429 | Upstream rate limit",
+		"HTTP 429 · Upstream rate limit",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("detail missing %q in:\n%s", want, text)
@@ -218,7 +218,7 @@ func TestModelDetailNoHistory(t *testing.T) {
 	if !strings.Contains(text, "Проверок: 0") {
 		t.Fatalf("checks counter missing:\n%s", text)
 	}
-	if !strings.Contains(text, "HTTP 503 | Service Unavailable") {
+	if !strings.Contains(text, "HTTP 503 · Service Unavailable") {
 		t.Fatalf("last error missing:\n%s", text)
 	}
 }

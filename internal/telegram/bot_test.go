@@ -293,7 +293,7 @@ func TestStatusModelDetail(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	if !strings.Contains(text, "glm-5.3 — 🟢 Operational") {
+	if !strings.Contains(text, "<b>glm-5.3</b> - 🟢 работает") {
 		t.Fatalf("detail wrong: %q", text)
 	}
 	if m.callCount("pinChatMessage") != 0 {

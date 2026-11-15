@@ -19,7 +19,7 @@ func TestPanelCompactOneLine(t *testing.T) {
 			InputTokens: ptr1(5), OutputTokens: ptr1(1)},
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
-	want := "🟢 <code>deepseek-v4.1-flash-1017</code> - 7.5s | 12.5 TPS | 5/1"
+	want := "🟢 <code>deepseek-v4.1-flash-1017</code> - 7.5s · 12.5 TPS · 5/1"
 	if !strings.Contains(text, want) {
 		t.Fatalf("compact line:\nwant: %q\ngot:  %q", want, text)
 	}
@@ -42,7 +42,7 @@ func TestPanelNoNonASCIIPunctuation(t *testing.T) {
 			LatencyUS: ptr1(7_531_000), TPS: ptrF(12.5), InputTokens: ptr1(5), OutputTokens: ptr1(1)},
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
-	for _, bad := range []string{"·", "—", "…"} {
+	for _, bad := range []string{"—", "…"} {
 		if strings.Contains(text, bad) {
 			t.Fatalf("non-ASCII punctuation %q still present:\n%s", bad, text)
 		}
@@ -70,7 +70,7 @@ func TestPanelErrorLineCompact(t *testing.T) {
 			ErrorMessage: "No available accounts. Please retry after 02:01 MSK."},
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
-	if !strings.Contains(text, "🔴 <code>grok-4.6</code> - HTTP 503 |") {
+	if !strings.Contains(text, "🔴 <code>grok-4.6</code> - HTTP 503 ·") {
 		t.Fatalf("error head wrong:\n%s", text)
 	}
 	if strings.Contains(text, "Please retry after") {

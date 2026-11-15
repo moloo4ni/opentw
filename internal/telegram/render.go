@@ -16,13 +16,27 @@ var MSK = time.FixedZone("MSK", 3*60*60)
 
 const (
 	absent      = "N/A"
-	maxPanelErr = 30 // панель — одна строка на десктопе; полный текст в /status model-id
+	maxPanelErr = 20 // панель — одна строка на десктопе; полный текст в /status model-id
 )
 
 func fmtClockMSK(t time.Time) string { return t.In(MSK).Format("15:04:05") }
 
 func fmtSecs(us int64) string  { return fmt.Sprintf("%.2fs", float64(us)/1e6) }
 func fmtSecs1(us int64) string { return fmt.Sprintf("%.1fs", float64(us)/1e6) }
+
+// statusTitleRu — русские подписи статусов (детальная страница; эмодзи уже передают цвет).
+func statusTitleRu(st status.Status) string {
+	switch st {
+	case status.Operational:
+		return "работает"
+	case status.Degraded:
+		return "нестабильно"
+	case status.Down:
+		return "недоступна"
+	default:
+		return "нет данных"
+	}
+}
 
 // EscapeHTML экранирует любые внешние строки перед отправкой в Telegram.
 func EscapeHTML(s string) string { return html.EscapeString(s) }
@@ -53,7 +67,7 @@ func i64Ptr(v *int64) string {
 // grouped by family, exact model IDs, N/A for unknown metrics.
 func RenderStatusPanel(models []storage.Model, checks map[string]storage.Check, updatedAt, nextAt time.Time) string {
 	var b strings.Builder
-	b.WriteString("OpenTW\n\n")
+	b.WriteString("<b>OpenTW</b>\n\n")
 	b.WriteString(fmt.Sprintf("Обновлено: %s MSK\n", fmtClockMSK(updatedAt)))
 	b.WriteString(fmt.Sprintf("Следующая проверка: %s MSK\n", fmtClockMSK(nextAt)))
 
@@ -82,9 +96,9 @@ func modelLine(m storage.Model, c storage.Check) string {
 
 	switch {
 	case c.ErrorType == "perf":
-		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c) + " | деградация"
+		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c) + " · деградация"
 	case c.ErrorType == "empty":
-		return emoji + " " + codeID(m.ID) + " - HTTP 200 | пустая генерация"
+		return emoji + " " + codeID(m.ID) + " - HTTP 200 · пустая генерация"
 	case c.ErrorType != "":
 		return emoji + " " + codeID(m.ID) + " - " + errorHead(c)
 	default:
@@ -111,7 +125,7 @@ func errorHead(c storage.Check) string {
 		return head
 	}
 	msg := trunc(oneLine(c.ErrorMessage), maxPanelErr)
-	return head + " | " + EscapeHTML(msg)
+	return head + " · " + EscapeHTML(msg)
 }
 
 func oneLine(s string) string {
@@ -132,7 +146,7 @@ func metricsTail(c storage.Check) string {
 	if c.InputTokens != nil && c.OutputTokens != nil {
 		parts = append(parts, fmt.Sprintf("%d/%d", *c.InputTokens, *c.OutputTokens))
 	}
-	return strings.Join(parts, " | ")
+	return strings.Join(parts, " · ")
 }
 
 // detailErrorLine — полная строка последней ошибки (без обрезки).
@@ -153,7 +167,7 @@ func detailErrorLine(c storage.Check) string {
 		head = c.ErrorType
 	}
 	if c.ErrorMessage != "" && c.ErrorType != "invalid" && c.ErrorType != "empty" {
-		return head + " | " + EscapeHTML(oneLine(c.ErrorMessage))
+		return head + " · " + EscapeHTML(oneLine(c.ErrorMessage))
 	}
 	return head
 }
@@ -161,7 +175,7 @@ func detailErrorLine(c storage.Check) string {
 // RenderModelDetail renders the /status model-id view.
 func RenderModelDetail(modelID string, st status.Status, last storage.Check, last24 []storage.Check) string {
 	var b strings.Builder
-	b.WriteString(EscapeHTML(modelID) + " — " + st.Emoji() + " " + st.Title() + "\n\n")
+	b.WriteString("<b>" + EscapeHTML(modelID) + "</b> - " + st.Emoji() + " " + statusTitleRu(st) + "\n\n")
 	b.WriteString("Последняя проверка: " + fmtClockMSK(last.At) + " MSK\n\n")
 
 	b.WriteString("Последний запрос\n")
@@ -239,7 +253,7 @@ func RenderModelDetail(modelID string, st status.Status, last storage.Check, las
 	}
 	if lastErr != nil {
 		b.WriteString("\nПоследняя ошибка\n")
-		b.WriteString(fmtClockMSK(lastErr.At) + " | " + detailErrorLine(*lastErr))
+		b.WriteString(fmtClockMSK(lastErr.At) + " · " + detailErrorLine(*lastErr))
 	}
 	return b.String()
 }
