@@ -71,9 +71,9 @@ func Load(path string) (*Config, error) {
 	}
 	cfg := &Config{
 		Interval:    15 * time.Minute,
-		HTTPTimeout: 60 * time.Second,
+		HTTPTimeout: 120 * time.Second,
 		Concurrency: 4,
-		MaxTokens:   8,
+		MaxTokens:   64,
 		Streaming:   true,
 		SQLitePath:  "opentw.db",
 	}

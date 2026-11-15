@@ -23,6 +23,16 @@ func newTestClient(baseURL string, timeout time.Duration, stream bool) *Client {
 	}
 }
 
+// writeChunks writes SSE events without the [DONE] terminator.
+func writeChunks(w http.ResponseWriter, events ...string) {
+	for _, ev := range events {
+		fmt.Fprintf(w, "data: %s\n\n", ev)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
 // writeSSE writes SSE events with a flush after each, so TTFT timing is observable.
 func writeSSE(w http.ResponseWriter, events []string) {
 	for _, ev := range events {
@@ -40,9 +50,12 @@ func TestGenerateStreamSuccess(t *testing.T) {
 			t.Errorf("missing bearer auth")
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		writeSSE(w, []string{
+		writeChunks(w,
 			`{"id":"1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
 			`{"id":"1","choices":[{"index":0,"delta":{"content":"O"},"finish_reason":null}]}`,
+		)
+		time.Sleep(180 * time.Millisecond) // реальная генерация занимает время
+		writeSSE(w, []string{
 			`{"id":"1","choices":[{"index":0,"delta":{"content":"K"},"finish_reason":null}]}`,
 			`{"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}`,
 			`{"id":"1","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}`,

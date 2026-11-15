@@ -13,8 +13,9 @@ type streamChunk struct {
 	Choices []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
+			Role             string `json:"role"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -28,10 +29,12 @@ type usage struct {
 }
 
 // readStream consumes an SSE body, recording the moment of the first
-// content token and accumulating text and usage. It never reports an error
-// for individual malformed chunks: providers send keep-alive and odd
+// generated token and accumulating visible text and usage. Reasoning tokens
+// count as generation: reasoning models write their budget there first, and
+// a visible answer may never arrive at small max_tokens.
+// Individual malformed chunks are skipped: providers send keep-alive and odd
 // extensions; usable state is decided by the caller from the fields.
-func readStream(r io.Reader, onFirstContent func()) (text strings.Builder, u *usage, sawData, parsedAny bool, err error) {
+func readStream(r io.Reader, onFirstContent func()) (text strings.Builder, u *usage, sawData, parsedAny, generated bool, err error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
 		line, readErr := br.ReadString('\n')
@@ -61,10 +64,13 @@ func readStream(r io.Reader, onFirstContent func()) (text strings.Builder, u *us
 					u = chunk.Usage
 				}
 				for _, ch := range chunk.Choices {
-					if ch.Delta.Content != "" {
-						if text.Len() == 0 && onFirstContent != nil {
+					if !generated && (ch.Delta.Content != "" || ch.Delta.ReasoningContent != "") {
+						generated = true
+						if onFirstContent != nil {
 							onFirstContent()
 						}
+					}
+					if ch.Delta.Content != "" {
 						text.WriteString(ch.Delta.Content)
 					}
 				}
@@ -77,15 +83,16 @@ func readStream(r io.Reader, onFirstContent func()) (text strings.Builder, u *us
 			break
 		}
 	}
-	return text, u, sawData, parsedAny, err
+	return text, u, sawData, parsedAny, generated, err
 }
 
 // nonStreamResponse is a full chat completion object.
 type nonStreamResponse struct {
 	Choices []struct {
 		Message struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
+			Role             string `json:"role"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"message"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`

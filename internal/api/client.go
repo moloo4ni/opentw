@@ -29,6 +29,10 @@ func (c *Client) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
+// minGenerationUS — минимальная длительность генерации, при которой TPS
+// считается достоверным (буферизованные SSE-потоки дают ~0).
+const minGenerationUS = 100_000
+
 func readLimited(r io.Reader, limit int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, limit))
 }
@@ -139,7 +143,7 @@ func (c *Client) Generate(ctx context.Context, modelID string, maxTokens int) *R
 
 func (c *Client) consumeStream(body io.Reader, res *RawResult, start time.Time) {
 	var firstContentAt time.Time
-	text, u, sawData, parsedAny, err := readStream(body, func() {
+	_, u, sawData, parsedAny, generated, err := readStream(body, func() {
 		if firstContentAt.IsZero() {
 			firstContentAt = time.Now()
 		}
@@ -160,8 +164,9 @@ func (c *Client) consumeStream(body io.Reader, res *RawResult, start time.Time) 
 		res.ErrorKind, res.ErrorMessage = "invalid", "unparseable response body"
 		return
 	}
-	if text.Len() == 0 {
-		// HTTP 200 with nothing generated — Degraded, not Down.
+	if !generated {
+		// HTTP 200 with nothing generated — Degraded, not Down. Reasoning
+		// tokens already counted as generation above.
 		res.ErrorKind, res.ErrorMessage = "empty", "empty generation"
 		return
 	}
@@ -176,7 +181,9 @@ func (c *Client) consumeStream(body io.Reader, res *RawResult, start time.Time) 
 		gen = 0
 	}
 	res.GenUS = ptr64(gen)
-	if res.OutputTokens != nil && *res.OutputTokens > 0 && gen > 0 {
+	// Буферизованный провайдер отдаёт весь ответ одним залпом: TPS по такому
+	// интервалу был бы выдумкой, поэтому требуется минимальная длительность.
+	if res.OutputTokens != nil && *res.OutputTokens > 0 && gen >= minGenerationUS {
 		res.TPS = ptrF64(float64(*res.OutputTokens) / (float64(gen) / 1e6))
 	}
 }
@@ -200,11 +207,12 @@ func (c *Client) consumeFull(body io.Reader, res *RawResult) {
 			res.OutputTokens = ptr64(*parsed.Usage.CompletionTokens)
 		}
 	}
-	content := ""
+	generated := false
 	if len(parsed.Choices) > 0 {
-		content = parsed.Choices[0].Message.Content
+		msg := parsed.Choices[0].Message
+		generated = msg.Content != "" || msg.ReasoningContent != ""
 	}
-	if content == "" {
+	if !generated {
 		res.ErrorKind, res.ErrorMessage = "empty", "empty generation"
 	}
 	// Without streaming there is no first-token timing: TTFT/TPS stay N/A.

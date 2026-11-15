@@ -92,10 +92,10 @@ models:
 	if cfg.Interval != 15*time.Minute {
 		t.Fatalf("default interval = %v", cfg.Interval)
 	}
-	if cfg.HTTPTimeout != 60*time.Second {
+	if cfg.HTTPTimeout != 120*time.Second {
 		t.Fatalf("default http_timeout = %v", cfg.HTTPTimeout)
 	}
-	if cfg.Concurrency != 4 || cfg.MaxTokens != 8 {
+	if cfg.Concurrency != 4 || cfg.MaxTokens != 64 {
 		t.Fatalf("default concurrency/max_tokens = %d/%d", cfg.Concurrency, cfg.MaxTokens)
 	}
 	if !cfg.Streaming {

@@ -2,6 +2,8 @@ package telegram
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -10,12 +12,13 @@ import (
 	"opentw/internal/storage"
 )
 
-// BotCfg配置 бота.
+// BotCfg configures the bot.
 type BotCfg struct {
-	API    *Client
-	Store  *storage.Store
-	Models []storage.Model // упорядоченные модели (family, id)
-	Logger *slog.Logger
+	API      *Client
+	Store    *storage.Store
+	Models   []storage.Model // упорядоченные модели (family, id)
+	Logger   *slog.Logger
+	Interval time.Duration // интервал мониторинга для «Следующая проверка»
 }
 
 // Bot обрабатывает команды Telegram и ведёт статусные панели.
@@ -24,10 +27,10 @@ type Bot struct {
 	store  *storage.Store
 	models []storage.Model
 	log    *slog.Logger
+	tick   time.Duration
 
 	lastText map[int64]string // кэш последнего текста панели по чату
 	pinWarn  map[int64]bool   // однократное предупреждение о запрете закрепления
-	tick     time.Duration    // интервал мониторинга для «Следующая проверка»
 
 	drafts map[int64]map[string]bool // черновики подписок до «Сохранить»
 	mu     sync.Mutex
@@ -44,6 +47,7 @@ func NewBot(cfg BotCfg) *Bot {
 		store:    cfg.Store,
 		models:   cfg.Models,
 		log:      log,
+		tick:     cfg.Interval,
 		lastText: map[int64]string{},
 		pinWarn:  map[int64]bool{},
 		drafts:   map[int64]map[string]bool{},
@@ -65,6 +69,9 @@ func (b *Bot) Run(ctx context.Context) error {
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			if fatal := fatalTelegramErr(err); fatal != nil {
+				return fatal
 			}
 			b.log.Error("telegram: getUpdates", "err", err)
 			select {
@@ -173,4 +180,18 @@ func (b *Bot) handleModelDetail(ctx context.Context, chatID int64, modelID strin
 	text := RenderModelDetail(modelID, m.LastStatus, last, checks)
 	_, err = b.api.SendMessage(ctx, chatID, text)
 	return err
+}
+
+// fatalTelegramErr returns a permanent error for configuration problems that
+// retrying cannot fix: wrong bot token (401), forbidden (403), not found (404).
+func fatalTelegramErr(err error) error {
+	var apiErr *ApiError
+	if !errors.As(err, &apiErr) {
+		return nil
+	}
+	switch apiErr.Code {
+	case 401, 403, 404:
+		return fmt.Errorf("telegram: fatal API error %d: %s (check BOT_TOKEN)", apiErr.Code, apiErr.Description)
+	}
+	return nil
 }

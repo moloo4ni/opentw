@@ -2,6 +2,8 @@
 package monitor
 
 import (
+	"strings"
+
 	"opentw/internal/api"
 	"opentw/internal/status"
 )
@@ -39,6 +41,9 @@ func Classify(res api.RawResult) Status {
 		case res.HTTPStatus == 401 || res.HTTPStatus == 403:
 			// The monitor's own authorization problem.
 			return StatusUnknown
+		case looksLikeModelNotFound(res.ErrorMessage):
+			// 400 от роутера: модель/провайдер не обслуживается.
+			return StatusDown
 		default:
 			// Other 4xx: incompatible request/response shape — monitoring issue.
 			return StatusUnknown
@@ -53,4 +58,21 @@ func Classify(res api.RawResult) Status {
 	default:
 		return StatusUnknown
 	}
+}
+
+// looksLikeModelNotFound распознаёт 400-ответы об отсутствии модели.
+func looksLikeModelNotFound(msg string) bool {
+	m := strings.ToLower(msg)
+	for _, marker := range []string{
+		"unknown provider for model",
+		"model not found",
+		"does not exist",
+		"no such model",
+		"invalid model",
+	} {
+		if strings.Contains(m, marker) {
+			return true
+		}
+	}
+	return false
 }
