@@ -273,6 +273,24 @@ func (s *Store) StatusMessage(chatID int64) (*StatusMessage, error) {
 	return &sm, nil
 }
 
+// StatusChats lists chats that have a pinned panel binding.
+func (s *Store) StatusChats() ([]int64, error) {
+	rows, err := s.db.Query(`SELECT chat_id FROM status_messages ORDER BY chat_id`)
+	if err != nil {
+		return nil, fmt.Errorf("storage: status chats: %w", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // DeleteStatusMessage forgets the chat's panel binding.
 func (s *Store) DeleteStatusMessage(chatID int64) error {
 	return s.exec(context.Background(), `DELETE FROM status_messages WHERE chat_id = ?`, chatID)

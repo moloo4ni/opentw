@@ -20,6 +20,14 @@ type mockTG struct {
 	handler func(method string, body []byte) (any, int) // custom response, status
 	token   string
 	url     string
+	msgID   int64
+}
+
+func (m *mockTG) nextMessageID() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.msgID++
+	return m.msgID
 }
 
 func newMockTG(t *testing.T) *mockTG {
@@ -36,10 +44,14 @@ func newMockTG(t *testing.T) *mockTG {
 		m.bodies[method] = body
 		m.token = token
 		m.mu.Unlock()
-		var payload any = map[string]any{"ok": true, "result": true}
+		var payload any
 		status := http.StatusOK
 		if m.handler != nil {
 			payload, status = m.handler(method, body)
+		} else if method == "sendMessage" {
+			payload = map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}
+		} else {
+			payload = map[string]any{"ok": true, "result": true}
 		}
 		w.WriteHeader(status)
 		json.NewEncoder(w).Encode(payload)
