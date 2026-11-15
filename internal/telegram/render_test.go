@@ -38,11 +38,11 @@ func TestPanelFormatSuccess(t *testing.T) {
 		"Обновлено: 16:15:03 MSK",
 		"Следующая проверка: 16:30:00 MSK",
 		"",
-		"GPT",
-		"🟢 gpt-6-astra — 2.7s·TTFT 0.4s·42.3 TPS·154/96",
+		"<b>GPT</b>",
+		"🟢 <code>gpt-6-astra</code> - 2.7s | TTFT 0.4s | 42.3 TPS | 154/96",
 		"",
-		"GLM",
-		"🟢 glm-5.3 — 4.2s·TTFT 0.6s·54.1 TPS",
+		"<b>GLM</b>",
+		"🟢 <code>glm-5.3</code> - 4.2s | TTFT 0.6s | 54.1 TPS",
 	}
 	got := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	if len(got) != len(wantLines) {
@@ -93,17 +93,17 @@ func TestPanelErrorLinesAndNA(t *testing.T) {
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	for _, want := range []string{
-		"🟡 gpt-6-sol — HTTP 429·Upstream rate limit",
-		"🔴 glm-5.3-fast — нет модели",
-		"⚪ claude-opus-5 — ошибка монитора",
-		"🔴 un — Timeout",
-		"🟢 glm-5.3 — 3.1s·TTFT N/A·N/A TPS",
+		"🟡 <code>gpt-6-sol</code> - HTTP 429 | Upstream rate limit",
+		"🔴 <code>glm-5.3-fast</code> - нет модели",
+		"⚪ <code>claude-opus-5</code> - ошибка монитора",
+		"🔴 <code>un</code> - Timeout",
+		"🟢 <code>glm-5.3</code> - 3.1s | TTFT N/A | N/A TPS",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("panel missing line %q\npanel:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "glm-5.3 — 3.1s·TTFT N/A·N/A TPS·") {
+	if strings.Contains(text, "glm-5.3</code> - 3.1s | TTFT N/A | N/A TPS |") {
 		t.Error("tokens block must be omitted when tokens are unknown")
 	}
 }
@@ -120,9 +120,9 @@ func TestPanelPerfDegradedAndEmptyAndNoData(t *testing.T) {
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
 	for _, want := range []string{
-		"🟡 a-perf — 30.0s·TTFT 3.0s·12.3 TPS·деградация",
-		"🟡 a-empty — HTTP 200·пустая генерация",
-		"⚪ a-new — нет данных",
+		"🟡 <code>a-perf</code> - 30.0s | TTFT 3.0s | 12.3 TPS | деградация",
+		"🟡 <code>a-empty</code> - HTTP 200 | пустая генерация",
+		"⚪ <code>a-new</code> - нет данных",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing %q in:\n%s", want, text)
@@ -151,12 +151,12 @@ func TestPanelTruncatesLongError(t *testing.T) {
 		"m": {Status: status.Down, HTTPStatus: 500, ErrorType: "http", ErrorMessage: long},
 	}
 	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
-	lineIdx := strings.Index(text, "🔴 m —")
+	lineIdx := strings.Index(text, "🔴 <code>m</code> -")
 	line := text[lineIdx:]
 	if strings.Count(line, "a") > 40 {
 		t.Fatalf("long error not truncated: %s", line)
 	}
-	if !strings.HasSuffix(strings.TrimSpace(line), "…") {
+	if !strings.HasSuffix(strings.TrimSpace(line), "...") {
 		t.Fatalf("truncation marker missing: %q", line)
 	}
 }

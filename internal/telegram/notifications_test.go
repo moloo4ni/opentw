@@ -55,10 +55,13 @@ func TestNotifyOnlySubscribedChats(t *testing.T) {
 		t.Fatalf("notification must go to chat 100 only, got %v", body["chat_id"])
 	}
 	text := fmt.Sprint(body["text"])
-	for _, want := range []string{"🔴 gpt-6-astra — DOWN", "HTTP 503", "Service Unavailable", "MSK"} {
+	for _, want := range []string{"🔴 <code>gpt-6-astra</code> - недоступна", "HTTP 503", "Service Unavailable", "Время:", "MSK"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("notification missing %q:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "DOWN") || strings.Contains(text, "—") {
+		t.Errorf("old uppercase/english format leaked:\n%s", text)
 	}
 }
 
@@ -106,7 +109,7 @@ func TestRecoveryNotificationIncludesDuration(t *testing.T) {
 	inc := &storage.Incident{ModelID: "gpt-6-astra", From: status.Down, To: status.Operational, Duration: 13*time.Minute + 2*time.Second}
 	b.OnCycle(context.Background(), cycle(nil, transition("gpt-6-astra", status.Down, status.Operational, time.Now(), inc)))
 	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	for _, want := range []string{"🟢 gpt-6-astra — OPERATIONAL", "Восстановлена", "Длительность сбоя: 13м 02с"} {
+	for _, want := range []string{"🟢 <code>gpt-6-astra</code> - восстановилась", "Latency: 2.70s", "TPS: 42.3", "Время:", "Длительность сбоя: 13м 02с"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("recovery missing %q:\n%s", want, text)
 		}
@@ -123,11 +126,11 @@ func TestPartialRecoveryNotification(t *testing.T) {
 	inc := &storage.Incident{ModelID: "gpt-6-astra", From: status.Down, To: status.Degraded, Duration: 5 * time.Minute}
 	b.OnCycle(context.Background(), cycle(nil, transition("gpt-6-astra", status.Down, status.Degraded, time.Now(), inc)))
 	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	if !strings.Contains(text, "🟡 gpt-6-astra — DEGRADED") {
+	if !strings.Contains(text, "🟡 <code>gpt-6-astra</code> - частично восстановилась") {
 		t.Fatalf("text = %s", text)
 	}
-	if !strings.Contains(text, "Частично восстановлена") {
-		t.Fatalf("partial recovery missing:\n%s", text)
+	if !strings.Contains(text, "Длительность сбоя: 5м 00с") {
+		t.Fatalf("duration missing:\n%s", text)
 	}
 }
 
@@ -140,7 +143,7 @@ func TestDegradationNotification(t *testing.T) {
 	}
 	b.OnCycle(context.Background(), cycle(nil, transition("gpt-6-astra", status.Operational, status.Degraded, time.Now(), nil)))
 	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	for _, want := range []string{"🟡 gpt-6-astra — DEGRADED", "HTTP 429", "Upstream rate limit", "Время:"} {
+	for _, want := range []string{"🟡 <code>gpt-6-astra</code> - работает нестабильно", "HTTP 429", "Upstream rate limit", "Время:"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("degradation missing %q:\n%s", want, text)
 		}

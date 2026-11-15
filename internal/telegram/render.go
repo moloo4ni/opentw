@@ -32,7 +32,7 @@ func trunc(s string, n int) string {
 	if len(r) <= n {
 		return s
 	}
-	return string(r[:n]) + "…"
+	return string(r[:n]) + "..."
 }
 
 func f64Ptr(v *float64) (string, bool) {
@@ -61,7 +61,7 @@ func RenderStatusPanel(models []storage.Model, checks map[string]storage.Check, 
 	for _, m := range models {
 		if m.Family != family {
 			family = m.Family
-			b.WriteString("\n" + EscapeHTML(family) + "\n")
+			b.WriteString("\n<b>" + EscapeHTML(family) + "</b>\n")
 		}
 		b.WriteString(modelLine(m, checks[m.ID]))
 		b.WriteString("\n")
@@ -69,25 +69,28 @@ func RenderStatusPanel(models []storage.Model, checks map[string]storage.Check, 
 	return b.String()
 }
 
+// codeID оборачивает model ID в моноширинный формат Telegram.
+func codeID(id string) string { return "<code>" + EscapeHTML(id) + "</code>" }
+
 // modelLine формирует строку одной модели (обязательно одну).
 func modelLine(m storage.Model, c storage.Check) string {
 	if c.Status == "" {
 		// ещё нет ни одной проверки этой модели
-		return "⚪ " + EscapeHTML(m.ID) + " — нет данных"
+		return "⚪ " + codeID(m.ID) + " - нет данных"
 	}
 	emoji := c.Status.Emoji()
 
 	switch {
 	case c.ErrorType == "notfound":
-		return emoji + " " + EscapeHTML(m.ID) + " — нет модели"
+		return emoji + " " + codeID(m.ID) + " - нет модели"
 	case c.ErrorType == "perf":
-		return emoji + " " + EscapeHTML(m.ID) + " — " + metricsTail(c) + "·деградация"
+		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c) + " | деградация"
 	case c.ErrorType == "empty":
-		return emoji + " " + EscapeHTML(m.ID) + " — HTTP 200·пустая генерация"
+		return emoji + " " + codeID(m.ID) + " - HTTP 200 | пустая генерация"
 	case c.ErrorType != "":
-		return emoji + " " + EscapeHTML(m.ID) + " — " + errorHead(c)
+		return emoji + " " + codeID(m.ID) + " - " + errorHead(c)
 	default:
-		return emoji + " " + EscapeHTML(m.ID) + " — " + metricsTail(c)
+		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c)
 	}
 }
 
@@ -110,7 +113,7 @@ func errorHead(c storage.Check) string {
 		return head
 	}
 	msg := trunc(oneLine(c.ErrorMessage), maxPanelErr)
-	return head + "·" + EscapeHTML(msg)
+	return head + " | " + EscapeHTML(msg)
 }
 
 func oneLine(s string) string {
@@ -136,7 +139,7 @@ func metricsTail(c storage.Check) string {
 	if c.InputTokens != nil && c.OutputTokens != nil {
 		parts = append(parts, fmt.Sprintf("%d/%d", *c.InputTokens, *c.OutputTokens))
 	}
-	return strings.Join(parts, "·")
+	return strings.Join(parts, " | ")
 }
 
 // detailErrorLine — полная строка последней ошибки (без обрезки).
