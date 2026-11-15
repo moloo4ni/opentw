@@ -3,3 +3,4 @@
 *.sqlite*
 bin/
 .superpowers/
+config.yaml
