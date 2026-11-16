@@ -5,9 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -34,6 +37,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.assertSchema(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -53,8 +60,18 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("storage: migrate: %w", err)
 	}
 	sort.Strings(names)
-	for i, name := range names {
-		version := i + 1
+	for _, name := range names {
+		// Версия — из числового префикса имени, а не позиции в списке:
+		// вставка/удаление файла не должна сдвигать версии чужих миграций (I6).
+		base := strings.TrimPrefix(name, "migrations/")
+		cut := strings.IndexByte(base, '_')
+		if cut <= 0 {
+			return fmt.Errorf("storage: migrate: bad migration name %q (want NNN_desc.sql)", name)
+		}
+		version, err := strconv.Atoi(base[:cut])
+		if err != nil {
+			return fmt.Errorf("storage: migrate: bad migration name %q (want NNN_desc.sql)", name)
+		}
 		if version <= current {
 			continue
 		}
@@ -77,6 +94,31 @@ func (s *Store) migrate() error {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("storage: migrate %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// assertSchema защищает от баз интерим-сборок: CREATE TABLE IF NOT EXISTS
+// пропускает чужую форму таблицы, а рантайм упал бы «no such column» позже.
+func (s *Store) assertSchema() error {
+	for _, col := range []string{"chat_id", "sent_at", "attempts", "next_attempt_at"} {
+		var one int
+		err := s.db.QueryRow(`SELECT 1 FROM pragma_table_info('notification_outbox') WHERE name = ?`, col).Scan(&one)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("storage: notification_outbox lacks column %q (legacy interim database? restore from a consistent backup)", col)
+		}
+		if err != nil {
+			return fmt.Errorf("storage: schema check: %w", err)
+		}
+	}
+	return nil
+}
+
+// BackupTo writes a consistent snapshot of the (possibly live WAL) database
+// to dst via VACUUM INTO. Fails when dst already exists.
+func (s *Store) BackupTo(dst string) error {
+	if _, err := s.db.Exec(`VACUUM INTO ?`, dst); err != nil {
+		return fmt.Errorf("storage: backup: %w", err)
 	}
 	return nil
 }
