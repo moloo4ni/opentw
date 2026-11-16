@@ -196,14 +196,6 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 	}
 	wg.Wait()
 
-	if _, err := r.cfg.Store.DeleteOldChecks(r.cfg.Retention); err != nil {
-		r.log.Error("monitor: retention cleanup failed", "err", err)
-	}
-	// инциденты флэппинг-моделей растут по ~48 строк/сутки: режем по 30 дням
-	if _, err := r.cfg.Store.DeleteOldIncidents(30 * 24 * time.Hour); err != nil {
-		r.log.Error("monitor: incident cleanup failed", "err", err)
-	}
-
 	res := &CycleResult{
 		CycleAt:     now,
 		NextAt:      NextTick(r.cfg.Interval, now),
@@ -226,6 +218,17 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 	// инцидентные операции — они идемпотентны, D3).
 	if err := r.cfg.Store.ApplyCycle(res.Checks, events, incidents...); err != nil {
 		return nil, fmt.Errorf("commit cycle: %w", err)
+	}
+	// Очистка старых измерений и инцидентов — строго ПОСЛЕ коммита цикла (2.4):
+	// до коммита она могла удалить инцидент, прочитанный планровщиком →
+	// ApplyCycle падал бы («уже закрыт») и ломал фиксацию состояния цикла.
+	// Атомарность ApplyCycle не затрагивается: очистка — отдельные транзакции.
+	if _, err := r.cfg.Store.DeleteOldChecks(r.cfg.Retention); err != nil {
+		r.log.Error("monitor: retention cleanup failed", "err", err)
+	}
+	// инциденты флэппинг-моделей растут по ~48 строк/сутки: режем по 30 дням
+	if _, err := r.cfg.Store.DeleteOldIncidents(30 * 24 * time.Hour); err != nil {
+		r.log.Error("monitor: incident cleanup failed", "err", err)
 	}
 	r.logCycle(res.Checks, events)
 	r.lastOK = true
@@ -367,11 +370,12 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 //   - First-sight non-Operational state opens an incident without an event.
 //   - A notifiable change closes the previous incident and opens a new one.
 //   - Recovery from ⚪ closes the still-open incident (event carries duration).
-//   - ⚪→🔴 with an open incident: the model fell BEFORE the blindness —
-//     the incident lives on from the original fall, no duplicate, no event.
-//   - ⚪→🔴 with no open incident: the model fell DURING the blindness —
-//     an incident opens from this check (true start unknown) and the event
-//     reaches subscribers.
+//   - ⚪→🔴/⚪→🟡 with a matching open incident: the model was in trouble
+//     BEFORE the blindness — the incident lives on from the original fall,
+//     no duplicate, no event (2.2).
+//   - ⚪→🔴/⚪→🟡 with no open incident: the model fell DURING the blindness
+//     — an incident opens from this check (true start unknown) and the event
+//     reaches subscribers (2.1, D2).
 func (r *Runner) planIncident(modelID string, prev, cur status.Status, at time.Time) (op *storage.IncidentOp, closed *storage.Incident, blindFall bool) {
 	if cur == StatusUnknown {
 		return nil, nil, false
@@ -388,20 +392,28 @@ func (r *Runner) planIncident(modelID string, prev, cur status.Status, at time.T
 	if prev == cur {
 		return nil, nil, false
 	}
-	if prev == StatusUnknown && cur == StatusDown {
+	if prev == StatusUnknown && cur != StatusOperational {
 		open, err := r.cfg.Store.CurrentIncident(modelID)
 		if err != nil {
 			r.log.Error("monitor: read open incident failed", "model", modelID, "err", err)
 			return nil, nil, false
 		}
 		if open != nil {
-			// модель как была, так и осталась недоступной: инцидент живёт
-			// с исходного падения, перезапуск не срезал бы длительность
-			return nil, nil, false
+			// слепое окно не меняет картину: открытый инцидент того же состояния
+			// (🟡→⚪→🟡, 🔴→⚪→🔴) живёт с исходного события — без повторного
+			// события, без второго инцидента и без сброса длительности (2.2).
+			// Ухудшение после ⚪ (🟡→⚪→🔴) тоже молчит: инцидент уже открыт,
+			// непрерывность длительности важнее лишнего события.
+			if open.From == cur || cur == StatusDown {
+				return nil, nil, false
+			}
+			// open.From «хуже» cur (🔴→⚪→🟡): улучшение обязано дойти —
+			// обрабатывается общим путём ниже (закрытие + новый инцидент + событие)
+		} else {
+			// состояние возникло В слепое окно (2.1, D2) — инцидент с момента
+			// обнаружения (истинное начало неизвестно), событие обязательно.
+			return &storage.IncidentOp{ModelID: modelID, Open: true, OpenFrom: cur, OpenAt: at}, nil, true
 		}
-		// падение произошло В слепое окно: фиксируем честно — инцидент
-		// с этого момента (истинное начало неизвестно), событие ниже.
-		return &storage.IncidentOp{ModelID: modelID, Open: true, OpenFrom: cur, OpenAt: at}, nil, true
 	}
 	if !cur.Notifiable() {
 		return nil, nil, false // prev != cur and cur is Unknown — handled above

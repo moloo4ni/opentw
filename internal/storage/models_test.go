@@ -338,3 +338,49 @@ func TestApplyCycleIncidentOps(t *testing.T) {
 		t.Fatalf("failed incident op must roll the cycle back: %+v", m)
 	}
 }
+
+// Этап 2.5: SyncModels удаляет подписки на модели, покинувшие конфигурацию,
+// и закрывает открытые инциденты удалённых моделей (2.3) одной транзакцией.
+func TestSyncModelsCleansOrphanSubscriptionsAndIncidents(t *testing.T) {
+	s := openTest(t)
+	if err := s.SyncModels([]Model{{ID: "model-a", Family: "A"}, {ID: "model-b", Family: "B"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSubscription(100, "model-a", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSubscription(100, "model-b", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSubscription(101, "model-a", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.OpenIncident("model-a", status.Down, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// model-a покидает конфигурацию
+	if err := s.SyncModels([]Model{{ID: "model-b", Family: "B"}}); err != nil {
+		t.Fatal(err)
+	}
+	var subsA []string
+	if subs, err := s.Subscriptions(100); err != nil {
+		t.Fatal(err)
+	} else {
+		subsA = subs
+	}
+	if len(subsA) != 1 || subsA[0] != "model-b" {
+		t.Fatalf("subscription to removed model must be dropped: %v", subsA)
+	}
+	subs101, err := s.Subscriptions(101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs101) != 0 {
+		t.Fatalf("all subscriptions of removed model must be dropped: %v", subs101)
+	}
+	// инцидент удалённой модели закрыт (не остаётся открытым навсегда)
+	if open, err := s.HasOpenIncident("model-a"); err != nil || open {
+		t.Fatalf("open incident must be closed when the model leaves the config: %v %v", open, err)
+	}
+}

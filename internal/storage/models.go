@@ -93,7 +93,6 @@ func (s *Store) SyncModels(models []Model) error {
 			return fmt.Errorf("storage: sync models: %w", err)
 		}
 	}
-	var configured string
 	if len(models) > 0 {
 		placeholders := ""
 		args := make([]any, 0, len(models))
@@ -104,9 +103,24 @@ func (s *Store) SyncModels(models []Model) error {
 			placeholders += "?"
 			args = append(args, m.ID)
 		}
-		configured = fmt.Sprintf("DELETE FROM models WHERE model_id NOT IN (%s)", placeholders)
-		if _, err := tx.ExecContext(ctx, configured, args...); err != nil {
-			return fmt.Errorf("storage: sync models: %w", err)
+		// Модель покинула конфигурацию: строка состояния уходит, а вместе с ней —
+		// подписки на неё (2.5, иначе события возвратившейся модели молча
+		// «оживали» бы старые подписки) и открытые инциденты (2.3, иначе они
+		// оставались открытыми навсегда и воровали длительность возврата).
+		// Инцидент закрывается без перехода (to = from): модель просто перестала
+		// наблюдаться, история сохраняется.
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`DELETE FROM models WHERE model_id NOT IN (` + placeholders + `)`, args},
+			{`DELETE FROM subscriptions WHERE model_id NOT IN (` + placeholders + `)`, args},
+			{`UPDATE incidents SET to_status = from_status, ended_at = ? WHERE model_id NOT IN (` + placeholders + `) AND ended_at IS NULL`,
+				append([]any{fmtTime(time.Now())}, args...)},
+		} {
+			if _, err := tx.ExecContext(ctx, q.sql, q.args...); err != nil {
+				return fmt.Errorf("storage: sync models: %w", err)
+			}
 		}
 	}
 	return tx.Commit()
