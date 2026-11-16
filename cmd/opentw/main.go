@@ -9,7 +9,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 
 	"opentw/internal/api"
 	"opentw/internal/config"
@@ -30,6 +33,7 @@ func main() {
 
 func run() error {
 	configPath := flag.String("config", "config.yaml", "path to config.yaml")
+	backup := flag.String("backup", "", "write a consistent SQLite snapshot to this path and exit")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -51,6 +55,16 @@ func run() error {
 		return err
 	}
 	defer store.Close()
+
+	if *backup != "" {
+		// VACUUM INTO: атомарный снапшот живой WAL-базы без остановки и без
+		// sqlite3 в образе; отказ, если файл уже существует (I3)
+		if err := store.BackupTo(*backup); err != nil {
+			return err
+		}
+		log.Info("opentw: backup written", "path", *backup)
+		return nil
+	}
 
 	models := make([]storage.Model, 0, len(cfg.ModelIDs()))
 	for _, family := range cfg.Models {
@@ -78,6 +92,18 @@ func run() error {
 		Interval: cfg.Interval,
 	})
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Порог живости вычисляется из фактического конфига и пишется рядом с
+	// heartbeat: HEALTHCHECK читает его, образ не требует пересборки при
+	// смене интервала (I2). 2×интервал + худший возможный цикл + минута.
+	worstCycle := time.Duration((len(models)+cfg.Concurrency-1)/cfg.Concurrency) * cfg.HTTPTimeout
+	maxAgePath := filepath.Join(filepath.Dir(cfg.SQLitePath), "opentw.heartbeat.maxage")
+	if err := os.WriteFile(maxAgePath, []byte(fmt.Sprintf("%d\n", int64((2*cfg.Interval+worstCycle+time.Minute).Seconds()))), 0o644); err != nil {
+		log.Warn("opentw: heartbeat maxage write failed", "err", err)
+	}
+
 	runner := monitor.NewRunner(monitor.RunnerCfg{
 		API:         apiClient,
 		Store:       store,
@@ -90,28 +116,48 @@ func run() error {
 			LatencyFactor: cfg.Degradation.LatencyFactor,
 			TPSShare:      cfg.Degradation.TPSShare,
 		},
-		OnCycle: func(res monitor.CycleResult) {
-			bot.OnCycle(context.Background(), res)
+		HeartbeatPath: filepath.Join(filepath.Dir(cfg.SQLitePath), "opentw.heartbeat"),
+		// События готовит бот; раннер зафиксирует их атомарно с состояниями (P0-1)
+		OnCycle: func(res monitor.CycleResult) ([]storage.OutboxEvent, error) {
+			return bot.OnCycle(context.Background(), res)
 		},
 		Logger: log,
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	errCh := make(chan error, 2)
-	go func() { errCh <- bot.Run(ctx) }()
-	go func() { errCh <- runner.Run(ctx) }()
-
-	select {
-	case <-ctx.Done():
+	go func() {
+		<-ctx.Done()
 		log.Info("opentw: shutting down")
-		return nil
-	case err := <-errCh:
-		if err != nil {
-			stop()
-			return fmt.Errorf("opentw: component stopped: %w", err)
-		}
-		return nil
+	}()
+
+	// RunDelivery: панели и уведомления доставляются асинхронно от циклов —
+	// недоступный Telegram не останавливает мониторинг, недоставленное уходит в outbox.
+	return supervise(ctx, stop, []func(context.Context) error{bot.Run, bot.RunDelivery, runner.Run})
+}
+
+// supervise держит run() открытой до полного завершения обоих компонентов:
+// отмена (SIGINT/SIGTERM или падение одного из них) → затем wg.Wait() — и
+// только потом run() возвращает управление, где defer store.Close() закрывает
+// базу. Ожидание конечно: сетевые операции бота ограничены его HTTP-клиентом
+// и shutdownFlush.
+func supervise(ctx context.Context, stop context.CancelFunc, components []func(context.Context) error) error {
+	errCh := make(chan error, len(components))
+	var wg sync.WaitGroup
+	for _, run := range components {
+		wg.Add(1)
+		go func(run func(context.Context) error) {
+			defer wg.Done()
+			errCh <- run(ctx)
+		}(run)
 	}
+	var runErr error
+	select {
+	case <-ctx.Done(): // сигнал остановки
+	case err := <-errCh: // компонент остановился сам
+		if err != nil {
+			runErr = fmt.Errorf("opentw: component stopped: %w", err)
+		}
+		stop() // отменяем второй компонент, чтобы run() не ждал его вечно
+	}
+	wg.Wait()
+	return runErr
 }

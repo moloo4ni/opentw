@@ -7,8 +7,17 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - opentw-data:/data
-    # SQLite на томе /data; путь задаётся в config.yaml (sqlite_path)
-    stop_grace_period: 20s
+    # SQLite на томе /data; путь задаётся в config.yaml (sqlite_path).
+    # 35с покрывают плавную остановку: in-flight HTTP-запросы отменяются
+    # контекстом немедленно, недоставленные уведомления доедут из outbox
+    stop_grace_period: 35s
+    # Ротация логов: затяжной сбой (Telegram down, crash-луп) не должен
+    # расти на диске хоста неограниченно
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   opentw-data:
