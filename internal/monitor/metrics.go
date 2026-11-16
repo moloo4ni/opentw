@@ -1,5 +1,6 @@
 package monitor
 
+import "fmt"
 import "sort"
 
 // PerfSample is one successful historical measurement of a model.
@@ -17,11 +18,11 @@ type PerfCfg struct {
 }
 
 // DegradedByPerf decides a substantial performance regression from the
-// model's own history. Conservative: needs MinSamples, and single
-// small fluctuations never trip it.
-func DegradedByPerf(cfg PerfCfg, samples []PerfSample, cur PerfSample) bool {
+// model's own history and explains it with numbers. Conservative: needs
+// MinSamples, and single small fluctuations never trip it.
+func DegradedByPerf(cfg PerfCfg, samples []PerfSample, cur PerfSample) (bool, string) {
 	if len(samples) < cfg.MinSamples || cfg.MinSamples < 1 {
-		return false
+		return false, ""
 	}
 
 	lat := make([]int64, 0, len(samples))
@@ -38,17 +39,18 @@ func DegradedByPerf(cfg PerfCfg, samples []PerfSample, cur PerfSample) bool {
 	if cur.LatencyUS > 0 && len(lat) >= cfg.MinSamples {
 		p95 := percentileInt64(lat, 0.95)
 		if p95 > 0 && float64(cur.LatencyUS) > float64(p95)*cfg.LatencyFactor {
-			return true
+			return true, fmt.Sprintf("latency %.1fs против P95 %.1fs за 24ч",
+				float64(cur.LatencyUS)/1e6, float64(p95)/1e6)
 		}
 	}
 
 	if cur.HasTPS && cur.TPS > 0 && len(tpsVals) >= cfg.MinSamples {
 		med := medianF64(tpsVals)
 		if med > 0 && cur.TPS < med*cfg.TPSShare {
-			return true
+			return true, fmt.Sprintf("TPS %.1f против медианы %.1f за 24ч", cur.TPS, med)
 		}
 	}
-	return false
+	return false, ""
 }
 
 func percentileInt64(v []int64, q float64) int64 {

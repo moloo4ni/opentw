@@ -44,6 +44,11 @@ func Classify(res api.RawResult) Status {
 		case looksLikeModelNotFound(res.ErrorMessage):
 			// 400 от роутера: модель/провайдер не обслуживается.
 			return StatusDown
+		case looksLikeModelOffline(res.ErrorMessage):
+			// Провайдер явно сообщает, что конкретная модель offline
+			// («The model kimi-k2.6 has been offline», HTTP 400) — это 🔴,
+			// а не «монитор не может проверить».
+			return StatusDown
 		default:
 			// Other 4xx: incompatible request/response shape — monitoring issue.
 			return StatusUnknown
@@ -72,4 +77,27 @@ func looksLikeModelNotFound(msg string) bool {
 		}
 	}
 	return false
+}
+
+// looksLikeModelOffline распознаёт узкий класс сообщений, в которых сам
+// провайдер заявляет недоступность конкретной модели: живые формулировки
+// аудита — «The model kimi-k2.6 has been offline» и «model "..." not
+// available» (HTTP 400). Прочие 4xx (несовместимый запрос, конфигурация,
+// квота/аккаунты) сюда не попадают и остаются ⚪ Unknown.
+func looksLikeModelOffline(msg string) bool {
+	m := strings.ToLower(msg)
+	for _, marker := range []string{
+		"has been offline",
+		"is offline",
+		"was offline",
+	} {
+		if strings.Contains(m, marker) {
+			return true
+		}
+	}
+	// «model … not available»: слово о конкретной модели, идущее РАНЬШЕ
+	// заявления о недоступности. «tool use is not available for this model»
+	// и «no available accounts» под маркер не подходят.
+	mi, ni := strings.Index(m, "model"), strings.Index(m, "not available")
+	return mi >= 0 && ni > mi
 }

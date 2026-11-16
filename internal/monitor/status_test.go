@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"strings"
 	"testing"
 
 	"opentw/internal/api"
@@ -74,50 +75,98 @@ func TestDegradedByPerf(t *testing.T) {
 
 	t.Run("insufficient history", func(t *testing.T) {
 		s := samples(histLat[:11], nil)
-		if DegradedByPerf(cfg, s, PerfSample{LatencyUS: 10_000_000}) {
+		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 10_000_000}); degraded {
 			t.Fatal("must not degrade with too few samples")
 		}
 	})
 
 	t.Run("latency spike", func(t *testing.T) {
 		s := samples(histLat, nil)
-		if !DegradedByPerf(cfg, s, PerfSample{LatencyUS: 1_000_000}) {
+		degraded, reason := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 1_000_000})
+		if !degraded {
 			t.Fatal("latency 10x history must degrade")
+		}
+		if !strings.Contains(reason, "P95") {
+			t.Fatalf("latency reason must cite P95: %q", reason)
 		}
 	})
 
 	t.Run("small fluctuation", func(t *testing.T) {
 		s := samples(histLat, nil)
-		if DegradedByPerf(cfg, s, PerfSample{LatencyUS: 120_000}) {
+		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 120_000}); degraded {
 			t.Fatal("1.2x fluctuation must not degrade")
 		}
 	})
 
 	t.Run("tps collapse", func(t *testing.T) {
 		s := samples(histLat, histTPS)
-		if !DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 10, HasTPS: true}) {
+		degraded, reason := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 10, HasTPS: true})
+		if !degraded {
 			t.Fatal("TPS collapse must degrade")
+		}
+		if !strings.Contains(reason, "медианы") {
+			t.Fatalf("tps reason must cite median: %q", reason)
 		}
 	})
 
 	t.Run("tps mild dip", func(t *testing.T) {
 		s := samples(histLat, histTPS)
-		if DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 80, HasTPS: true}) {
+		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 80, HasTPS: true}); degraded {
 			t.Fatal("TPS 80 of ~100 must not degrade (share 0.4)")
 		}
 	})
 
 	t.Run("current without tps ignores tps rule", func(t *testing.T) {
 		s := samples(histLat, histTPS)
-		if DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000}) {
+		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000}); degraded {
 			t.Fatal("latency fine, no TPS data — must not degrade")
 		}
 	})
 
 	t.Run("history without tps skips tps rule", func(t *testing.T) {
 		s := samples(histLat, nil)
-		if DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 1, HasTPS: true}) {
+		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 1, HasTPS: true}); degraded {
 			t.Fatal("no TPS history: rule cannot fire")
 		}
 	})
+}
+
+func msg(kind string, httpStatus int, m string) api.RawResult {
+	return api.RawResult{ErrorKind: kind, HTTPStatus: httpStatus, ErrorMessage: m}
+}
+
+// Провайдер сам заявляет недоступность модели — живые формулировки live-аудита
+// (kimi-k2.6 «has been offline», kimi-k3 «model "..." not available», HTTP 400)
+// обязаны давать 🔴; похожие ошибки не про недоступность модели — остаются ⚪.
+func TestClassifyProviderOfflineMessages(t *testing.T) {
+	cases := []struct {
+		name string
+		res  api.RawResult
+		want Status
+	}{
+		// живые формулировки аудита
+		{"400 kimi has been offline", msg("http", 400, "The model kimi-k2.6 has been offline"), StatusDown},
+		{"400 kimi not available", msg("http", 400, `model "<待填目标模型>" not available`), StatusDown},
+		// близкие варианты той же семантики
+		{"400 is offline", msg("http", 400, "The model gpt-x is offline"), StatusDown},
+		{"400 was offline", msg("http", 400, "model was offline during maintenance"), StatusDown},
+		{"422 offline wording", msg("http", 422, "The model kimi-k3 has been offline"), StatusDown},
+		// похожие, но НЕ о недоступности модели
+		{"400 upstream error", msg("http", 400, "Upstream error: 400"), StatusUnknown},
+		{"400 incompatible param", msg("http", 400, "Invalid request: parameter 'max_tokens' not available in this mode"), StatusUnknown},
+		{"400 not-available before model", msg("http", 400, "tool use is not available for this model"), StatusUnknown},
+		{"400 no available accounts", msg("http", 400, "No available accounts. Please retry after 12:34 MSK"), StatusUnknown},
+		{"400 request config", msg("http", 400, "Unknown request configuration"), StatusUnknown},
+		{"401 stays unknown despite wording", msg("http", 401, "The model x is offline"), StatusUnknown},
+		// существующие маркеры «модель не найдена» продолжают работать
+		{"400 unknown provider", msg("http", 400, "Unknown provider for model 'kimi-k3'"), StatusDown},
+		{"400 invalid model", msg("http", 400, "Invalid model."), StatusDown},
+		{"400 no such model", msg("http", 400, "No such model: gpt-x"), StatusDown},
+		{"400 model not found", msg("http", 400, "Model not found in registry"), StatusDown},
+	}
+	for _, tc := range cases {
+		if got := Classify(tc.res); got != tc.want {
+			t.Errorf("%s: Classify = %q, want %q", tc.name, got, tc.want)
+		}
+	}
 }

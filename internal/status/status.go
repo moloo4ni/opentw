@@ -26,20 +26,6 @@ func (s Status) Emoji() string {
 	}
 }
 
-// Title returns the human-readable status name.
-func (s Status) Title() string {
-	switch s {
-	case Operational:
-		return "Operational"
-	case Degraded:
-		return "Degraded"
-	case Down:
-		return "Down"
-	default:
-		return "Unknown"
-	}
-}
-
 // Notifiable reports whether the state participates in event notifications
 // (only 🟢/🟡/🔴 transitions are events; ⚪ is a monitoring problem).
 func (s Status) Notifiable() bool {

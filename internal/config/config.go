@@ -17,7 +17,6 @@ const (
 	minIntervalStr = "5m"
 	minTimeoutStr  = "5s"
 	minTokens      = 1
-	absentString   = "N/A"
 )
 
 // Degradation holds conservative performance-degradation thresholds.
@@ -59,9 +58,6 @@ type Config struct {
 
 // ModelIDs returns the flattened, ordered list of monitored model IDs.
 func (c *Config) ModelIDs() []string { return c.modelIDs }
-
-// Absent is the sentinel string shown for unavailable metrics.
-func (c *Config) Absent() string { return absentString }
 
 // Load reads the YAML file and env vars and validates the result.
 func Load(path string) (*Config, error) {

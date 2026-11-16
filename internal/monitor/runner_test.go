@@ -2,7 +2,11 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -49,6 +53,8 @@ func (f *fakeAPI) calls(modelID string) int {
 
 func ptrLat(v int64) *int64 { return &v }
 
+func ptrFloat(v float64) *float64 { return &v }
+
 func okResult(id string, latUS int64, tps float64) *api.RawResult {
 	return &api.RawResult{
 		ModelID: id, Timestamp: time.Now(), ErrorKind: "", HTTPStatus: 200,
@@ -81,9 +87,52 @@ func newRunner(t *testing.T, f *fakeAPI, models []storage.Model) (*Runner, *[]Cy
 		MaxTokens:   8,
 		Interval:    time.Minute,
 		Perf:        PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4},
-		OnCycle:     func(res CycleResult) { *results = append(*results, res) },
+		OnCycle: func(res CycleResult) ([]storage.OutboxEvent, error) {
+			*results = append(*results, res)
+			return nil, nil
+		},
 	})
 	return r, results
+}
+
+// Расписание циклов привязано к границам интервала, а не к моменту
+// старта: при 15м проверки идут в :00/:15/:30/:45 независимо от того,
+// когда процесс запущен.
+func TestNextTickAligned(t *testing.T) {
+	m := func(h, min, s int) time.Time { return time.Date(2026, 11, 16, h, min, s, 0, time.UTC) }
+	for _, tc := range []struct {
+		from, want time.Time
+	}{
+		{m(13, 52, 6), m(14, 0, 0)},   // старт между границами → ближайшая
+		{m(14, 0, 0), m(14, 15, 0)},   // ровно на границе → следующая
+		{m(14, 14, 59), m(14, 15, 0)}, // за секунду до границы
+	} {
+		if got := NextTick(15*time.Minute, tc.from); !got.Equal(tc.want) {
+			t.Fatalf("NextTick(15m, %s) = %s, want %s", tc.from, got, tc.want)
+		}
+	}
+	if got := NextTick(time.Hour, m(13, 30, 0)); !got.Equal(m(14, 0, 0)) {
+		t.Fatalf("NextTick(1h, 13:30) = %s, want 14:00", got)
+	}
+}
+
+// Ошибка чтения предыдущих состояний прерывает цикл: без них корректная
+// классификация переходов невозможна (иначе откроются дубли инцидентов).
+func TestCycleAbortsWhenStatesUnreadable(t *testing.T) {
+	f := newFakeAPI([]string{"model-a", "model-b"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	r, _ := newRunner(t, f, basicModels())
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.Store().Close() // следующие операции с хранилищем обязаны ошибаться
+	_, err := r.RunCycle(context.Background())
+	if err == nil {
+		t.Fatal("cycle must abort when previous states are unreadable")
+	}
+	if n := f.calls("model-a"); n != 1 {
+		t.Fatalf("no model may be re-checked after failed state read: got %d generate calls", n)
+	}
 }
 
 func basicModels() []storage.Model {
@@ -123,6 +172,11 @@ func TestFirstCycleBaselineNoEvents(t *testing.T) {
 	last, _ := r.Store().LastChecks()
 	if len(last) != 2 || last["model-b"].HTTPStatus != 503 {
 		t.Fatalf("checks = %+v", last)
+	}
+	// D2-сценарий B: первое наблюдение Down — базлайн без уведомления,
+	// но инцидент (учёт длительности) открывается.
+	if open, _ := r.Store().HasOpenIncident("model-b"); !open {
+		t.Fatal("first-sight Down must still open an incident (baseline accounting)")
 	}
 	if last["model-b"].ErrorMessage != "Service Unavailable" {
 		t.Fatalf("provider message lost: %+v", last["model-b"])
@@ -375,5 +429,648 @@ func TestSingleFlight(t *testing.T) {
 	}
 	if _, err := r.RunCycle(context.Background()); err != nil {
 		t.Fatalf("cycle after completion must run: %v", err)
+	}
+}
+
+// Сбой транспорта при каталоге + транспортные же ошибки моделей → у всех
+// ⚪ Unknown («монитор не может проверить»), а не 27 ложных «модель упала».
+func TestCatalogTransportMarksUnknown(t *testing.T) {
+	f := newFakeAPI(nil)
+	f.catErr = errors.New("api: models: dial tcp: connection refused")
+	f.hook = func(id string) *api.RawResult {
+		return &api.RawResult{ModelID: id, Timestamp: time.Now(), ErrorKind: "timeout", ErrorMessage: "context deadline exceeded", LatencyUS: 120_000_000}
+	}
+	r, res0 := newRunner(t, f, basicModels())
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 0 {
+		t.Fatalf("monitor-wide transport failure must not emit events: %+v", res.Transitions)
+	}
+	for _, id := range []string{"model-a", "model-b"} {
+		m, _ := r.Store().Model(id)
+		if m.LastStatus != StatusUnknown {
+			t.Fatalf("%s status = %q, want Unknown", id, m.LastStatus)
+		}
+	}
+	last, _ := r.Store().LastChecks()
+	if last["model-a"].ErrorType != "timeout" {
+		t.Fatalf("raw error must be recorded verbatim: %+v", last["model-a"])
+	}
+	_ = res0
+}
+
+// Каталог в 429 (лимит ключа монитора) + модели в 429 → у моделей ⚪.
+func TestCatalogRatelimitMarksUnknown(t *testing.T) {
+	f := newFakeAPI(nil)
+	f.catErr = errors.New("api: models: HTTP 429: Too Many Requests")
+	f.hook = func(id string) *api.RawResult {
+		if id == "model-b" { // модель с другой ошибкой остаётся при своём статусе
+			return errResult(id, 500, "boom")
+		}
+		return errResult(id, 429, "Too Many Requests")
+	}
+	r, _ := newRunner(t, f, basicModels())
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := r.Store().Model("model-a")
+	if m.LastStatus != StatusUnknown {
+		t.Fatalf("429 under monitor rate limit = %q, want Unknown", m.LastStatus)
+	}
+	mb, _ := r.Store().Model("model-b")
+	if mb.LastStatus != StatusDown {
+		t.Fatalf("unrelated 500 must stay Down, got %q", mb.LastStatus)
+	}
+}
+
+// Живой каталог: транспортные ошибки моделей — честные 🔴 (не «проблема монитора»).
+func TestCatalogOKStillDown(t *testing.T) {
+	f := newFakeAPI([]string{"model-a", "model-b"})
+	f.hook = func(id string) *api.RawResult {
+		return &api.RawResult{ModelID: id, Timestamp: time.Now(), ErrorKind: "timeout", ErrorMessage: "context deadline exceeded"}
+	}
+	r, _ := newRunner(t, f, basicModels())
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := r.Store().Model("model-a")
+	if m.LastStatus != StatusDown {
+		t.Fatalf("live catalog + model timeout must be Down, got %q", m.LastStatus)
+	}
+}
+
+// Тихое восстановление из Unknown устранено: после ⚪-периода (сбитый ключ)
+// восстановление модели доходит подписчикам, длительность инцидента честная.
+func TestRecoveryFromUnknownEmitsEvent(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	if _, err := r.RunCycle(context.Background()); err != nil { // первое наблюдение Down
+		t.Fatal(err)
+	}
+	f.hook = func(id string) *api.RawResult { return errResult(id, 500, "keep down") }
+	if _, err := r.RunCycle(context.Background()); err != nil { // 503 → 500: Down→Down, но инцидент уже открыт после 503
+		t.Fatal(err)
+	}
+	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
+	if _, err := r.RunCycle(context.Background()); err != nil { // ⚪ Unknown
+		t.Fatal(err)
+	}
+	m, _ := r.Store().Model("model-a")
+	if m.LastStatus != StatusUnknown {
+		t.Fatalf("status after 401 = %q", m.LastStatus)
+	}
+	f.hook = func(id string) *api.RawResult { return okResult(id, 900_000, 55) }
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 1 {
+		t.Fatalf("recovery from Unknown must emit one event: %+v", res.Transitions)
+	}
+	tr := res.Transitions[0]
+	if tr.From != StatusUnknown || tr.To != StatusOperational {
+		t.Fatalf("transition = %+v", tr)
+	}
+	if tr.Incident == nil || tr.Incident.From != StatusDown || tr.Incident.Duration <= 0 {
+		t.Fatalf("incident duration lost: %+v", tr.Incident)
+	}
+	if open, _ := r.Store().HasOpenIncident("model-a"); open {
+		t.Fatal("incident must be closed")
+	}
+}
+
+// Кратковременный ⚪ без открытого инцидента (была 🟢) → восстановления-события нет.
+func TestUnknownBlipAfterOperationalNoEvent(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 0 {
+		t.Fatalf("no-incident blip needs no event: %+v", res.Transitions)
+	}
+}
+
+// Перезапуск во время инцидента: постоянный Down не эмитит повторных событий.
+func TestRestartWhileDownNoFalseTransitions(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := dir + "/test.db"
+	mkRunner := func() *Runner {
+		s, err := storage.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		if err := s.SyncModels(basicModels()); err != nil {
+			t.Fatal(err)
+		}
+		f := newFakeAPI([]string{"model-a", "model-b"})
+		f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
+		return NewRunner(RunnerCfg{API: f, Store: s, Models: basicModels(), Concurrency: 2, MaxTokens: 8, Interval: time.Minute, Perf: PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4}})
+	}
+	r1 := mkRunner()
+	if _, err := r1.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r2 := mkRunner()
+	res, err := r2.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 0 {
+		t.Fatalf("restart must not duplicate a running incident: %+v", res.Transitions)
+	}
+	if open, _ := r2.Store().HasOpenIncident("model-a"); !open {
+		t.Fatal("incident must continue across restart")
+	}
+}
+
+// Основа perf-деградации видна в данных проверки (числа, не слова).
+func TestPerfReasonInCheck(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 10_000_000, 40) } // latency 10s
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	now := time.Now()
+	for i := 0; i < 12; i++ {
+		if err := r.Store().InsertCheck(storage.Check{
+			ModelID: "model-a", At: now.Add(-time.Duration(24-i) * time.Minute),
+			HTTPStatus: 200, Status: StatusOperational, LatencyUS: ptrLat(100_000), TPS: ptrFloat(40.0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Store().SetModelState("model-a", StatusOperational, "", "", now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := res.Checks["model-a"]
+	if c.ErrorType != "perf" {
+		t.Fatalf("check = %+v", c)
+	}
+	if !strings.Contains(c.ErrorMessage, "latency 10.0s") || !strings.Contains(c.ErrorMessage, "P95") {
+		t.Fatalf("perf reason must carry numbers, got %q", c.ErrorMessage)
+	}
+}
+
+// Цикл вычищает инциденты старше retention (D7).
+func TestIncidentRetentionInCycle(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	r, _ := newRunner(t, f, basicModels())
+	if err := r.cfg.Store.OpenIncident("model-z", StatusDown, time.Now().Add(-31*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.cfg.Store.OpenIncident("model-y", StatusDown, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if open, _ := r.Store().HasOpenIncident("model-z"); open {
+		t.Fatal("31d-old incident must be cleaned by the cycle")
+	}
+	if open, _ := r.Store().HasOpenIncident("model-y"); !open {
+		t.Fatal("fresh incident must survive")
+	}
+}
+
+// D9: heartbeat-файл обновляется в конце каждого цикла (основа HEALTHCHECK).
+func TestHeartbeatFileWritten(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	path := t.TempDir() + "/opentw.heartbeat"
+	s, err := storage.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.SyncModels([]storage.Model{{ID: "model-a", Family: "A"}}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRunner(RunnerCfg{
+		API: f, Store: s, Models: []storage.Model{{ID: "model-a", Family: "A"}},
+		Concurrency: 1, MaxTokens: 8, Interval: time.Minute, HeartbeatPath: path,
+	})
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("heartbeat before first cycle")
+	}
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("heartbeat after cycle: %v", err)
+	}
+	if time.Since(st.ModTime()) > time.Minute {
+		t.Fatalf("heartbeat must be fresh: %v", st.ModTime())
+	}
+}
+
+// Мусорный ответ каталога — не транспортный сбой: совпадающих с ним
+// ошибок моделей он не «гасит» (Rev-1).
+func TestCatalogInvalidJSONNotTransport(t *testing.T) {
+	f := newFakeAPI(nil)
+	f.catErr = errors.New("api: models: invalid response: bad json")
+	f.hook = func(id string) *api.RawResult {
+		return &api.RawResult{ModelID: id, Timestamp: time.Now(), ErrorKind: "timeout", ErrorMessage: "deadline"}
+	}
+	r, _ := newRunner(t, f, basicModels())
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := r.Store().Model("model-a")
+	if m.LastStatus != StatusDown {
+		t.Fatalf("unparseable catalog must not mask a real outage: %q", m.LastStatus)
+	}
+}
+
+// Unknown→Down не перезапускает инцидент: длительность считается от
+// исходного падения, а не от «прозрения» монитора (Rev-5).
+func TestUnknownToDownKeepsOriginalIncident(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	if _, err := r.RunCycle(context.Background()); err != nil { // Down
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
+	if _, err := r.RunCycle(context.Background()); err != nil { // ⚪ (инцидент остаётся открытым)
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
+	if _, err := r.RunCycle(context.Background()); err != nil { // снова Down
+		t.Fatal(err)
+	}
+	// D2-сценарий C: старый инцидент не дублируется и остаётся открытым —
+	// длительность считается от исходного падения, не от «прозрения».
+	if open, _ := r.Store().HasOpenIncident("model-a"); !open {
+		t.Fatal("original incident must stay open through the blind period")
+	}
+	time.Sleep(10 * time.Millisecond)
+	f.hook = func(id string) *api.RawResult { return okResult(id, 900_000, 55) }
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 1 {
+		t.Fatalf("recovery expected: %+v", res.Transitions)
+	}
+	inc := res.Transitions[0].Incident
+	if inc == nil || inc.Duration < 20*time.Millisecond {
+		t.Fatalf("duration must span from the original fall, not the monitor blip: %+v", inc)
+	}
+}
+
+// P0-1: сбой подготовки событий (подписки недоступны) не должен фиксировать
+// состояния — иначе события цикла терялись бы навсегда (следующий цикл видел
+// prev == cur). Следующий цикл обязан переоткрыть переход.
+func TestOnCycleErrorKeepsState(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	models := []storage.Model{{ID: "model-a", Family: "A"}}
+	s, err := storage.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.SyncModels(models); err != nil {
+		t.Fatal(err)
+	}
+
+	var fail bool
+	r := NewRunner(RunnerCfg{
+		API: f, Store: s, Models: models, Concurrency: 2, MaxTokens: 8, Interval: time.Minute,
+		OnCycle: func(res CycleResult) ([]storage.OutboxEvent, error) {
+			if fail {
+				return nil, errors.New("subscribers unavailable")
+			}
+			return nil, nil
+		},
+	})
+
+	// базлайн: модель работает
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// модель падает, но фиксация невозможна
+	fail = true
+	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "boom") }
+	if _, err := r.RunCycle(context.Background()); err == nil {
+		t.Fatal("cycle must fail when events cannot be prepared")
+	}
+	m, err := s.Model("model-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.LastStatus != StatusOperational {
+		t.Fatalf("failed cycle must not commit state, got %q", m.LastStatus)
+	}
+	// доставка восстановилась: следующий цикл обязан переоткрыть переход
+	fail = false
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 1 || res.Transitions[0].To != StatusDown {
+		t.Fatalf("transition must be re-opened: %+v", res.Transitions)
+	}
+	m, err = s.Model("model-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.LastStatus != StatusDown {
+		t.Fatalf("state must be committed now, got %q", m.LastStatus)
+	}
+}
+
+// I1: проваленный цикл (мёртвая база) не освежает heartbeat — HEALTHCHECK
+// обязан краснеть, а не показывать вечно живой монитор.
+func TestHeartbeatNotRefreshedByFailedCycle(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult("model-a", 1_000_000, 40) }
+	path := t.TempDir() + "/opentw.heartbeat"
+	s, err := storage.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := basicModels()
+	if err := s.SyncModels(models); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRunner(RunnerCfg{
+		API: f, Store: s, Models: models, Concurrency: 1, MaxTokens: 8, Interval: time.Minute,
+		HeartbeatPath: path,
+	})
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := st.ModTime()
+
+	// база умерла: чтение предыдущих состояний проваливается. Первый
+	// проваленный цикл ещё имел право на стартовый heartbeat (прошый цикл
+	// был успешен, монитор был жив на старте), второй подряд — уже нет.
+	s.Close()
+	if _, err := r.RunCycle(context.Background()); err == nil {
+		t.Fatal("cycle must fail with closed store")
+	}
+	st, err = os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterFirst := st.ModTime()
+	if _, err := r.RunCycle(context.Background()); err == nil {
+		t.Fatal("second cycle must fail too")
+	}
+	st, err = os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.ModTime().Equal(afterFirst) {
+		t.Fatalf("consecutively failed cycles must not refresh heartbeat: %v -> %v", afterFirst, st.ModTime())
+	}
+	if !afterFirst.After(fresh.Add(-time.Second)) {
+		t.Fatalf("sanity: first failing cycle ran after baseline: %v", afterFirst)
+	}
+}
+
+// Рестарт посреди цикла (P0-1): состояния, зафиксированные до рестарта,
+// не опережают события — применяются одним коммитом в конце цикла.
+// Проверяем через OnCycle: события, подготовленные вместе с состояниями,
+// оказываются в outbox тем же коммитом.
+func TestCycleCommitsStateAndEventsTogether(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	models := basicModels()
+	s, err := storage.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.SyncModels(models); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetModelState("model-a", StatusOperational, "", "", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRunner(RunnerCfg{
+		API: f, Store: s, Models: models, Concurrency: 1, MaxTokens: 8, Interval: time.Minute,
+		OnCycle: func(res CycleResult) ([]storage.OutboxEvent, error) {
+			var evs []storage.OutboxEvent
+			for _, tr := range res.Transitions {
+				payload, _ := json.Marshal(tr)
+				evs = append(evs, storage.OutboxEvent{ChatID: 42, Kind: "single", DedupeKey: fmt.Sprintf("%d", res.CycleAt.UnixNano()), Payload: payload})
+			}
+			return evs, nil
+		},
+	})
+	// первый цикл: без переходов
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// модель падает — событие готовится и фиксируется коммитом цикла
+	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "boom") }
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.PendingOutbox(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ChatID != 42 {
+		t.Fatalf("cycle must commit its event: %+v", rows)
+	}
+	m, _ := s.Model("model-a")
+	if m.LastStatus != StatusDown {
+		t.Fatalf("state = %q", m.LastStatus)
+	}
+}
+
+// D2-сценарий A: модель была 🟢, монитор временно ослеп (401 → ⚪), за это
+// время модель реально упала, зрение вернулось и API подтверждает 🔴.
+// Падение обязано дойти подписчику событием, инцидент — открыться; время
+// начала недоступности неизвестно и длительность не выдумывается.
+func TestFallDuringBlindnessNotified(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	if _, err := r.RunCycle(context.Background()); err != nil { // 🟢 базлайн
+		t.Fatal(err)
+	}
+	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
+	res, err := r.RunCycle(context.Background()) // ⚪ слепота монитора
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 0 {
+		t.Fatalf("blindness must not emit events: %+v", res.Transitions)
+	}
+	m, _ := r.Store().Model("model-a")
+	if m.LastStatus != StatusUnknown {
+		t.Fatalf("status after 401 = %q", m.LastStatus)
+	}
+	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
+	res, err = r.RunCycle(context.Background()) // зрение вернулось: подтверждённое падение
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 1 {
+		t.Fatalf("confirmed fall during blindness must reach subscribers: %+v", res.Transitions)
+	}
+	tr := res.Transitions[0]
+	if tr.From != StatusUnknown || tr.To != StatusDown {
+		t.Fatalf("transition = %+v", tr)
+	}
+	if tr.Incident != nil && tr.Incident.Duration > 0 {
+		t.Fatalf("start time is unknown — duration must not be fabricated: %+v", tr.Incident)
+	}
+	if open, _ := r.Store().HasOpenIncident("model-a"); !open {
+		t.Fatal("incident must be opened on the discovered fall")
+	}
+	m, _ = r.Store().Model("model-a")
+	if m.LastStatus != StatusDown {
+		t.Fatalf("state must be committed as Down: %+v", m)
+	}
+	last, _ := r.Store().LastChecks()
+	if last["model-a"].ErrorMessage != "Service Unavailable" {
+		t.Fatalf("provider message lost: %+v", last["model-a"])
+	}
+	// D2-сценарий D: восстановление приходит с честной длительностью —
+	// от момента обнаружения падения (не выдуманной).
+	time.Sleep(10 * time.Millisecond)
+	f.hook = func(id string) *api.RawResult { return okResult(id, 900_000, 55) }
+	res, err = r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 1 {
+		t.Fatalf("recovery must emit: %+v", res.Transitions)
+	}
+	rec := res.Transitions[0]
+	if rec.From != StatusDown || rec.To != StatusOperational {
+		t.Fatalf("recovery transition = %+v", rec)
+	}
+	if rec.Incident == nil || rec.Incident.Duration <= 0 {
+		t.Fatalf("recovery must carry the incident duration: %+v", rec.Incident)
+	}
+	if open, _ := r.Store().HasOpenIncident("model-a"); open {
+		t.Fatal("incident must be closed on recovery")
+	}
+}
+
+// D3: инциденты применяются только вместе с коммитом цикла. Сбой подготовки
+// событий после планирования не оставляет ни открытого инцидента, ни дублей
+// после успешного повтора; восстановление закрывает ровно один инцидент.
+func TestIncidentsAtomicWithCycleCommit(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
+	models := []storage.Model{{ID: "model-a", Family: "A"}}
+	s, err := storage.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.SyncModels(models); err != nil {
+		t.Fatal(err)
+	}
+	var fail bool
+	r := NewRunner(RunnerCfg{
+		API: f, Store: s, Models: models, Concurrency: 2, MaxTokens: 8, Interval: time.Minute,
+		OnCycle: func(res CycleResult) ([]storage.OutboxEvent, error) {
+			if fail {
+				return nil, errors.New("subscribers unavailable")
+			}
+			return nil, nil
+		},
+	})
+	// цикл спланировал инцидент, но провалился до коммита: ничего не записано
+	fail = true
+	if _, err := r.RunCycle(context.Background()); err == nil {
+		t.Fatal("cycle must fail when events cannot be prepared")
+	}
+	if open, _ := s.HasOpenIncident("model-a"); open {
+		t.Fatal("failed cycle must not leave an open incident (D3)")
+	}
+	m, _ := s.Model("model-a")
+	if m.LastStatus != "" {
+		t.Fatalf("failed cycle must not commit state, got %q", m.LastStatus)
+	}
+	// успешный повтор открывает инцидент ровно один раз
+	fail = false
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if open, _ := s.HasOpenIncident("model-a"); !open {
+		t.Fatal("successful cycle must open the incident")
+	}
+	// восстановление закрывает его; при дубликатах открытым остался бы
+	// старый (закрывается только новейший) — длительность не теряется
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Transitions) != 1 {
+		t.Fatalf("recovery expected: %+v", res.Transitions)
+	}
+	if res.Transitions[0].Incident == nil || res.Transitions[0].Incident.Duration <= 0 {
+		t.Fatalf("recovery must carry duration: %+v", res.Transitions[0])
+	}
+	if open, _ := s.HasOpenIncident("model-a"); open {
+		t.Fatal("recovery must close the incident; duplicates would leave it open (D3)")
+	}
+}
+
+// Классификация offline-заявлений провайдера: живой ответ kimi-k2.6
+// «The model kimi-k2.6 has been offline» (HTTP 400) — это 🔴, а не ⚪:
+// событие подписчикам, инцидент, дословно сохранённая причина.
+func TestProviderOfflineMessageIsDown(t *testing.T) {
+	f := newFakeAPI([]string{"kimi-k2.6"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "kimi-k2.6", Family: "KIMI"}})
+	if _, err := r.RunCycle(context.Background()); err != nil { // 🟢 базлайн
+		t.Fatal(err)
+	}
+	f.hook = func(id string) *api.RawResult {
+		return errResult(id, 400, "The model kimi-k2.6 has been offline")
+	}
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := r.Store().Model("kimi-k2.6")
+	if m.LastStatus != StatusDown {
+		t.Fatalf("explicit provider offline must be Down, got %q", m.LastStatus)
+	}
+	if len(res.Transitions) != 1 || res.Transitions[0].To != StatusDown {
+		t.Fatalf("subscribers must learn the model is down: %+v", res.Transitions)
+	}
+	if open, _ := r.Store().HasOpenIncident("kimi-k2.6"); !open {
+		t.Fatal("incident must be opened")
+	}
+	last, _ := r.Store().LastChecks()
+	if last["kimi-k2.6"].ErrorMessage != "The model kimi-k2.6 has been offline" {
+		t.Fatalf("provider wording must be preserved verbatim: %+v", last["kimi-k2.6"])
 	}
 }
