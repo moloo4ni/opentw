@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"opentw/internal/monitor"
 	"opentw/internal/status"
@@ -60,24 +59,6 @@ func (b *Bot) prepareTransitions(res monitor.CycleResult) ([]storage.OutboxEvent
 	return events, nil
 }
 
-// humanDuration — длительность инцидента в человекочитаемом виде.
-func humanDuration(d time.Duration) string {
-	sec := int64(d.Seconds())
-	if sec < 0 {
-		sec = 0
-	}
-	switch {
-	case sec == 0:
-		return "0с"
-	case sec < 60:
-		return fmt.Sprintf("%dс", sec)
-	case sec < 3600:
-		return fmt.Sprintf("%dм %02dс", sec/60, sec%60)
-	default:
-		return fmt.Sprintf("%dч %02dм", sec/3600, (sec%3600)/60)
-	}
-}
-
 // RenderNotification форматирует одиночное событийное уведомление: русский
 // строчный глагол в заголовке, исходные данные провайдера в теле, время и длительность.
 func RenderNotification(tr monitor.Transition) string {
@@ -111,7 +92,7 @@ func RenderNotification(tr monitor.Transition) string {
 	b.WriteString("\n\nПроверено: " + fmtClockMSK(tr.Check.At) + " MSK")
 	if (tr.To == status.Operational || (tr.To == status.Degraded && tr.From == status.Down)) &&
 		tr.Incident != nil && tr.Incident.Duration > 0 {
-		b.WriteString("\nДлительность сбоя: " + humanDuration(tr.Incident.Duration))
+		b.WriteString("\nДлительность сбоя: " + durationHuman(tr.Incident.Duration))
 	}
 	return b.String()
 }
@@ -131,31 +112,18 @@ func notifyErrorBody(c storage.Check) string {
 	return b.String()
 }
 
-// providerErrorBody — код + исходный текст провайдера (кап 500 рун — лимит 4096).
+// providerErrorBody — единая подпись вида (errorKindLabel) + исходный текст
+// провайдера (кап 500 рун — лимит 4096). Для timeout/connrefused/invalid
+// подписи исчерпывающи, текста нет.
 func providerErrorBody(c storage.Check) string {
+	line := errorKindLabel(c)
 	switch c.ErrorType {
-	case "http":
-		line := fmt.Sprintf("HTTP %d", c.HTTPStatus)
-		if c.ErrorMessage != "" {
-			line += "\n" + EscapeHTML(trunc(oneLine(c.ErrorMessage), 500))
-		}
-		return line
-	case "empty":
-		line := "HTTP 200"
-		if c.ErrorMessage != "" && c.ErrorMessage != "empty generation" {
-			line += "\n" + EscapeHTML(trunc(oneLine(c.ErrorMessage), 500))
-		}
-		return line
-	case "timeout":
-		return "Timeout"
-	case "connrefused":
-		return "Connection refused"
-	case "invalid":
-		return "Некорректный ответ API"
+	case "http", "empty":
 	default:
-		if c.ErrorMessage != "" {
-			return EscapeHTML(trunc(oneLine(c.ErrorMessage), 500))
-		}
-		return "ошибка монитора"
+		return line
 	}
+	if c.ErrorMessage == "" || c.ErrorMessage == "empty generation" {
+		return line
+	}
+	return line + "\n" + EscapeHTML(trunc(oneLine(c.ErrorMessage), 500))
 }

@@ -309,14 +309,14 @@ func digestLine(st *digestState) string {
 	switch st.final {
 	case status.Down:
 		if d := st.lastAt.Sub(st.since); d > 0 {
-			return codeID(st.model) + " - недоступна ~" + shortDuration(d) + suffix
+			return codeID(st.model) + " - недоступна ~" + durationHuman(d) + suffix
 		}
 		return codeID(st.model) + " - недоступна" + suffix
 	case status.Degraded:
 		return codeID(st.model) + " - работает нестабильно" + suffix
 	default:
 		if st.dur > 0 {
-			return codeID(st.model) + " - сбой длился " + shortDuration(st.dur) + suffix
+			return codeID(st.model) + " - сбой длился " + durationHuman(st.dur) + suffix
 		}
 		return codeID(st.model) + " - восстановилась" + suffix
 	}
@@ -366,7 +366,7 @@ func renderDigest(rows []storage.OutboxRow) string {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "📬 Пока Telegram был недоступен: %s за %s\n",
-		pluralEvents(total), shortDuration(lastSeen.Sub(firstSeen)))
+		pluralEvents(total), durationHuman(lastSeen.Sub(firstSeen)))
 	shown, rest := 0, 0
 	for _, section := range []struct {
 		emoji string
@@ -480,13 +480,13 @@ func groupedLine(tr monitor.Transition) string {
 	switch tr.To {
 	case status.Operational:
 		if tr.Incident != nil && tr.Incident.Duration > 0 {
-			return codeID(tr.ModelID) + " - сбой длился " + shortDuration(tr.Incident.Duration)
+			return codeID(tr.ModelID) + " - сбой длился " + durationHuman(tr.Incident.Duration)
 		}
 		return codeID(tr.ModelID) + " - восстановилась"
 	case status.Degraded:
-		return codeID(tr.ModelID) + " - работает нестабильно: " + panelErrorHead(tr.Check)
+		return codeID(tr.ModelID) + " - работает нестабильно: " + errorHead(tr.Check)
 	default: // Down
-		line := codeID(tr.ModelID) + " - " + panelErrorHead(tr.Check)
+		line := codeID(tr.ModelID) + " - " + errorHead(tr.Check)
 		if tr.From == status.Unknown {
 			// модель вернулась из слепого окна уже упавшей (D2)
 			line += " (время падения неизвестно)"
@@ -495,38 +495,5 @@ func groupedLine(tr monitor.Transition) string {
 	}
 }
 
-// shortDuration —Duration без секунд: «1ч 30м», «15м».
-func shortDuration(d time.Duration) string {
-	sec := int64(d.Seconds())
-	if sec < 0 {
-		sec = 0
-	}
-	switch {
-	case sec < 3600:
-		return fmt.Sprintf("%dм", sec/60)
-	default:
-		return fmt.Sprintf("%dч %02dм", sec/3600, (sec%3600)/60)
-	}
-}
-
-// panelErrorHead — короткое обозначение ошибки для списков (обрезка 20 рун).
-func panelErrorHead(c storage.Check) string {
-	switch c.ErrorType {
-	case "http":
-		head := fmt.Sprintf("HTTP %d", c.HTTPStatus)
-		if c.ErrorMessage != "" {
-			head += " · " + EscapeHTML(trunc(oneLine(c.ErrorMessage), maxPanelErr))
-		}
-		return head
-	case "timeout":
-		return "Timeout"
-	case "connrefused":
-		return "Connection refused"
-	case "empty":
-		return "HTTP 200 · пустая генерация"
-	case "perf":
-		return "деградация производительности"
-	default:
-		return "ошибка монитора"
-	}
-}
+// panelErrorHead и shortDuration удалены (7.3): сводки и дайджест используют
+// единые errorHead и durationHuman из render.go — одна подпись на тип ошибки.

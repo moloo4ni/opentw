@@ -2,9 +2,11 @@ package telegram
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 
@@ -194,7 +196,7 @@ func TestModelDetailFormat(t *testing.T) {
 	text := RenderModelDetail("gpt-6-astra", status.Operational, last, checks)
 	for _, want := range []string{
 		"<b>gpt-6-astra</b> - 🟢 работает",
-		"Последняя проверка: 16:15:03 MSK",
+		"Последняя проверка: 16.11.2026 16:15:03 MSK",
 		"HTTP: 200",
 		"Latency: 2.70s",
 		"TTFT: 0.42s",
@@ -328,7 +330,7 @@ func TestSubscribeEmptySelection(t *testing.T) {
 }
 
 func TestHelp(t *testing.T) {
-	text := RenderHelp()
+	text := RenderHelp(15 * time.Minute)
 	for _, cmd := range []string{"/start", "/status", "/status model-id", "/subscribe", "/help"} {
 		if !strings.Contains(text, cmd) {
 			t.Errorf("help missing %q:\n%s", cmd, text)
@@ -507,7 +509,7 @@ func TestModelDetailFlapping(t *testing.T) {
 	if !strings.Contains(text, "Переключений состояния: 3") {
 		t.Fatalf("switch count missing:\n%s", text)
 	}
-	if !strings.Contains(text, "Последнее переключение: "+fmtClockMSK(base.Add(45*time.Minute))+" MSK") {
+	if !strings.Contains(text, "Последнее переключение: "+fmtDateClockMSK(base.Add(45*time.Minute))+" MSK") {
 		t.Fatalf("last switch time missing:\n%s", text)
 	}
 	if !strings.Contains(text, "Среднее пребывание в статусе: 15 мин") {
@@ -537,7 +539,7 @@ func TestUptimeExcludesUnknown(t *testing.T) {
 
 // /help: легенда, смысл метрик, путь отключения надоевшей модели (AC-20).
 func TestHelpContent(t *testing.T) {
-	text := RenderHelp()
+	text := RenderHelp(15 * time.Minute)
 	for _, want := range []string{
 		"🟢 работает · 🟡 нестабильно · 🔴 недоступна · ⚪ нет данных",
 		"одного проверочного запроса",
@@ -568,5 +570,158 @@ func TestPanelEmptyWithGatewayError(t *testing.T) {
 	}
 	if strings.Contains(text, "пустая генерация") {
 		t.Fatalf("misleading empty-generation label when a real error exists:\n%s", text)
+	}
+}
+
+// --- Этап 7 ---
+
+// 7.1: длинная ошибка провайдера не раздувает детальную страницу за лимит
+// Telegram 4096 — ответ пользователю гарантирован.
+func TestModelDetailErrorTextCapped(t *testing.T) {
+	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		HTTPStatus: 503, ErrorType: "http",
+		ErrorMessage: strings.Repeat("но<bws&>amp; ", 4000)} // 40к рун с HTML-символами
+	text := RenderModelDetail("m", status.Down, last, nil)
+	if l := len([]rune(text)); l > 4096 {
+		t.Fatalf("detail must fit Telegram limit, %d runes:\n%.300s…", l, text)
+	}
+	if !strings.Contains(text, "HTTP 503") {
+		t.Fatalf("error head must survive capping:\n%s", text)
+	}
+	if !utf8.ValidString(text) {
+		t.Fatal("capping must not produce invalid UTF-8")
+	}
+	if strings.HasSuffix(strings.TrimSpace(text), "&") || entityTail.MatchString(strings.TrimSpace(text)) {
+		t.Fatal("capping must not cut an HTML entity in half (Telegram 400)")
+	}
+}
+
+// entityTail — оборванная entity на конце строки (&am без «;»).
+var entityTail = regexp.MustCompile(`&[a-zA-Z0-9#]{1,7}$`)
+
+// 7.3: детальные отметки времени несут дату — 24-часовое окно пересекает
+// полночь, одно время суток вводит в заблуждение.
+func TestModelDetailTimestampsHaveDate(t *testing.T) {
+	last := storage.Check{ModelID: "m", At: mskTime(t, 16, 15, 3), Status: status.Down,
+		HTTPStatus: 503, ErrorType: "http", ErrorMessage: "Service Unavailable"}
+	checks := []storage.Check{
+		{ModelID: "m", At: mskTime(t, 14, 0, 0), Status: status.Operational, HTTPStatus: 200},
+		last,
+	}
+	text := RenderModelDetail("m", status.Down, last, checks)
+	for _, want := range []string{
+		"Последняя проверка: 16.11.2026 16:15:03 MSK",
+		"Последнее переключение: 16.11.2026 16:15:03 MSK",
+		"Последняя ошибка\n16.11.2026 16:15:03 MSK · HTTP 503 · Service Unavailable",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("date missing in %q:\n%s", want, text)
+		}
+	}
+}
+
+// 7.3: Degraded виден в статистике 24ч отдельной строкой, а не проваливается
+// между «успешными» и «неудачными».
+func TestStatsCountDegraded(t *testing.T) {
+	base := time.Now().Add(-2 * time.Hour)
+	var checks []storage.Check
+	for i, st := range []status.Status{
+		status.Operational, status.Degraded, status.Degraded, status.Down,
+	} {
+		checks = append(checks, storage.Check{ModelID: "m", At: base.Add(time.Duration(i) * 15 * time.Minute), Status: st, HTTPStatus: 200})
+	}
+	text := RenderModelDetail("m", status.Down, checks[len(checks)-1], checks)
+	if !strings.Contains(text, "Нестабильных: 2") {
+		t.Fatalf("degraded count missing:\n%s", text)
+	}
+	if !strings.Contains(text, "	Uptime: 25.00%") && !strings.Contains(text, "Uptime: 25.00%") {
+		t.Fatalf("uptime must stay (1 op)/(4-0 known) = 25%%:\n%s", text)
+	}
+}
+
+// 7.3: переключения состояния не считают ⚪ — это слепота монитора,
+// а не смена состояния модели.
+func TestFlappingIgnoresUnknown(t *testing.T) {
+	base := time.Now().Add(-2 * time.Hour)
+	var checks []storage.Check
+	for i, st := range []status.Status{
+		status.Operational, status.Unknown, status.Operational,
+		status.Down, status.Unknown, status.Down,
+	} {
+		checks = append(checks, storage.Check{ModelID: "m", At: base.Add(time.Duration(i) * 15 * time.Minute), Status: st, HTTPStatus: 200})
+	}
+	n, lastAt, _ := flappingStats(checks)
+	if n != 1 {
+		t.Fatalf("only the real 🟢→🔴 switch must count, got %d", n)
+	}
+	want := checks[3].At
+	if !lastAt.Equal(want) {
+		t.Fatalf("last switch = %v, want %v", lastAt, want)
+	}
+}
+
+// 7.3: единое форматирование длительностей — один словарь на все поверхности.
+func TestDurationHuman(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0с"},
+		{45 * time.Second, "45с"},
+		{30 * time.Minute, "30м"},
+		{90 * time.Minute, "1ч 30м"},
+		{26 * time.Hour, "26ч 00м"},
+	} {
+		if got := durationHuman(tc.d); got != tc.want {
+			t.Errorf("durationHuman(%v) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+// 7.3: единый форматтер заголовков ошибок — одна подпись на тип ошибки для
+// панели, сводок, дайджеста и деталей.
+func TestErrorHeadSingle(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		c    storage.Check
+		want string
+	}{
+		{"http", storage.Check{ErrorType: "http", HTTPStatus: 429, ErrorMessage: "Upstream rate limit"}, "HTTP 429 · Upstream rate limit"},
+		{"http-empty-body", storage.Check{ErrorType: "http", HTTPStatus: 502}, "HTTP 502"},
+		{"timeout", storage.Check{ErrorType: "timeout"}, "Timeout"},
+		{"connrefused", storage.Check{ErrorType: "connrefused"}, "Connection refused"},
+		{"empty-gen", storage.Check{ErrorType: "empty", ErrorMessage: "empty generation"}, "HTTP 200 · пустая генерация"},
+		{"empty-gateway", storage.Check{ErrorType: "empty", HTTPStatus: 200, ErrorMessage: "No available accounts"}, "HTTP 200 · No available account..."},
+		{"invalid", storage.Check{ErrorType: "invalid"}, "Некорректный ответ API"},
+		{"perf", storage.Check{ErrorType: "perf"}, "деградация производительности"},
+	} {
+		if got := errorHead(tc.c); got != tc.want {
+			t.Errorf("%s: errorHead = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	if got := detailErrorLine(storage.Check{ErrorType: "invalid"}); got != "Некорректный ответ API" {
+		t.Errorf("detailErrorLine(invalid) = %q", got)
+	}
+	if got := detailErrorLine(storage.Check{ErrorType: "empty", ErrorMessage: "empty generation"}); got != "HTTP 200 · пустая генерация" {
+		t.Errorf("detailErrorLine(empty) = %q, want unified ' · ' separator", got)
+	}
+}
+
+// 7.4: /help не обещает «каждые 15 минут» при настраиваемом интервале.
+func TestHelpDynamicInterval(t *testing.T) {
+	text := RenderHelp(15 * time.Minute)
+	if !strings.Contains(text, "каждые 15 мин") {
+		t.Fatalf("help must state the configured interval:\n%s", text)
+	}
+	if strings.Contains(text, "каждые 15 минут") {
+		t.Fatalf("hardcoded interval must be gone:\n%s", text)
+	}
+	text = RenderHelp(0) // интервал неизвестен — нейтральная формулировка
+	if !strings.Contains(text, "каждый цикл проверки") {
+		t.Fatalf("neutral wording expected:\n%s", text)
+	}
+	text = RenderHelp(30 * time.Minute)
+	if !strings.Contains(text, "каждые 30 мин") {
+		t.Fatalf("configured interval must be reflected:\n%s", text)
 	}
 }

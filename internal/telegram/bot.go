@@ -146,7 +146,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg *Message) error {
 	case "/subscribe":
 		return b.handleSubscribeCommand(ctx, msg.Chat, fromID(msg))
 	case "/help":
-		_, err := b.api.SendMessage(ctx, msg.Chat.ID, RenderHelp())
+		_, err := b.api.SendMessage(ctx, msg.Chat.ID, RenderHelp(b.interval()))
 		return err
 	case "":
 		return nil

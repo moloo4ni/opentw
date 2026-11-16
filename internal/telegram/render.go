@@ -18,8 +18,9 @@ var MSK = time.FixedZone("MSK", 3*60*60)
 
 const (
 	absent          = "N/A"
-	maxPanelErr     = 20 // панель — одна строка на десктопе; полный текст в /status model-id
-	maxCallbackData = 64 // лимит Telegram на callback_data в байтах
+	maxPanelErr     = 20   // панель — одна строка на десктопе; полный текст в /status model-id
+	detailErrMax    = 3500 // бюджет текста ошибки на детальной странице: page ≤ 4096 рун (7.1)
+	maxCallbackData = 64   // лимит Telegram на callback_data в байтах
 )
 
 func fmtClockMSK(t time.Time) string { return t.In(MSK).Format("15:04:05") }
@@ -159,39 +160,88 @@ func modelLine(m storage.Model, c storage.Check) string {
 	switch {
 	case c.ErrorType == "perf":
 		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c) + " · деградация"
-	case c.ErrorType == "empty":
-		if msg := trunc(oneLine(c.ErrorMessage), maxPanelErr); c.ErrorMessage != "" && c.ErrorMessage != "empty generation" {
-			// шлюз вернул 200 с JSON-ошибкой: его текст важнее «пустой генерации»
-			return emoji + " " + codeID(m.ID) + " - HTTP 200 · " + EscapeHTML(msg)
-		}
-		return emoji + " " + codeID(m.ID) + " - HTTP 200 · пустая генерация"
 	case c.ErrorType != "":
-		return emoji + " " + codeID(m.ID) + " - " + errorHead(m.ID, c)
+		// шлюз вернул 200 с JSON-ошибкой: errorHead показывает его текст
+		// вместо «пустой генерации» (D13)
+		return emoji + " " + codeID(m.ID) + " - " + errorHead(c)
 	default:
 		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c)
 	}
 }
 
-// errorHead формирует краткое описание ошибки для панели.
-func errorHead(modelID string, c storage.Check) string {
-	var head string
+// errorKindLabel — единая подпись типа ошибки, одна на тип (7.3): панель,
+// сводки, дайджест, детальная страница и уведомления строятся на ней.
+func errorKindLabel(c storage.Check) string {
 	switch c.ErrorType {
 	case "http":
-		head = fmt.Sprintf("HTTP %d", c.HTTPStatus)
+		return fmt.Sprintf("HTTP %d", c.HTTPStatus)
 	case "timeout":
-		head = "Timeout"
+		return "Timeout"
 	case "connrefused":
-		head = "Connection refused"
-	case "invalid":
-		head = "ошибка монитора"
+		return "Connection refused"
+	case "empty":
+		return "HTTP 200"
+	case "perf":
+		return "деградация производительности"
+	default: // invalid и неизвестные виды: монитор не осмыслил ответ
+		return "Некорректный ответ API"
+	}
+}
+
+// errorHead — краткое описание ошибки для панели и сводок (текст ≤ 20 рун).
+func errorHead(c storage.Check) string {
+	return errorHeadCapped(c, maxPanelErr)
+}
+
+// errorHeadCapped — общий форматтер заголовка ошибки: единая подпись вида +
+// исходный текст ошибки в бюджете maxRunes рун. Обрезка не рвёт HTML-entity
+// (иначе Telegram 400 «can't parse entities»), «пустая генерация» уступает
+// место реальному тексту шлюза в 200-ответе (D13).
+func errorHeadCapped(c storage.Check, maxRunes int) string {
+	if c.ErrorType == "empty" && (c.ErrorMessage == "" || c.ErrorMessage == "empty generation") {
+		return "HTTP 200 · пустая генерация"
+	}
+	if c.ErrorMessage == "" || c.ErrorType == "perf" || c.ErrorType == "invalid" {
+		return errorKindLabel(c)
+	}
+	msg := oneLine(c.ErrorMessage)
+	if maxRunes <= maxPanelErr {
+		return errorKindLabel(c) + " · " + EscapeHTML(trunc(msg, maxRunes))
+	}
+	return errorKindLabel(c) + " · " + truncEscaped(msg, maxRunes)
+}
+
+// truncEscaped экранирует текст и обрезает до max рун УЖЕ экранированного
+// результата: entity (&amp; и т.п.) не разрывается посередине.
+func truncEscaped(s string, max int) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		enc := html.EscapeString(string(r))
+		if n+len(enc) > max { // entity — ASCII: байты == руны
+			break
+		}
+		n += len(enc)
+		b.WriteString(enc)
+	}
+	return b.String()
+}
+
+// durationHuman — единое форматирование длительностей (7.3): уведомления,
+// сводки и дайджест показывают одну и ту же форму (45с / 30м / 1ч 30м).
+func durationHuman(d time.Duration) string {
+	sec := int64(d.Seconds())
+	if sec < 0 {
+		sec = 0
+	}
+	switch {
+	case sec < 60:
+		return fmt.Sprintf("%dс", sec)
+	case sec < 3600:
+		return fmt.Sprintf("%dм", sec/60)
 	default:
-		head = c.ErrorType
+		return fmt.Sprintf("%dч %02dм", sec/3600, (sec%3600)/60)
 	}
-	if c.ErrorMessage == "" || c.ErrorType == "invalid" {
-		return head
-	}
-	msg := trunc(oneLine(c.ErrorMessage), maxPanelErr)
-	return head + " · " + EscapeHTML(msg)
 }
 
 func oneLine(s string) string {
@@ -215,27 +265,10 @@ func metricsTail(c storage.Check) string {
 	return strings.Join(parts, " · ")
 }
 
-// detailErrorLine — полная строка последней ошибки (без обрезки).
+// detailErrorLine — полная строка последней ошибки: единый заголовок
+// (errorHead), текст ошибки до detailErrMax рун (7.1).
 func detailErrorLine(c storage.Check) string {
-	head := ""
-	switch c.ErrorType {
-	case "http":
-		head = fmt.Sprintf("HTTP %d", c.HTTPStatus)
-	case "timeout":
-		head = "Timeout"
-	case "connrefused":
-		head = "Connection refused"
-	case "invalid":
-		head = "Некорректный ответ API"
-	case "empty":
-		head = "HTTP 200 | пустая генерация"
-	default:
-		head = c.ErrorType
-	}
-	if c.ErrorMessage != "" && c.ErrorType != "invalid" && c.ErrorType != "empty" {
-		return head + " · " + EscapeHTML(oneLine(c.ErrorMessage))
-	}
-	return head
+	return errorHeadCapped(c, detailErrMax)
 }
 
 // RenderModelDetail renders the /status model-id view.
@@ -246,7 +279,8 @@ func RenderModelDetail(modelID string, st status.Status, last storage.Check, las
 		// модель ещё ни разу не проверялась — осмысленной даты нет
 		b.WriteString("Последняя проверка: " + absent + "\n\n")
 	} else {
-		b.WriteString("Последняя проверка: " + fmtClockMSK(last.At) + " MSK\n\n")
+		// 24-часовое окно пересекает полночь: отметки с датой (7.3)
+		b.WriteString("Последняя проверка: " + fmtDateClockMSK(last.At) + " MSK\n\n")
 	}
 
 	b.WriteString("Последний запрос\n")
@@ -267,13 +301,15 @@ func RenderModelDetail(modelID string, st status.Status, last storage.Check, las
 	if len(last24) == 0 {
 		b.WriteString("Проверок: 0\n")
 	} else {
-		var okCount, downCount, unknownCount int
+		var okCount, degradedCount, downCount, unknownCount int
 		var latencies []float64
 		var tpsVals []float64
 		for _, c := range last24 {
 			switch c.Status {
 			case status.Operational:
 				okCount++
+			case status.Degraded:
+				degradedCount++ // 🟡 виден в статистике отдельной строкой (7.3)
 			case status.Down:
 				downCount++
 			case status.Unknown:
@@ -298,6 +334,7 @@ func RenderModelDetail(modelID string, st status.Status, last storage.Check, las
 		}
 		b.WriteString(fmt.Sprintf("Проверок: %d\n", len(last24)))
 		b.WriteString(fmt.Sprintf("Успешных: %d\n", okCount))
+		b.WriteString(fmt.Sprintf("Нестабильных: %d\n", degradedCount))
 		b.WriteString(fmt.Sprintf("Неудачных: %d\n", downCount))
 		if len(latencies) > 0 {
 			sort.Float64s(latencies)
@@ -321,7 +358,7 @@ func RenderModelDetail(modelID string, st status.Status, last storage.Check, las
 		// флэппинг-наблюдаемость: по тем же данным, без новой семантики
 		if n, last, dwell := flappingStats(last24); n > 0 {
 			b.WriteString(fmt.Sprintf("Переключений состояния: %d\n", n))
-			b.WriteString("Последнее переключение: " + fmtClockMSK(last) + " MSK\n")
+			b.WriteString("Последнее переключение: " + fmtDateClockMSK(last) + " MSK\n")
 			b.WriteString("Среднее пребывание в статусе: " + intervalHuman(dwell) + "\n")
 		}
 	}
@@ -340,7 +377,7 @@ func RenderModelDetail(modelID string, st status.Status, last storage.Check, las
 	}
 	if lastErr != nil {
 		b.WriteString("\nПоследняя ошибка\n")
-		b.WriteString(fmtClockMSK(lastErr.At) + " · " + detailErrorLine(*lastErr))
+		b.WriteString(fmtDateClockMSK(lastErr.At) + " MSK · " + detailErrorLine(*lastErr))
 	}
 	return b.String()
 }
@@ -354,21 +391,30 @@ func secPtr(v *int64) string {
 
 // flappingStats — переключения за окно, время последнего и среднее пребывание
 // в статусе (равные интервалы проверки → среднее = окно/переключений).
+// ⚪ не считается: слепота монитора — не смена состояния модели (7.3).
 func flappingStats(checks []storage.Check) (int, time.Time, time.Duration) {
 	var n int
-	var last time.Time
+	var last, firstKept time.Time
 	prev := status.Status("")
+	kept := 0
 	for _, c := range checks {
+		if c.Status == status.Unknown {
+			continue
+		}
+		if kept == 0 {
+			firstKept = c.At
+		}
 		if prev != "" && c.Status != prev {
 			n++
 			last = c.At
 		}
 		prev = c.Status
+		kept++
 	}
-	if n == 0 || len(checks) < 2 {
+	if n == 0 || kept < 2 {
 		return 0, time.Time{}, 0
 	}
-	span := checks[len(checks)-1].At.Sub(checks[0].At)
+	span := last.Sub(firstKept)
 	return n, last, span / time.Duration(n)
 }
 
@@ -563,8 +609,13 @@ func FamiliesOf(models []storage.Model) []string {
 	return out
 }
 
-// RenderHelp renders /help.
-func RenderHelp() string {
+// RenderHelp renders /help; интервал проверки — из фактической конфигурации
+// (0 — нейтральная формулировка «каждый цикл проверки»).
+func RenderHelp(interval time.Duration) string {
+	perCycle := "каждый цикл проверки"
+	if interval > 0 {
+		perCycle = "каждые " + intervalHuman(interval)
+	}
 	return strings.Join([]string{
 		"OpenTW - мониторинг доступности моделей.",
 		"",
@@ -575,7 +626,7 @@ func RenderHelp() string {
 		"/help - эта справка.",
 		"",
 		"Статусы: 🟢 работает · 🟡 нестабильно · 🔴 недоступна · ⚪ нет данных.",
-		"Latency, TPS и токены - метрики одного проверочного запроса (каждые 15 минут).",
+		"Latency, TPS и токены - метрики одного проверочного запроса (" + perCycle + ").",
 		"Уведомления приходят только по выбранным моделям; панель /status показывает все.",
 		"Отключить надоевшую модель: /subscribe -> семейство -> снять отметку -> Сохранить.",
 	}, "\n")

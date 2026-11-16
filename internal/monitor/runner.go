@@ -63,6 +63,11 @@ type Runner struct {
 	running chan struct{} // closed when idle; used as a single-flight token
 	lastOK  bool          // последний цикл дожил до конца (управляет стартовым heartbeat)
 	log     *slog.Logger
+
+	// allUnknownStreak — подряд идущие циклы без единого осмысленного
+	// вердикта (A01-5): живой монитор, мёртвый ключ. Операционный сигнал,
+	// семантику статусов и /status не меняет.
+	allUnknownStreak int
 }
 
 // Store exposes the storage handle (для бота и тестов).
@@ -259,6 +264,19 @@ func (r *Runner) logCycle(checks map[string]storage.Check, events []storage.Outb
 	r.log.Info("monitor: cycle done",
 		"checked", len(checks), "ok", nOK, "degraded", nDegr, "down", nDown, "unknown", nUnknown,
 		"events", len(events), "outbox_pending", pending)
+
+	// A01-5: циклы успешны (heartbeat жив, контейнер healthy), но осмысленных
+	// вердиктов нет — проблемы ключа/шлюза выдают себя только этим сигналом.
+	// Статусы моделей остаются честными ⚪; ложных падений не создаём.
+	if len(checks) > 0 && nOK+nDegr+nDown == 0 {
+		r.allUnknownStreak++
+		if r.allUnknownStreak >= 2 {
+			r.log.Error("monitor: no meaningful checks for consecutive cycles - monitor/API problem (key or gateway), not a model outage",
+				"streak", r.allUnknownStreak, "unknown", nUnknown)
+		}
+	} else {
+		r.allUnknownStreak = 0
+	}
 }
 
 // writeHeartbeat обновляет mtime файла живости (основа HEALTHCHECK).

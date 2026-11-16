@@ -116,7 +116,7 @@ func TestRecoveryNotificationIncludesDuration(t *testing.T) {
 	commitCycle(t, b, cycle(nil, transition("gpt-6-astra", status.Down, status.Operational, time.Now(), inc)))
 	b.deliveryTick(context.Background())
 	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	for _, want := range []string{"🟢 <code>gpt-6-astra</code> - восстановилась", "Latency: 2.70s", "TPS: 42.3", "Проверено:", "Длительность сбоя: 13м 02с"} {
+	for _, want := range []string{"🟢 <code>gpt-6-astra</code> - восстановилась", "Latency: 2.70s", "TPS: 42.3", "Проверено:", "Длительность сбоя: 13м"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("recovery missing %q:\n%s", want, text)
 		}
@@ -137,7 +137,7 @@ func TestPartialRecoveryNotification(t *testing.T) {
 	if !strings.Contains(text, "🟡 <code>gpt-6-astra</code> - частично восстановилась") {
 		t.Fatalf("text = %s", text)
 	}
-	if !strings.Contains(text, "Длительность сбоя: 5м 00с") {
+	if !strings.Contains(text, "Длительность сбоя: 5м") {
 		t.Fatalf("duration missing:\n%s", text)
 	}
 }
@@ -233,5 +233,44 @@ func TestGroupedLineMarksBlindFall(t *testing.T) {
 	if !strings.Contains(text, "<code>gpt-6-astra</code> - HTTP 503") ||
 		!strings.Contains(text, "(время падения неизвестно)") {
 		t.Fatalf("grouped line must mark the blind fall:\n%s", text)
+	}
+}
+
+// --- Этап 7.6: уведомления empty/timeout ---
+
+// Событие с ErrorType empty (200 без генерации) несёт текст шлюза, если тот
+// сохранён, и стандартную подпись иначе.
+func TestNotificationEmptyErrorType(t *testing.T) {
+	tr := transition("gpt-6-astra", status.Operational, status.Degraded, time.Now(), nil)
+	tr.Check.ErrorType = "empty"
+	tr.Check.HTTPStatus = 200
+	tr.Check.ErrorMessage = "No available accounts. Please retry later."
+	text := RenderNotification(tr)
+	if !strings.Contains(text, "🟡 <code>gpt-6-astra</code> - работает нестабильно") {
+		t.Fatalf("degradation header missing:\n%s", text)
+	}
+	if !strings.Contains(text, "HTTP 200") || !strings.Contains(text, "No available accounts") {
+		t.Fatalf("empty-kind body must carry the gateway text:\n%s", text)
+	}
+
+	tr.Check.ErrorMessage = "empty generation"
+	text = RenderNotification(tr)
+	if !strings.Contains(text, "HTTP 200") {
+		t.Fatalf("empty-kind body must still name HTTP 200:\n%s", text)
+	}
+}
+
+// Событие с ErrorType timeout: тело — «Timeout», заголовок — падение.
+func TestNotificationTimeoutErrorType(t *testing.T) {
+	tr := transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)
+	tr.Check.ErrorType = "timeout"
+	tr.Check.HTTPStatus = 0
+	tr.Check.ErrorMessage = "context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+	text := RenderNotification(tr)
+	if !strings.Contains(text, "🔴 <code>gpt-6-astra</code> - недоступна") {
+		t.Fatalf("down header missing:\n%s", text)
+	}
+	if !strings.Contains(text, "Timeout") {
+		t.Fatalf("timeout body expected:\n%s", text)
 	}
 }

@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -100,10 +101,13 @@ func (b *Bot) userIsAdmin(ctx context.Context, chat Chat, userID int64) (bool, e
 // Кнопки несут идентификаторы моделей/семейств (не индексы): устаревшие
 // клавиатуры после смены конфигурации вежливо отвергаются.
 func (b *Bot) handleCallback(ctx context.Context, cb *CallbackQuery) error {
-	chat := Chat{ID: 0}
-	if cb.Message != nil {
-		chat = cb.Message.Chat
+	if cb.Message == nil {
+		// колбэк без сообщения (отозванная/старая клавиатура): ни chat_id, ни
+		// message_id — обработка испортила бы данные нулевым chat_id (7.2);
+		// отвечаем тостом, чтобы у пользователя не висел спиннер
+		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Кнопка устарела, откройте /subscribe заново")
 	}
+	chat := cb.Message.Chat
 	switch {
 	case cb.Data == "save":
 		return b.handleSubscribeSave(ctx, chat, cb)
@@ -185,13 +189,17 @@ func (b *Bot) savedMap(chatID int64) map[string]bool {
 	return saved
 }
 
-// editMenu перерисовывает сообщение меню; при неудаче даёт понятный тост.
+// editMenu перерисовывает сообщение меню; «message is not modified» —
+// штатный случай (двойной клик по кнопке), а не ошибка; при настоящей
+// неудаче даёт понятный тост (7.2).
 func (b *Bot) editMenu(ctx context.Context, chat Chat, cb *CallbackQuery, text string, kb *InlineKeyboardMarkup) error {
-	if err := b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, text, kb); err != nil {
-		b.log.Error("subscribe: menu edit", "chat", chat.ID, "err", err)
-		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Меню недоступно, откройте /subscribe заново")
+	err := b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, text, kb)
+	var apiErr *ApiError
+	if err == nil || (errors.As(err, &apiErr) && apiErr.Code == 400 && strings.Contains(strings.ToLower(apiErr.Description), errNotModified)) {
+		return b.api.AnswerCallbackQuery(ctx, cb.ID, "")
 	}
-	return b.api.AnswerCallbackQuery(ctx, cb.ID, "")
+	b.log.Error("subscribe: menu edit", "chat", chat.ID, "err", err)
+	return b.api.AnswerCallbackQuery(ctx, cb.ID, "Меню недоступно, откройте /subscribe заново")
 }
 
 // showFamily редактирует сообщение до экрана семейства.

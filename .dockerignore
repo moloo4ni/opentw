@@ -1,7 +1,7 @@
 .git
 .gitignore
 .env
-*.db
+*.db*
 *.sqlite*
 .superpowers
 docs

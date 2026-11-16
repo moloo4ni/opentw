@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -32,9 +33,15 @@ func main() {
 }
 
 func run() error {
-	configPath := flag.String("config", "config.yaml", "path to config.yaml")
-	backup := flag.String("backup", "", "write a consistent SQLite snapshot to this path and exit")
-	flag.Parse()
+	// отдельный FlagSet (не глобальный flag.CommandLine): run() вызывается
+	// повторно в тестах, глобальный ре-регистрирует флаги и паникует
+	fs := flag.NewFlagSet("opentw", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	configPath := fs.String("config", "config.yaml", "path to config.yaml")
+	backup := fs.String("backup", "", "write a consistent SQLite snapshot to this path and exit")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
@@ -98,7 +105,7 @@ func run() error {
 	// Порог живости вычисляется из фактического конфига и пишется рядом с
 	// heartbeat: HEALTHCHECK читает его, образ не требует пересборки при
 	// смене интервала (I2). 2×интервал + худший возможный цикл + минута.
-	worstCycle := time.Duration((len(models)+cfg.Concurrency-1)/cfg.Concurrency) * cfg.HTTPTimeout
+	worstCycle := worstCycleTime(len(models), cfg.Concurrency, cfg.HTTPTimeout)
 	maxAgePath := filepath.Join(filepath.Dir(cfg.SQLitePath), "opentw.heartbeat.maxage")
 	if err := os.WriteFile(maxAgePath, []byte(fmt.Sprintf("%d\n", int64((2*cfg.Interval+worstCycle+time.Minute).Seconds()))), 0o644); err != nil {
 		log.Warn("opentw: heartbeat maxage write failed", "err", err)
@@ -132,6 +139,18 @@ func run() error {
 	// RunDelivery: панели и уведомления доставляются асинхронно от циклов —
 	// недоступный Telegram не останавливает мониторинг, недоставленное уходит в outbox.
 	return supervise(ctx, stop, []func(context.Context) error{bot.Run, bot.RunDelivery, runner.Run})
+}
+
+// worstCycleTime — подтверждённый максимум длительности одного цикла:
+// запрос каталога + волны проверок по ceil(N/concurrency), каждая волна
+// ограничена http_timeout. Формула согласована с HEALTHCHECK Dockerfile
+// (start-period покрывает худший первый цикл) и с файлом maxage.
+func worstCycleTime(models, concurrency int, httpTimeout time.Duration) time.Duration {
+	waves := (models + concurrency - 1) / concurrency
+	if waves < 1 {
+		waves = 1
+	}
+	return time.Duration(waves+1) * httpTimeout
 }
 
 // supervise держит run() открытой до полного завершения обоих компонентов:

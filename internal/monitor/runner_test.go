@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -1512,4 +1513,65 @@ func resultHook(st Status) func(string) *api.RawResult {
 	default:
 		return func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
 	}
+}
+
+// --- Этап A01-5: операционный сигнал при «всё ⚪» ---
+
+// A01-5: ключ умер — все модели ⚪, циклы успешны, heartbeat жив (контейнер
+// healthy). Оператор обязан видеть отдельный ERROR-сигнал: «осмысленных
+// проверок нет N циклов подряд». Это не меняет статусы моделей и /status.
+func TestProlongedAllUnknownSignalsOperations(t *testing.T) {
+	var buf syncBuffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	r.log = log
+
+	for i := 0; i < 3; i++ {
+		if _, err := r.RunCycle(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m, _ := r.Store().Model("model-a")
+	if m.LastStatus != StatusUnknown {
+		t.Fatalf("model semantics must not change: %q", m.LastStatus)
+	}
+	msgs := strings.Split(buf.String(), "\n")
+	signal := 0
+	for _, ln := range msgs {
+		if strings.Contains(ln, "no meaningful checks") {
+			signal++
+		}
+	}
+	if signal < 2 { // второй и третий циклы подряд — сигнал на каждом
+		t.Fatalf("operational ERROR signal expected on consecutive all-unknown cycles, got %d:\n%s", signal, buf.String())
+	}
+	// восстановление смысла: сигнал сбрасывается
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(buf.String(), "no meaningful checks") != signal {
+		t.Fatal("streak must reset on a meaningful cycle")
+	}
+}
+
+// syncBuffer — потокобезопасный буфер для slog (цикл пишет из одной горутины,
+// но slog.NewJSONHandler требует Writer без гонок при -race).
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

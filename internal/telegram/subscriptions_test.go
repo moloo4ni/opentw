@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -280,5 +281,71 @@ func TestMenuEditFailureToast(t *testing.T) {
 	ack := fmt.Sprint(m.lastBody("answerCallbackQuery")["text"])
 	if !strings.Contains(ack, "Меню недоступно") {
 		t.Fatalf("edit failure toast = %q", ack)
+	}
+}
+
+// --- Этап 7.2: колбэки ---
+
+// Колбэк без сообщения (отозванная/старая клавиатура) не должен ни паниковать,
+// ни портить данные нулевым chat_id — только вежливый тост.
+func TestCallbackWithoutMessageNoPanic(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range []string{"save", "cancel", "back", "f:GPT", "s:gpt-6-astra", "s:absent-model"} {
+		cb := &CallbackQuery{ID: "cb1", Data: data, From: User{ID: 7}}
+		if err := b.handleCallback(context.Background(), cb); err != nil {
+			t.Fatalf("data=%q: err = %v", data, err)
+		}
+	}
+	if n := m.callCount("answerCallbackQuery"); n != 6 {
+		t.Fatalf("every stale callback must be answered, got %d", n)
+	}
+	body := m.lastBody("answerCallbackQuery")
+	if body["text"] != "Кнопка устарела, откройте /subscribe заново" {
+		t.Fatalf("stale toast = %v", body["text"])
+	}
+	// подписка не тронута, пустые chat_id в базу не попадали
+	subs, _ := store.Subscriptions(100)
+	if len(subs) != 1 {
+		t.Fatalf("subscriptions must be intact, got %v", subs)
+	}
+	if zeroSubs, _ := store.Subscriptions(0); len(zeroSubs) != 0 {
+		t.Fatalf("no row may be written for chat_id 0: %v", zeroSubs)
+	}
+}
+
+// 7.2: «message is not modified» — штатный двойной клик, а не ошибка меню.
+func TestEditMenuNotModifiedIsBenign(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil {
+		t.Fatal(err)
+	}
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "editMessageText" {
+			// «пользователь дважды ткнул, текст не изменился»
+			return map[string]any{"ok": false, "error_code": 400, "description": "Bad Request: message is not modified"}, http.StatusBadRequest
+		}
+		if method == "getChatMember" {
+			return map[string]any{"ok": true, "result": map[string]any{"status": "administrator"}}, http.StatusOK
+		}
+		return map[string]any{"ok": true, "result": true}, http.StatusOK
+	}
+	cb := cbUpdate(100, 7, "f:GPT")
+	if cb.CallbackQuery == nil || cb.CallbackQuery.Message == nil {
+		t.Fatal("cb fixture must carry a message")
+	}
+	if err := b.HandleUpdate(context.Background(), cb); err != nil {
+		t.Fatalf("benign not-modified must not error: %v", err)
+	}
+	if n := m.callCount("answerCallbackQuery"); n != 1 {
+		t.Fatalf("callback must be answered, got %d", n)
+	}
+	body := m.lastBody("answerCallbackQuery")
+	if txt, _ := body["text"].(string); txt != "" {
+		t.Fatalf("benign edit needs no error toast, got %q", txt)
 	}
 }
