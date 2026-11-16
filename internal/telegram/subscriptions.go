@@ -2,7 +2,6 @@ package telegram
 
 import (
 	"context"
-	"strconv"
 	"strings"
 )
 
@@ -25,9 +24,18 @@ func (b *Bot) handleSubscribeCommand(ctx context.Context, chat Chat, userID int6
 		}
 	}
 	draft := b.loadDraft(ctx, chat.ID)
-	text, kb := RenderSubscribeRoot(b.models, draft)
+	text, kb := RenderSubscribeRoot(b.models, draft, draftCopy(draft))
 	_, err := b.api.SendMessageWithKeyboard(ctx, chat.ID, text, kb)
 	return err
+}
+
+// draftCopy делает независимую копию черновика (для нового меню дифф = 0).
+func draftCopy(d map[string]bool) map[string]bool {
+	c := make(map[string]bool, len(d))
+	for k, v := range d {
+		c[k] = v
+	}
+	return c
 }
 
 // loadDraft инициализирует черновик подписок чата из сохранённого состояния.
@@ -46,14 +54,28 @@ func (b *Bot) loadDraft(ctx context.Context, chatID int64) map[string]bool {
 	return draft
 }
 
+// draftOf возвращает черновик чата; если меню не открывали в этом процессе
+// (рестарт между открытием и «Сохранить»), черновик гидратируется из
+// сохранённых подписок — иначе пустой черновик стёр бы их (P0).
+//
+// Инвариант: черновики читаются и пишутся только горутиной bot.Run —
+// колбэки обрабатываются последовательно в цикле polling, — поэтому
+// мутации вне b.mu безопасны.
 func (b *Bot) draftOf(chatID int64) map[string]bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	d, ok := b.drafts[chatID]
-	if !ok {
-		d = map[string]bool{}
-		b.drafts[chatID] = d
+	if d, ok := b.drafts[chatID]; ok {
+		return d
 	}
+	subs, err := b.store.Subscriptions(chatID)
+	if err != nil {
+		b.log.Error("subscribe: subscriptions", "chat", chatID, "err", err)
+	}
+	d := map[string]bool{}
+	for _, id := range subs {
+		d[id] = true
+	}
+	b.drafts[chatID] = d
 	return d
 }
 
@@ -75,6 +97,8 @@ func (b *Bot) userIsAdmin(ctx context.Context, chat Chat, userID int64) (bool, e
 
 // handleCallback обрабатывает нажатия inline-кнопок панели подписок:
 // семейства, возврат, переключение моделей, сохранение и отмена.
+// Кнопки несут идентификаторы моделей/семейств (не индексы): устаревшие
+// клавиатуры после смены конфигурации вежливо отвергаются.
 func (b *Bot) handleCallback(ctx context.Context, cb *CallbackQuery) error {
 	chat := Chat{ID: 0}
 	if cb.Message != nil {
@@ -87,18 +111,34 @@ func (b *Bot) handleCallback(ctx context.Context, cb *CallbackQuery) error {
 		return b.handleSubscribeCancel(ctx, chat, cb)
 	case cb.Data == "back":
 		return b.showRoot(ctx, chat, cb)
-	case strings.HasPrefix(cb.Data, "f:"):
-		idx, err := strconv.Atoi(strings.TrimPrefix(cb.Data, "f:"))
-		if err != nil {
-			return b.api.AnswerCallbackQuery(ctx, cb.ID, "")
-		}
-		return b.showFamily(ctx, chat, cb, idx)
-	case strings.HasPrefix(cb.Data, "s:"):
-		idx, err := strconv.Atoi(strings.TrimPrefix(cb.Data, "s:"))
-		if err != nil || idx < 0 || idx >= len(b.models) {
+	case cb.Data == "all":
+		return b.handleMassToggle(ctx, chat, cb, "", true)
+	case cb.Data == "none":
+		return b.handleMassToggle(ctx, chat, cb, "", false)
+	case strings.HasPrefix(cb.Data, "fa:"):
+		fam, ok := resolveCallback(strings.TrimPrefix(cb.Data, "fa:"), FamiliesOf(b.models))
+		if !ok {
 			return b.api.AnswerCallbackQuery(ctx, cb.ID, "Кнопка устарела, откройте /subscribe заново")
 		}
-		return b.handleSubscribeToggle(ctx, chat, cb, idx)
+		return b.handleMassToggle(ctx, chat, cb, fam, true)
+	case strings.HasPrefix(cb.Data, "fn:"):
+		fam, ok := resolveCallback(strings.TrimPrefix(cb.Data, "fn:"), FamiliesOf(b.models))
+		if !ok {
+			return b.api.AnswerCallbackQuery(ctx, cb.ID, "Кнопка устарела, откройте /subscribe заново")
+		}
+		return b.handleMassToggle(ctx, chat, cb, fam, false)
+	case strings.HasPrefix(cb.Data, "f:"):
+		fam, ok := resolveCallback(strings.TrimPrefix(cb.Data, "f:"), FamiliesOf(b.models))
+		if !ok {
+			return b.api.AnswerCallbackQuery(ctx, cb.ID, "Кнопка устарела, откройте /subscribe заново")
+		}
+		return b.showFamily(ctx, chat, cb, fam)
+	case strings.HasPrefix(cb.Data, "s:"):
+		id, ok := resolveCallback(strings.TrimPrefix(cb.Data, "s:"), modelIDs(b.models))
+		if !ok {
+			return b.api.AnswerCallbackQuery(ctx, cb.ID, "Кнопка устарела, откройте /subscribe заново")
+		}
+		return b.handleSubscribeToggle(ctx, chat, cb, id)
 	default:
 		return b.api.AnswerCallbackQuery(ctx, cb.ID, "")
 	}
@@ -127,49 +167,90 @@ func (b *Bot) showRoot(ctx context.Context, chat Chat, cb *CallbackQuery) error 
 		return nil
 	}
 	draft := b.draftOf(chat.ID)
-	text, kb := RenderSubscribeRoot(b.models, draft)
+	saved := b.savedMap(chat.ID)
+	text, kb := RenderSubscribeRoot(b.models, draft, saved)
+	return b.editMenu(ctx, chat, cb, text, kb)
+}
+
+// savedMap — сохранённые подписки чата для диффа черновика.
+func (b *Bot) savedMap(chatID int64) map[string]bool {
+	subs, err := b.store.Subscriptions(chatID)
+	if err != nil {
+		b.log.Error("subscribe: subscriptions", "chat", chatID, "err", err)
+	}
+	saved := map[string]bool{}
+	for _, id := range subs {
+		saved[id] = true
+	}
+	return saved
+}
+
+// editMenu перерисовывает сообщение меню; при неудаче даёт понятный тост.
+func (b *Bot) editMenu(ctx context.Context, chat Chat, cb *CallbackQuery, text string, kb *InlineKeyboardMarkup) error {
 	if err := b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, text, kb); err != nil {
-		b.log.Error("subscribe: root edit", "chat", chat.ID, "err", err)
+		b.log.Error("subscribe: menu edit", "chat", chat.ID, "err", err)
+		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Меню недоступно, откройте /subscribe заново")
 	}
 	return b.api.AnswerCallbackQuery(ctx, cb.ID, "")
 }
 
-// showFamily редактирует сообщение до экрана семейства с индексом famIdx.
-func (b *Bot) showFamily(ctx context.Context, chat Chat, cb *CallbackQuery, famIdx int) error {
+// showFamily редактирует сообщение до экрана семейства.
+func (b *Bot) showFamily(ctx context.Context, chat Chat, cb *CallbackQuery, family string) error {
 	if ok, err := b.adminGate(ctx, chat, cb); err != nil {
 		return err
 	} else if !ok {
 		return nil
 	}
-	families := FamiliesOf(b.models)
-	if famIdx < 0 || famIdx >= len(families) {
-		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Кнопка устарела, откройте /subscribe заново")
-	}
 	draft := b.draftOf(chat.ID)
-	text, kb := RenderSubscribeFamily(families[famIdx], b.models, draft)
-	if err := b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, text, kb); err != nil {
-		b.log.Error("subscribe: family edit", "chat", chat.ID, "err", err)
-	}
-	return b.api.AnswerCallbackQuery(ctx, cb.ID, "")
+	saved := b.savedMap(chat.ID)
+	text, kb := RenderSubscribeFamily(family, b.models, draft, saved)
+	return b.editMenu(ctx, chat, cb, text, kb)
 }
 
 // handleSubscribeToggle переключает модель в черновике и показывает экран
 // её семейства.
-func (b *Bot) handleSubscribeToggle(ctx context.Context, chat Chat, cb *CallbackQuery, idx int) error {
+func (b *Bot) handleSubscribeToggle(ctx context.Context, chat Chat, cb *CallbackQuery, modelID string) error {
 	if ok, err := b.adminGate(ctx, chat, cb); err != nil {
 		return err
 	} else if !ok {
 		return nil
 	}
-	modelID := b.models[idx].ID
+	var family string
+	for _, m := range b.models {
+		if m.ID == modelID {
+			family = m.Family
+			break
+		}
+	}
 	draft := b.draftOf(chat.ID)
 	draft[modelID] = !draft[modelID]
 
-	text, kb := RenderSubscribeFamily(b.models[idx].Family, b.models, draft)
-	if err := b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, text, kb); err != nil {
-		b.log.Error("subscribe: toggle edit", "chat", chat.ID, "err", err)
+	saved := b.savedMap(chat.ID)
+	text, kb := RenderSubscribeFamily(family, b.models, draft, saved)
+	return b.editMenu(ctx, chat, cb, text, kb)
+}
+
+// handleMassToggle включает/выключает в черновике все модели (family=""
+// означает все семейства) и перерисовывает соответствующий экран.
+func (b *Bot) handleMassToggle(ctx context.Context, chat Chat, cb *CallbackQuery, family string, on bool) error {
+	if ok, err := b.adminGate(ctx, chat, cb); err != nil {
+		return err
+	} else if !ok {
+		return nil
 	}
-	return b.api.AnswerCallbackQuery(ctx, cb.ID, "")
+	draft := b.draftOf(chat.ID)
+	for _, m := range b.models {
+		if family == "" || m.Family == family {
+			draft[m.ID] = on
+		}
+	}
+	saved := b.savedMap(chat.ID)
+	if family == "" {
+		text, kb := RenderSubscribeRoot(b.models, draft, saved)
+		return b.editMenu(ctx, chat, cb, text, kb)
+	}
+	text, kb := RenderSubscribeFamily(family, b.models, draft, saved)
+	return b.editMenu(ctx, chat, cb, text, kb)
 }
 
 // handleSubscribeCancel удаляет сообщение с меню; изменения не сохраняются.
@@ -201,44 +282,22 @@ func (b *Bot) handleSubscribeSave(ctx context.Context, chat Chat, cb *CallbackQu
 	} else if !ok {
 		return nil
 	}
-	b.mu.Lock()
-	draft := b.drafts[chat.ID]
-	delete(b.drafts, chat.ID)
-	b.mu.Unlock()
-	if draft == nil {
-		draft = map[string]bool{}
-	}
-
-	saved, err := b.store.Subscriptions(chat.ID)
-	if err != nil {
-		return err
-	}
-	current := map[string]bool{}
-	for _, id := range saved {
-		current[id] = true
-	}
-	for _, m := range b.models {
-		want := draft[m.ID]
-		has := current[m.ID]
-		switch {
-		case want && !has:
-			if err := b.store.SetSubscription(chat.ID, m.ID, true); err != nil {
-				return err
-			}
-		case !want && has:
-			if err := b.store.SetSubscription(chat.ID, m.ID, false); err != nil {
-				return err
-			}
-		}
-	}
-	count := 0
+	draft := b.draftOf(chat.ID) // гидратированный черновик: save без меню не стирает
+	keep := make([]string, 0, len(b.models))
 	for _, m := range b.models {
 		if draft[m.ID] {
-			count++
+			keep = append(keep, m.ID)
 		}
 	}
+	if err := b.store.ReplaceSubscriptions(chat.ID, keep); err != nil {
+		b.log.Error("subscribe: save", "chat", chat.ID, "err", err)
+		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Не удалось сохранить, попробуйте ещё раз")
+	}
+	b.mu.Lock()
+	delete(b.drafts, chat.ID)
+	b.mu.Unlock()
 	if err := b.api.AnswerCallbackQuery(ctx, cb.ID, "Сохранено"); err != nil {
 		return err
 	}
-	return b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, RenderSubscribedSaved(count), nil)
+	return b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, RenderSubscribedSaved(len(keep)), nil)
 }

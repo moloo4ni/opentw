@@ -1,7 +1,7 @@
 package telegram
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -11,24 +11,53 @@ import (
 	"opentw/internal/storage"
 )
 
-// notifyTransitions рассылает события только чатам, подписанным на конкретную модель.
-func (b *Bot) notifyTransitions(ctx context.Context, res monitor.CycleResult) {
+// deliveryPayload — содержимое одной строки outbox: события цикла, адресованные
+// одному чату, плюс контекст массового сбоя для заголовка сводки.
+type deliveryPayload struct {
+	Trs         []monitor.Transition `json:"trs"`
+	Total       int                  `json:"total"`         // всего моделей в конфигурации
+	DownInCycle int                  `json:"down_in_cycle"` // переходов в Down глобально за цикл
+}
+
+// prepareTransitions группирует переходы цикла по подписанным чатам и готовит
+// по одной outbox-строке на чат: события одного цикла приходят одним
+// сообщением. Записи не пишет — их фиксирует раннер через Store.ApplyCycle
+// атомарно с состояниями моделей (P0-1). Ошибка чтения подписчиков — ошибка
+// всего цикла: следующий цикл переоткроет те же переходы, потери нет.
+func (b *Bot) prepareTransitions(res monitor.CycleResult) ([]storage.OutboxEvent, error) {
+	if len(res.Transitions) == 0 {
+		return nil, nil
+	}
+	downInCycle := 0
+	for _, tr := range res.Transitions {
+		if tr.To == status.Down {
+			downInCycle++
+		}
+	}
+	perChat := map[int64][]monitor.Transition{}
 	for _, tr := range res.Transitions {
 		chats, err := b.store.Subscribers(tr.ModelID)
 		if err != nil {
-			b.log.Error("notify: subscribers", "model", tr.ModelID, "err", err)
-			continue
+			return nil, fmt.Errorf("notify: subscribers: %w", err)
 		}
-		if len(chats) == 0 {
-			continue
-		}
-		text := RenderNotification(tr)
 		for _, chatID := range chats {
-			if _, err := b.api.SendMessage(ctx, chatID, text); err != nil {
-				b.log.Error("notify: send", "chat", chatID, "model", tr.ModelID, "err", err)
-			}
+			perChat[chatID] = append(perChat[chatID], tr)
 		}
 	}
+	dedupeKey := fmt.Sprintf("%d", res.CycleAt.UnixNano())
+	events := make([]storage.OutboxEvent, 0, len(perChat))
+	for chatID, trs := range perChat {
+		payload, err := json.Marshal(deliveryPayload{Trs: trs, Total: len(b.models), DownInCycle: downInCycle})
+		if err != nil {
+			return nil, fmt.Errorf("notify: encode: %w", err)
+		}
+		kind := "grouped"
+		if len(trs) == 1 {
+			kind = "single"
+		}
+		events = append(events, storage.OutboxEvent{ChatID: chatID, Kind: kind, DedupeKey: dedupeKey, Payload: payload})
+	}
+	return events, nil
 }
 
 // humanDuration — длительность инцидента в человекочитаемом виде.
@@ -49,8 +78,8 @@ func humanDuration(d time.Duration) string {
 	}
 }
 
-// RenderNotification форматирует событийное уведомление: русский строчный
-// глагол в заголовке, исходные данные провайдера в теле, время и длительность.
+// RenderNotification форматирует одиночное событийное уведомление: русский
+// строчный глагол в заголовке, исходные данные провайдера в теле, время и длительность.
 func RenderNotification(tr monitor.Transition) string {
 	var b strings.Builder
 	switch tr.To {
@@ -69,12 +98,17 @@ func RenderNotification(tr monitor.Transition) string {
 		} else {
 			b.WriteString(tr.To.Emoji() + " " + codeID(tr.ModelID) + " - работает нестабильно\n\n")
 		}
-		b.WriteString(notifyErrorBody(tr.ModelID, tr.Check))
+		b.WriteString(notifyErrorBody(tr.Check))
 	default: // Down
 		b.WriteString(tr.To.Emoji() + " " + codeID(tr.ModelID) + " - недоступна\n\n")
-		b.WriteString(notifyErrorBody(tr.ModelID, tr.Check))
+		b.WriteString(notifyErrorBody(tr.Check))
+		if tr.From == status.Unknown {
+			// Модель вернулась из слепого окна монитора уже упавшей (D2):
+			// длительность неизвестна — честно сообщаем, не выдумываем.
+			b.WriteString("\n\nТочное время начала недоступности неизвестно: монитор не мог проверять модель.")
+		}
 	}
-	b.WriteString("\n\nВремя: " + fmtClockMSK(tr.Check.At) + " MSK")
+	b.WriteString("\n\nПроверено: " + fmtClockMSK(tr.Check.At) + " MSK")
 	if (tr.To == status.Operational || (tr.To == status.Degraded && tr.From == status.Down)) &&
 		tr.Incident != nil && tr.Incident.Duration > 0 {
 		b.WriteString("\nДлительность сбоя: " + humanDuration(tr.Incident.Duration))
@@ -83,29 +117,45 @@ func RenderNotification(tr monitor.Transition) string {
 }
 
 // notifyErrorBody — исходные данные ошибки: HTTP-код и текст провайдера.
-func notifyErrorBody(modelID string, c storage.Check) string {
+func notifyErrorBody(c storage.Check) string {
 	var b strings.Builder
+	switch c.ErrorType {
+	case "perf":
+		b.WriteString("Деградация производительности")
+		if c.ErrorMessage != "" {
+			b.WriteString("\n" + EscapeHTML(oneLine(c.ErrorMessage)))
+		}
+	default:
+		b.WriteString(providerErrorBody(c))
+	}
+	return b.String()
+}
+
+// providerErrorBody — код + исходный текст провайдера (кап 500 рун — лимит 4096).
+func providerErrorBody(c storage.Check) string {
 	switch c.ErrorType {
 	case "http":
 		line := fmt.Sprintf("HTTP %d", c.HTTPStatus)
 		if c.ErrorMessage != "" {
-			line += "\n" + EscapeHTML(oneLine(c.ErrorMessage))
+			line += "\n" + EscapeHTML(trunc(oneLine(c.ErrorMessage), 500))
 		}
-		b.WriteString(line)
+		return line
 	case "empty":
-		b.WriteString("HTTP 200\nпустая генерация")
+		line := "HTTP 200"
+		if c.ErrorMessage != "" && c.ErrorMessage != "empty generation" {
+			line += "\n" + EscapeHTML(trunc(oneLine(c.ErrorMessage), 500))
+		}
+		return line
 	case "timeout":
-		b.WriteString("Timeout")
+		return "Timeout"
 	case "connrefused":
-		b.WriteString("Connection refused")
+		return "Connection refused"
 	case "invalid":
-		b.WriteString("Некорректный ответ API")
-	case "perf":
-		b.WriteString("Деградация производительности")
+		return "Некорректный ответ API"
 	default:
 		if c.ErrorMessage != "" {
-			b.WriteString(EscapeHTML(oneLine(c.ErrorMessage)))
+			return EscapeHTML(trunc(oneLine(c.ErrorMessage), 500))
 		}
+		return "ошибка монитора"
 	}
-	return b.String()
 }

@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -61,4 +62,38 @@ func TestRunRetriesTransientErrors(t *testing.T) {
 	if calls < 2 {
 		t.Fatalf("expected retries on transient errors, got %d calls", calls)
 	}
+}
+
+// D15: оффсет long polling персистентен — после рестарта подтверждённые
+// апдейты не доставляются повторно.
+func TestOffsetPersistedAcrossRestart(t *testing.T) {
+	m := newMockTG(t)
+	var first atomic.Bool
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "getUpdates" {
+			if !first.Swap(true) {
+				return map[string]any{"ok": true, "result": []any{
+					map[string]any{"update_id": 41, "message": map[string]any{
+						"message_id": 10, "chat": map[string]any{"id": 100, "type": "private"}, "text": "/help",
+					}},
+				}}, http.StatusOK
+			}
+			return map[string]any{"ok": true, "result": []any{}}, http.StatusOK
+		}
+		return map[string]any{"ok": true, "result": true}, http.StatusOK
+	}
+	b, store := newBot(t, m)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if off, _ := store.BotOffset(); off == 42 {
+			cancel()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("offset 42 (last update_id+1) must be persisted during polling")
 }

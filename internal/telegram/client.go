@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const maxRetries = 2 // 429 retries with retry_after
+const maxRetries = 2 // 429: до 2 повторных попыток с retry_after, всего до 3 запросов
 
 // ApiError is a Bot API level error (ok:false).
 type ApiError struct {

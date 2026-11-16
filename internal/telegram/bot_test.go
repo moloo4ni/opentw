@@ -16,15 +16,19 @@ import (
 
 func newBot(t *testing.T, m *mockTG) (*Bot, *storage.Store) {
 	t.Helper()
-	store, err := storage.Open(t.TempDir() + "/bot.db")
+	return newBotAt(t, m, t.TempDir()+"/bot.db", []storage.Model{
+		{ID: "gpt-6-astra", Family: "GPT"},
+		{ID: "glm-5.3", Family: "GLM"},
+	})
+}
+
+func newBotAt(t *testing.T, m *mockTG, path string, models []storage.Model) (*Bot, *storage.Store) {
+	t.Helper()
+	store, err := storage.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	models := []storage.Model{
-		{ID: "gpt-6-astra", Family: "GPT"},
-		{ID: "glm-5.3", Family: "GLM"},
-	}
 	if err := store.SyncModels(models); err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +83,30 @@ func check(id string, st status.Status) storage.Check {
 	return storage.Check{ModelID: id, At: time.Now(), Status: st, HTTPStatus: 200}
 }
 
+// commitCycle повторяет фиксацию цикла раннером: бот готовит события,
+// а коммитит их вместе с состояниями одним ApplyCycle (P0-1).
+func commitCycle(t *testing.T, b *Bot, res monitor.CycleResult) {
+	t.Helper()
+	events, err := b.OnCycle(context.Background(), res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.store.ApplyCycle(res.Checks, events); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedCheck записывает проверки цикла в БД — как это делает продовый
+// монитор до OnCycle (воркер рендерит панели из store.LastChecks()).
+func seedCheck(t *testing.T, b *Bot, checks map[string]storage.Check) {
+	t.Helper()
+	for _, c := range checks {
+		if err := b.store.InsertCheck(c); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // Сценарий: /status создаёт и закрепляет панель.
 func TestStatusCommandPinsPanel(t *testing.T) {
 	m := newMockTG(t)
@@ -116,7 +144,7 @@ func TestStartIsStatusSynonym(t *testing.T) {
 		t.Fatalf("start must behave like status: send=%d pin=%d", m.callCount("sendMessage"), m.callCount("pinChatMessage"))
 	}
 	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	if !strings.Contains(text, "OpenTW") || !strings.Contains(text, "Следующая проверка") {
+	if !strings.Contains(text, "OpenTW") || !strings.Contains(text, "Первый цикл проверки выполняется") {
 		t.Fatalf("start must render the status panel, got %q", text)
 	}
 }
@@ -163,7 +191,9 @@ func TestCycleEditsPanel(t *testing.T) {
 		"gpt-6-astra": check("gpt-6-astra", status.Operational),
 		"glm-5.3":     check("glm-5.3", status.Operational),
 	}
-	b.OnCycle(ctx, cycle(checks))
+	seedCheck(t, b, checks)
+	commitCycle(t, b, cycle(checks))
+	b.deliveryTick(ctx)
 	if m.callCount("editMessageText") != 1 {
 		t.Fatalf("panel must be edited, got %d", m.callCount("editMessageText"))
 	}
@@ -183,8 +213,11 @@ func TestCycleSkipsUnchangedText(t *testing.T) {
 	checks := map[string]storage.Check{
 		"gpt-6-astra": check("gpt-6-astra", status.Operational),
 	}
-	b.OnCycle(ctx, cycle(checks))
-	b.OnCycle(ctx, cycle(checks))
+	seedCheck(t, b, checks)
+	commitCycle(t, b, cycle(checks))
+	b.deliveryTick(ctx)
+	commitCycle(t, b, cycle(checks))
+	b.deliveryTick(ctx)
 	if m.callCount("editMessageText") != 1 {
 		t.Fatalf("unchanged text must not be re-edited: %d", m.callCount("editMessageText"))
 	}
@@ -209,7 +242,9 @@ func TestDeletedPanelRecreated(t *testing.T) {
 		return map[string]any{"ok": true, "result": true}, http.StatusOK
 	}
 	editFails = true
-	b.OnCycle(ctx, cycle(map[string]storage.Check{"gpt-6-astra": check("gpt-6-astra", status.Operational)}))
+	seedCheck(t, b, map[string]storage.Check{"gpt-6-astra": check("gpt-6-astra", status.Operational)})
+	commitCycle(t, b, cycle(map[string]storage.Check{"gpt-6-astra": check("gpt-6-astra", status.Operational)}))
+	b.deliveryTick(ctx)
 	if m.callCount("sendMessage") != 2 {
 		t.Fatalf("deleted panel must be re-sent: %d", m.callCount("sendMessage"))
 	}
@@ -230,7 +265,9 @@ func TestPanelRestoredAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	b.OnCycle(ctx, cycle(map[string]storage.Check{"glm-5.3": check("glm-5.3", status.Operational)}))
+	seedCheck(t, b, map[string]storage.Check{"glm-5.3": check("glm-5.3", status.Operational)})
+	commitCycle(t, b, cycle(map[string]storage.Check{"glm-5.3": check("glm-5.3", status.Operational)}))
+	b.deliveryTick(ctx)
 	if m.callCount("editMessageText") != 1 {
 		t.Fatalf("restored panel must be edited: %d", m.callCount("editMessageText"))
 	}
@@ -347,7 +384,7 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 	}
 
 	// колбэк от не-админа отклоняется
-	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 56, "s:0")); err != nil {
+	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 56, "s:gpt-6-astra")); err != nil {
 		t.Fatal(err)
 	}
 	answered := fmt.Sprint(m.lastBody("answerCallbackQuery")["text"])
@@ -356,7 +393,7 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 	}
 
 	// администратор переключает и сохраняет
-	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 55, "s:0")); err != nil {
+	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 55, "s:gpt-6-astra")); err != nil {
 		t.Fatal(err)
 	}
 	editMarkup := fmt.Sprint(m.lastBody("editMessageText")["reply_markup"])
@@ -379,11 +416,11 @@ func TestSubscribeSavePersists(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
-	cb := cbUpdate(100, 1, "s:0")
+	cb := cbUpdate(100, 1, "s:gpt-6-astra")
 	if err := b.HandleUpdate(ctx, cb); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:1")); err != nil {
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:glm-5.3")); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "save")); err != nil {
@@ -397,7 +434,7 @@ func TestSubscribeSavePersists(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(fmt.Sprint(m.lastBody("sendMessage")["text"]), "Выбрано: 2 модели") {
+	if !strings.Contains(fmt.Sprint(m.lastBody("sendMessage")["text"]), "Выбрано: 2 из 2") {
 		t.Fatalf("reopened panel must show current config: %q", m.lastBody("sendMessage")["text"])
 	}
 }
@@ -414,7 +451,7 @@ func TestSubscribeToggleIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	// повторный тогл той же кнопки снимает выбор
-	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:1")); err != nil {
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:glm-5.3")); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "save")); err != nil {
@@ -483,7 +520,7 @@ func TestSubscribeCancel(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:0")); err != nil { // включили gpt-6-astra в черновике
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:gpt-6-astra")); err != nil { // включили gpt-6-astra в черновике
 		t.Fatal(err)
 	}
 	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "cancel")); err != nil {
@@ -506,7 +543,7 @@ func TestSubscribeCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	reopened := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	if !strings.Contains(reopened, "Выбрано: 1 модель") {
+	if !strings.Contains(reopened, "Выбрано: 1 из 2") {
 		t.Fatalf("reopened draft must equal saved state: %q", reopened)
 	}
 }
@@ -519,7 +556,7 @@ func TestSubscribeFamilyNavigation(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "f:0")); err != nil { // GPT
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "f:GPT")); err != nil { // GPT
 		t.Fatal(err)
 	}
 	editText := fmt.Sprint(m.lastBody("editMessageText")["text"])
@@ -527,7 +564,7 @@ func TestSubscribeFamilyNavigation(t *testing.T) {
 		t.Fatalf("family screen wrong: %q", editText)
 	}
 	toggleMarkup := fmt.Sprint(m.lastBody("editMessageText")["reply_markup"])
-	if !strings.Contains(toggleMarkup, "s:0") || !strings.Contains(toggleMarkup, "back") {
+	if !strings.Contains(toggleMarkup, "s:gpt-6-astra") || !strings.Contains(toggleMarkup, "back") {
 		t.Fatalf("family keyboard wrong: %s", toggleMarkup)
 	}
 	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "back")); err != nil {
@@ -536,5 +573,23 @@ func TestSubscribeFamilyNavigation(t *testing.T) {
 	rootText := fmt.Sprint(m.lastBody("editMessageText")["text"])
 	if !strings.Contains(rootText, "Настройка уведомлений") {
 		t.Fatalf("back must return to the root screen: %q", rootText)
+	}
+}
+
+// /status <длинный аргумент>: ответ обрезается до 64 рун, чтобы после
+// экранирования не превысить лимит Telegram.
+func TestStatusUnknownModelLongArgTruncated(t *testing.T) {
+	m := newMockTG(t)
+	b, _ := newBot(t, m)
+	arg := strings.Repeat("z", 300)
+	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/status "+arg)); err != nil {
+		t.Fatal(err)
+	}
+	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
+	if !strings.Contains(text, "Модель не найдена: ") {
+		t.Fatalf("must answer 'not found'.")
+	}
+	if strings.Contains(text, strings.Repeat("z", 65)) {
+		t.Fatalf("argument must be truncated to 64 runes")
 	}
 }

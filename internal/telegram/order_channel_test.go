@@ -64,7 +64,7 @@ func TestChannelSubscribePublishesKeyboard(t *testing.T) {
 	if markup == nil {
 		t.Fatal("channel subscribe must include an inline keyboard")
 	}
-	if !strings.Contains(fmt.Sprint(markup), "f:0") {
+	if !strings.Contains(fmt.Sprint(markup), "f:GPT") {
 		t.Fatalf("keyboard must carry family buttons: %v", markup)
 	}
 	if !strings.Contains(fmt.Sprint(body["text"]), "Настройка уведомлений") {
@@ -90,7 +90,7 @@ func TestChannelCallbackAdminToggles(t *testing.T) {
 		t.Fatal(err)
 	}
 	cb := &Update{UpdateID: 6, CallbackQuery: &CallbackQuery{
-		ID: "cb9", From: User{ID: 55}, Data: "s:0",
+		ID: "cb9", From: User{ID: 55}, Data: "s:gpt-6-astra",
 		Message: &Message{MessageID: 700, Chat: Chat{ID: -300, Type: "channel"}},
 	}}
 	if err := b.HandleUpdate(ctx, cb); err != nil {

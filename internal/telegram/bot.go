@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"opentw/internal/storage"
@@ -34,6 +35,20 @@ type Bot struct {
 
 	drafts map[int64]map[string]bool // черновики подписок до «Сохранить»
 	mu     sync.Mutex
+
+	wake         chan struct{} // букс deliveries-воркера после цикла
+	floodUntil   atomic.Int64  // unix-сек паузы рассылки после 429 (флуд-лимит бота глобальный)
+	panelDirty   atomic.Bool   // цикл изменил состояние — панели надо обновить
+	lastCleanup  atomic.Int64  // unix-время последней очистки outbox
+	backlogStale time.Duration // порог дайджеста в тестах; 0 = 2×interval
+}
+
+// wakeDelivery будит воркер доставки (неблокирующе).
+func (b *Bot) wakeDelivery() {
+	select {
+	case b.wake <- struct{}{}:
+	default:
+	}
 }
 
 // NewBot создаёт бота.
@@ -51,6 +66,7 @@ func NewBot(cfg BotCfg) *Bot {
 		lastText: map[int64]string{},
 		pinWarn:  map[int64]bool{},
 		drafts:   map[int64]map[string]bool{},
+		wake:     make(chan struct{}, 1),
 	}
 }
 
@@ -64,7 +80,10 @@ func (b *Bot) Run(ctx context.Context) error {
 	}); err != nil {
 		b.log.Warn("telegram: setMyCommands failed", "err", err)
 	}
-	offset := int64(0)
+	offset, err := b.store.BotOffset() // подтверждённые ранее апдейты не доставляются повторно
+	if err != nil {
+		b.log.Error("telegram: read offset", "err", err)
+	}
 	for {
 		updates, err := b.api.GetUpdates(ctx, offset, 25)
 		if err != nil {
@@ -94,6 +113,11 @@ func (b *Bot) Run(ctx context.Context) error {
 					b.log.Error("telegram: handle update", "err", err)
 				}
 			}()
+			// подтверждаем апдейт только после обработки: крах в этом окне
+			// даст повтор (идемпотентный), а не потерю команды
+			if err := b.store.SetBotOffset(offset); err != nil {
+				b.log.Warn("telegram: persist offset", "offset", offset, "err", err)
+			}
 		}
 	}
 }
@@ -154,7 +178,7 @@ func fromID(msg *Message) int64 {
 // handleStatusCommand: /status (без аргумента — панель) или /status model-id.
 func (b *Bot) handleStatusCommand(ctx context.Context, chat Chat, modelID string) error {
 	if modelID == "" {
-		return b.ensurePanel(ctx, chat.ID, true)
+		return b.ensurePanel(ctx, chat.ID)
 	}
 	return b.handleModelDetail(ctx, chat.ID, modelID)
 }
@@ -165,7 +189,24 @@ func (b *Bot) handleModelDetail(ctx context.Context, chatID int64, modelID strin
 		return err
 	}
 	if m == nil {
-		_, err := b.api.SendMessage(ctx, chatID, "Модель не найдена: "+EscapeHTML(modelID)+"\nТочный model-id указан в панели /status.")
+		// смягчение ввода: уникальный префикс достаивает до точного ID
+		if id := b.uniquePrefix(modelID); id != "" {
+			modelID = id
+			m, err = b.store.Model(modelID)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if m == nil {
+		if cands := b.prefixCandidates(modelID); len(cands) > 0 {
+			// неоднозначный префикс: подсказываем ближайшие
+			_, err := b.api.SendMessage(ctx, chatID, "Уточните модель: "+codeIDs(cands))
+			return err
+		}
+		// аргумент — внешние данные: ограничиваем до экранирования,
+		// иначе длинный ввод раздувает ответ за лимит Telegram
+		_, err := b.api.SendMessage(ctx, chatID, "Модель не найдена: "+EscapeHTML(trunc(modelID, 64))+"\nТочный model-id указан в панели /status.")
 		return err
 	}
 	checks, err := b.store.RecentChecks(modelID, time.Now().Add(-24*time.Hour))
@@ -175,12 +216,46 @@ func (b *Bot) handleModelDetail(ctx context.Context, chatID int64, modelID strin
 	last := storage.Check{}
 	if len(checks) > 0 {
 		last = checks[len(checks)-1]
-	} else if sm, err := b.store.Model(modelID); err == nil && sm != nil && sm.LastCheckAt != nil {
-		last = storage.Check{ModelID: modelID, At: *sm.LastCheckAt, Status: sm.LastStatus, ErrorType: sm.ErrorType, ErrorMessage: sm.ErrorMessage}
+	} else if m.LastCheckAt != nil {
+		last = storage.Check{ModelID: modelID, At: *m.LastCheckAt, Status: m.LastStatus, ErrorType: m.ErrorType, ErrorMessage: m.ErrorMessage}
 	}
 	text := RenderModelDetail(modelID, m.LastStatus, last, checks)
 	_, err = b.api.SendMessage(ctx, chatID, text)
 	return err
+}
+
+// uniquePrefix — точное совпадение по префиксу, если оно единственное.
+func (b *Bot) uniquePrefix(arg string) string {
+	c := b.prefixCandidates(arg)
+	if len(c) == 1 {
+		return c[0]
+	}
+	return ""
+}
+
+// prefixCandidates — ID моделей, начинающиеся с arg (до 5 шт. для подсказки).
+func (b *Bot) prefixCandidates(arg string) []string {
+	if arg == "" {
+		return nil
+	}
+	var out []string
+	for _, m := range b.models {
+		if strings.HasPrefix(m.ID, arg) {
+			out = append(out, m.ID)
+			if len(out) >= 5 {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func codeIDs(ids []string) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = codeID(id)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // fatalTelegramErr returns a permanent error for configuration problems that
