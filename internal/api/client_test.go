@@ -3,12 +3,14 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 const testPrompt = "Reply with exactly OK."
@@ -434,5 +436,167 @@ func TestNonStreamGatewayErrorInBody(t *testing.T) {
 	}
 	if !strings.Contains(res.ErrorMessage, "No available accounts") {
 		t.Fatalf("gateway error text lost: %q", res.ErrorMessage)
+	}
+}
+
+// --- 1.2: ошибки чтения тела после заголовков классифицируются той же
+// сетевой причиной, что и ошибки до заголовков ---
+
+// HTTP 200, первый чанк получен, поток зависает до Client.Timeout.
+func TestStreamReadTimeoutAfterFirstChunk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeChunks(w, `{"choices":[{"index":0,"delta":{"content":"O"},"finish_reason":null}]}`)
+		<-r.Context().Done() // зависание потока после первого чанка
+	}))
+	defer srv.Close()
+
+	res := newTestClient(srv.URL, 300*time.Millisecond, true).Generate(context.Background(), "glm-5.3", 8)
+	if res.HTTPStatus != 200 {
+		t.Fatalf("status = %d", res.HTTPStatus)
+	}
+	if res.ErrorKind != "timeout" {
+		t.Fatalf("kind = %q, want timeout (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+}
+
+// Отмена ctx во время чтения стримингового ответа: штатная остановка
+// монитора не должна выглядеть ошибкой модели.
+func TestStreamReadCancelled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeChunks(w, `{"choices":[{"index":0,"delta":{"content":"O"},"finish_reason":null}]}`)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(150*time.Millisecond, cancel)
+	res := newTestClient(srv.URL, 5*time.Second, true).Generate(ctx, "glm-5.3", 8)
+	if res.ErrorKind != "cancelled" {
+		t.Fatalf("kind = %q, want cancelled (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+}
+
+// Обрыв соединения во время чтения полного (не-SSE) ответа.
+func TestFullBodyConnectionBreak(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 200\r\nContent-Type: application/json\r\n\r\n{\"choices\":["))
+		conn.Close() // тело короче Content-Length: разрыв посреди ответа
+	}))
+	defer srv.Close()
+
+	res := newTestClient(srv.URL, 5*time.Second, false).Generate(context.Background(), "glm-5.3", 8)
+	if res.HTTPStatus != 200 {
+		t.Fatalf("status = %d", res.HTTPStatus)
+	}
+	if res.ErrorKind != "connrefused" {
+		t.Fatalf("kind = %q, want connrefused (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+}
+
+// Обрыв соединения посреди SSE-потока.
+func TestStreamBodyConnectionBreak(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 500\r\nContent-Type: text/event-stream\r\n\r\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"O\"}}]}\n\n"))
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	res := newTestClient(srv.URL, 5*time.Second, true).Generate(context.Background(), "glm-5.3", 8)
+	if res.ErrorKind != "connrefused" {
+		t.Fatalf("kind = %q, want connrefused (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+}
+
+// --- 1.3: ошибка шлюза в streaming-режиме ---
+
+// SSE-чанк с полем error — ошибка шлюза: текст провайдера сохраняется,
+// а не подменяется «пустой генерацией» (паритет с non-stream, D13).
+func TestStreamGatewayErrorInSSE(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSE(w, []string{`{"error":{"message":"No available accounts. Please retry later.","type":"upstream_error"}}`})
+	}))
+	defer srv.Close()
+
+	res := newTestClient(srv.URL, 5*time.Second, true).Generate(context.Background(), "glm-5.3", 8)
+	if res.ErrorKind != "empty" {
+		t.Fatalf("kind = %q, want empty (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+	if !strings.Contains(res.ErrorMessage, "No available accounts") {
+		t.Fatalf("gateway error text lost: %q", res.ErrorMessage)
+	}
+}
+
+// stream:true, но SSE-данных нет: шлюз отдал обычный JSON с ошибкой —
+// это не «ошибка монитора».
+func TestStreamGatewayErrorJSONBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"error":{"message":"Insufficient balance","type":"insufficient_quota","code":"insufficient_balance"}}`)
+	}))
+	defer srv.Close()
+
+	res := newTestClient(srv.URL, 5*time.Second, true).Generate(context.Background(), "glm-5.3", 8)
+	if res.ErrorKind != "empty" {
+		t.Fatalf("kind = %q, want empty (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+	if !strings.Contains(res.ErrorMessage, "Insufficient balance") {
+		t.Fatalf("gateway error text lost: %q", res.ErrorMessage)
+	}
+}
+
+// Контент уже сгенерирован, затем error-чанк: частично успешный стрим
+// остаётся успехом — ошибка шлюза важна только при отсутствии генерации.
+func TestStreamErrorChunkAfterContentStaysSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSE(w, []string{
+			`{"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}`,
+			`{"error":{"message":"stream interrupted"}}`,
+		})
+	}))
+	defer srv.Close()
+
+	res := newTestClient(srv.URL, 5*time.Second, true).Generate(context.Background(), "glm-5.3", 8)
+	if res.ErrorKind != "" {
+		t.Fatalf("kind = %q, want success (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+}
+
+// --- 1.4: обрезка текста ошибок безопасна для Unicode ---
+
+func TestTruncateRunesSafe(t *testing.T) {
+	s := strings.Repeat("р", 600)
+	got := truncate(s, 512)
+	if !utf8.ValidString(got) {
+		t.Fatal("truncate produced invalid UTF-8")
+	}
+	// n рун + многоточие, как в telegram.trunc
+	if got != strings.Repeat("р", 512)+"…" {
+		t.Fatalf("truncate = %q", got)
+	}
+	if short := truncate(strings.Repeat("р", 10), 512); short != strings.Repeat("р", 10) {
+		t.Fatalf("short string must pass through, got %q", short)
+	}
+}
+
+func TestErrSummaryRunesSafe(t *testing.T) {
+	got := errSummary(errors.New(strings.Repeat("р", 600)))
+	if !utf8.ValidString(got) {
+		t.Fatal("errSummary produced invalid UTF-8")
+	}
+	if l := len([]rune(got)); l != 512 {
+		t.Fatalf("rune count = %d, want 512", l)
 	}
 }

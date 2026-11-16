@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -28,6 +29,21 @@ func (e *ApiError) Error() string {
 
 func asApiError(err error, target **ApiError) bool {
 	return errors.As(err, target)
+}
+
+// redactTransportError снимает *url.Error: его текст содержит URL метода
+// вместе с BOT_TOKEN. Причина сбоя (ue.Err — dial/timeout/отмена) сохраняется
+// для диагностики, распознавание ApiError/429 не затрагивается — они приходят
+// из тела ответа, а не из транспорта.
+func redactTransportError(err error) error {
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	if ue.Err != nil {
+		return ue.Err
+	}
+	return errors.New(ue.Op + " request failed") // url.Error без причины URL не раскрывает
 }
 
 // Client talks to the Bot API; BaseURL is injectable for tests.
@@ -63,7 +79,7 @@ func (c *Client) call(ctx context.Context, method string, payload any, out any) 
 	for attempt := 0; ; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
-			return fmt.Errorf("telegram: build %s: %w", method, err)
+			return fmt.Errorf("telegram: build %s: %w", method, redactTransportError(err))
 		}
 		req.Header.Set("Content-Type", "application/json")
 
@@ -73,7 +89,7 @@ func (c *Client) call(ctx context.Context, method string, payload any, out any) 
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			return fmt.Errorf("telegram: %s: %w", method, err)
+			return fmt.Errorf("telegram: %s: %w", method, redactTransportError(err))
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 		resp.Body.Close()

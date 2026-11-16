@@ -109,16 +109,7 @@ func (c *Client) Generate(ctx context.Context, modelID string, maxTokens int) *R
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		res.LatencyUS = usSince(start)
-		switch {
-		case errors.Is(ctx.Err(), context.Canceled):
-			res.ErrorKind, res.ErrorMessage = "cancelled", ctx.Err().Error()
-		case isTimeout(err):
-			res.ErrorKind, res.ErrorMessage = "timeout", errSummary(err)
-		default:
-			// Any other transport failure (refused, reset, DNS) is a
-			// connection problem from the monitor's point of view.
-			res.ErrorKind, res.ErrorMessage = "connrefused", errSummary(err)
-		}
+		res.ErrorKind, res.ErrorMessage = classifyTransport(ctx, err), errSummary(err)
 		return res
 	}
 	defer resp.Body.Close()
@@ -133,38 +124,66 @@ func (c *Client) Generate(ctx context.Context, modelID string, maxTokens int) *R
 	}
 
 	if c.Stream {
-		c.consumeStream(resp.Body, res, start)
+		c.consumeStream(ctx, resp.Body, res, start)
 	} else {
-		c.consumeFull(resp.Body, res)
+		c.consumeFull(ctx, resp.Body, res)
 	}
 	res.LatencyUS = usSince(start)
 	return res
 }
 
-func (c *Client) consumeStream(body io.Reader, res *RawResult, start time.Time) {
+// classifyTransport — единая классификация транспортных сбоев: одинаковая
+// сетевая причина даёт одинаковый kind и до заголовков, и при чтении тела
+// ответа. Отмена → cancelled (штатная остановка не создаёт ложное состояние
+// модели), таймаут → timeout, прочий разрыв (refused/reset/DNS) → connrefused.
+func classifyTransport(ctx context.Context, err error) string {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled), errors.Is(err, context.Canceled):
+		return "cancelled"
+	case isTimeout(err):
+		return "timeout"
+	default:
+		return "connrefused"
+	}
+}
+
+func (c *Client) consumeStream(ctx context.Context, body io.Reader, res *RawResult, start time.Time) {
 	var firstContentAt time.Time
-	u, sawData, parsedAny, generated, err := readStream(body, func() {
+	out := readStream(body, func() {
 		if firstContentAt.IsZero() {
 			firstContentAt = time.Now()
 		}
 	})
-	if err != nil {
-		res.ErrorKind, res.ErrorMessage = "invalid", errSummary(err)
+	if out.err != nil {
+		res.ErrorKind, res.ErrorMessage = classifyTransport(ctx, out.err), errSummary(out.err)
 		return
 	}
-	if u != nil {
-		if u.PromptTokens != nil {
-			res.InputTokens = ptr64(*u.PromptTokens)
+	if out.usage != nil {
+		if out.usage.PromptTokens != nil {
+			res.InputTokens = ptr64(*out.usage.PromptTokens)
 		}
-		if u.CompletionTokens != nil {
-			res.OutputTokens = ptr64(*u.CompletionTokens)
+		if out.usage.CompletionTokens != nil {
+			res.OutputTokens = ptr64(*out.usage.CompletionTokens)
 		}
 	}
-	if !sawData || !parsedAny {
+	if out.dataErr != "" && !out.generated {
+		// Шлюз сообщил об ошибке прямо в SSE-данных: HTTP 200 без генерации —
+		// «empty» (паритет с non-stream, D13), исходный текст провайдера
+		// сохраняется, а не подменяется «пустой генерацией».
+		res.ErrorKind, res.ErrorMessage = "empty", truncate(out.dataErr, 512)
+		return
+	}
+	if !out.sawData || !out.parsedAny {
+		if msg := bodyGatewayError(out.rawPrefix); msg != "" {
+			// stream:true, но SSE-данных не было: шлюз отдал JSON с ошибкой —
+			// это не «ошибка монитора» и не разрыв соединения
+			res.ErrorKind, res.ErrorMessage = "empty", msg
+			return
+		}
 		res.ErrorKind, res.ErrorMessage = "invalid", "unparseable response body"
 		return
 	}
-	if !generated {
+	if !out.generated {
 		// HTTP 200 with nothing generated — Degraded, not Down. Reasoning
 		// tokens already counted as generation above.
 		res.ErrorKind, res.ErrorMessage = "empty", "empty generation"
@@ -188,10 +207,12 @@ func (c *Client) consumeStream(body io.Reader, res *RawResult, start time.Time) 
 	}
 }
 
-func (c *Client) consumeFull(body io.Reader, res *RawResult) {
+func (c *Client) consumeFull(ctx context.Context, body io.Reader, res *RawResult) {
 	raw, err := readLimited(body, 8192)
 	if err != nil {
-		res.ErrorKind, res.ErrorMessage = "invalid", errSummary(err)
+		// чтение тела после заголовков классифицируется транспортной причиной,
+		// а не «некорректным ответом» (1.2)
+		res.ErrorKind, res.ErrorMessage = classifyTransport(ctx, err), errSummary(err)
 		return
 	}
 	var parsed nonStreamResponse
@@ -246,8 +267,10 @@ func isTimeout(err error) bool {
 
 func errSummary(err error) string {
 	msg := err.Error()
-	if len(msg) > 512 {
-		msg = msg[:512]
+	// обрезка по рунам: байтовый срез мог бы ломать многобайтовые символы
+	// и отправлять в Telegram невалидный UTF-8
+	if r := []rune(msg); len(r) > 512 {
+		return string(r[:512])
 	}
 	return msg
 }

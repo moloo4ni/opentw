@@ -21,6 +21,11 @@ type streamChunk struct {
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *usage `json:"usage"`
+	// Error — ошибка шлюза, доставленная прямо в SSE-данных (HTTP 200):
+	// не то же самое, что транспортный сбой или пустая генерация.
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 type usage struct {
@@ -35,7 +40,23 @@ type usage struct {
 // a visible answer may never arrive at small max_tokens.
 // Individual malformed chunks are skipped: providers send keep-alive and odd
 // extensions; usable state is decided by the caller from the fields.
-func readStream(r io.Reader, onFirstContent func()) (u *usage, sawData, parsedAny, generated bool, err error) {
+// streamOutcome — итог чтения SSE-потока.
+type streamOutcome struct {
+	usage     *usage
+	sawData   bool
+	parsedAny bool
+	generated bool
+	// dataErr — текст поля error из SSE-данных (первое непустое сообщение).
+	dataErr string
+	// rawPrefix — прочитанное до первого data: (≤ 8КБ): при stream:true
+	// шлюз может ответить обычным JSON с ошибкой вместо SSE.
+	rawPrefix []byte
+	err       error
+}
+
+func readStream(r io.Reader, onFirstContent func()) streamOutcome {
+	var out streamOutcome
+	var raw bytes.Buffer
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
 		line, readErr := br.ReadString('\n')
@@ -54,34 +75,42 @@ func readStream(r io.Reader, onFirstContent func()) (u *usage, sawData, parsedAn
 				}
 				continue
 			}
-			sawData = true
+			out.sawData = true
 			if payload == "[DONE]" {
 				break
 			}
 			var chunk streamChunk
 			if json.Unmarshal([]byte(payload), &chunk) == nil {
-				parsedAny = true
+				out.parsedAny = true
+				if chunk.Error != nil && chunk.Error.Message != "" && out.dataErr == "" {
+					out.dataErr = chunk.Error.Message
+				}
 				if chunk.Usage != nil {
-					u = chunk.Usage
+					out.usage = chunk.Usage
 				}
 				for _, ch := range chunk.Choices {
-					if !generated && (ch.Delta.Content != "" || ch.Delta.ReasoningContent != "") {
-						generated = true
+					if !out.generated && (ch.Delta.Content != "" || ch.Delta.ReasoningContent != "") {
+						out.generated = true
 						if onFirstContent != nil {
 							onFirstContent()
 						}
 					}
 				}
 			}
+		} else if !out.sawData && raw.Len() < 8192 {
+			// не-data строка до первого SSE-события: сохраняем — возможно,
+			// это JSON-ответ шлюза (многострочный JSON собирается целиком)
+			raw.WriteString(line)
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
-				err = readErr
+				out.err = readErr
 			}
 			break
 		}
 	}
-	return u, sawData, parsedAny, generated, err
+	out.rawPrefix = raw.Bytes()
+	return out
 }
 
 // nonStreamResponse is a full chat completion object.
@@ -126,9 +155,27 @@ func extractProviderError(body []byte, code int) string {
 	return truncate(trimmed, 512)
 }
 
+// bodyGatewayError извлекает текст ошибки шлюза из не-SSE тела ответа при
+// stream:true (нет ни одного data:-события). "" — если это не JSON с ошибкой.
+func bodyGatewayError(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var parsed nonStreamResponse
+	if json.Unmarshal(raw, &parsed) != nil {
+		return ""
+	}
+	if parsed.Error != nil && parsed.Error.Message != "" {
+		return truncate(parsed.Error.Message, 512)
+	}
+	return ""
+}
+
+// truncate обрезает по рунам: байтовый срез ломал бы многобайтовые символы.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(r[:n]) + "…"
 }

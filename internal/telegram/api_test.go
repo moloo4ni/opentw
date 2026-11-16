@@ -3,7 +3,9 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -292,5 +294,77 @@ func TestDeleteMessage(t *testing.T) {
 	body := m.lastBody("deleteMessage")
 	if body["chat_id"].(float64) != 100 || body["message_id"].(float64) != 55 {
 		t.Fatalf("delete body = %v", body)
+	}
+}
+
+// 1.1: транспортные ошибки http-клиента несут URL с BOT_TOKEN
+// (Post "https://api.telegram.org/bot<токен>/метод": ...) — текст
+// возвращаемой ошибки и всех её обёрток не должен его раскрывать.
+func TestTransportErrorDoesNotLeakToken(t *testing.T) {
+	const token = "123456:AAE-SECRET-token-XYZ"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close() // порт закрыт: соединение отклонено
+
+	c := &Client{Token: token, BaseURL: srv.URL, HTTP: &http.Client{Timeout: time.Second}}
+	err := c.PinChatMessage(context.Background(), 1, 1)
+	if err == nil {
+		t.Fatal("network error expected")
+	}
+	assertNoTokenInChain(t, err, token)
+}
+
+func TestTransportTimeoutDoesNotLeakToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body) // тело прочитано: разрыв коннекта клиентом отменит ctx
+		<-r.Context().Done()        // зависаем до клиентского таймаута
+	}))
+	defer srv.Close()
+
+	const token = "123456:AAE-SECRET-token-XYZ"
+	c := &Client{Token: token, BaseURL: srv.URL, HTTP: &http.Client{Timeout: 250 * time.Millisecond}}
+	_, err := c.SendMessage(context.Background(), 1, "hi")
+	if err == nil {
+		t.Fatal("timeout error expected")
+	}
+	assertNoTokenInChain(t, err, token)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout cause must stay diagnosable: %v", err)
+	}
+	srv.CloseClientConnections() // зависший коннект не должен тормозить Close
+}
+
+func TestTransportCancelledDoesNotLeakToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	const token = "123456:AAE-SECRET-token-XYZ"
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	c := &Client{Token: token, BaseURL: srv.URL, HTTP: &http.Client{Timeout: 5 * time.Second}}
+	_, err := c.SendMessage(ctx, 1, "hi")
+	if err == nil {
+		t.Fatal("cancelled error expected")
+	}
+	assertNoTokenInChain(t, err, token)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel cause must stay diagnosable: %v", err)
+	}
+	srv.CloseClientConnections()
+}
+
+// assertNoTokenInChain проверяет текст ошибки и каждой её обёртки.
+func assertNoTokenInChain(t *testing.T, err error, token string) {
+	t.Helper()
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		msg := e.Error()
+		if strings.Contains(msg, token) {
+			t.Fatalf("BOT_TOKEN leaked in error: %q", msg)
+		}
+		if strings.Contains(msg, "/bot") {
+			t.Fatalf("full bot URL (masked token, /bot path) leaked in error: %q", msg)
+		}
 	}
 }
