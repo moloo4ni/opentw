@@ -1,6 +1,7 @@
 .env
-*.db
+*.db*
 *.sqlite*
 bin/
 .superpowers/
 config.yaml
+opentw.heartbeat*
