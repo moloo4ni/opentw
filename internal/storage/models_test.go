@@ -384,3 +384,85 @@ func TestSyncModelsCleansOrphanSubscriptionsAndIncidents(t *testing.T) {
 		t.Fatalf("open incident must be closed when the model leaves the config: %v %v", open, err)
 	}
 }
+
+// Этап 6.3: PendingOutboxDue — строгий FIFO внутри чата и честная выборка:
+// только головная (старейшая) строка каждого чата и только созревшая
+// (next_attempt_at); отложенная голова не выпускает более новые строки
+// своего чата, но не блокирует чужие чаты.
+func TestPendingOutboxDue(t *testing.T) {
+	s := openTest(t)
+	// чат 100: три строки; чат 200: одна
+	for _, k := range []string{"k1", "k2", "k3"} {
+		if err := s.EnqueueOutbox(100, "single", k, []byte(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.EnqueueOutbox(200, "single", "k4", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.PendingOutboxDue(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].ChatID != 100 || rows[1].ChatID != 200 {
+		t.Fatalf("heads of both chats expected, got %+v", rows)
+	}
+	if rows[0].DedupeKey != "k1" {
+		t.Fatalf("chat head must be the oldest row, got %+v", rows[0])
+	}
+
+	// голова чата 100 отложена: чат не участвует в выборке, чат 200 — участвует
+	if err := s.DeferOutboxAttempt(rows[0].ID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = s.PendingOutboxDue(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ChatID != 200 {
+		t.Fatalf("deferred head must hold back its chat only, got %+v", rows)
+	}
+
+	// созревание (next_attempt_at в прошлом) возвращает голову
+	if err := s.DeferOutboxAttempt(rows[0].ID, -2*time.Hour); err != nil { // и чат 200 заодно отложен в прошлое
+		t.Fatal(err)
+	}
+	if err := s.DeferOutboxAttempt(1, -2*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = s.PendingOutboxDue(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("both matured heads expected, got %+v", rows)
+	}
+
+	// доставка головы открывает следующую строку того же чата
+	if err := s.MarkOutboxSent(rows[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkOutboxSent(rows[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = s.PendingOutboxDue(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ChatID != 100 || rows[0].DedupeKey != "k2" {
+		t.Fatalf("next head of chat 100 expected, got %+v", rows)
+	}
+
+	// количество попыток доступно для расчёта backoff (6.1)
+	if err := s.BumpOutboxAttempt(rows[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = s.PendingOutboxDue(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Attempts != 1 {
+		t.Fatalf("attempts must be readable, got %+v", rows[0])
+	}
+}

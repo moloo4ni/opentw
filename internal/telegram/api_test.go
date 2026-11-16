@@ -16,13 +16,14 @@ import (
 
 // mockTG is a scriptable Telegram Bot API server.
 type mockTG struct {
-	mu      sync.Mutex
-	calls   []string                                    // method paths
-	bodies  map[string][]byte                           // last body per method
-	handler func(method string, body []byte) (any, int) // custom response, status
-	token   string
-	url     string
-	msgID   int64
+	mu        sync.Mutex
+	calls     []string                                    // method paths
+	bodies    map[string][]byte                           // last body per method
+	handler   func(method string, body []byte) (any, int) // custom response, status
+	token     string
+	url       string
+	msgID     int64
+	sendChats []int64 // chat_id каждого sendMessage, по порядку
 }
 
 func (m *mockTG) nextMessageID() int64 {
@@ -45,6 +46,14 @@ func newMockTG(t *testing.T) *mockTG {
 		r.Body.Read(body)
 		m.bodies[method] = body
 		m.token = token
+		if method == "sendMessage" {
+			var p map[string]any
+			if json.Unmarshal(body, &p) == nil {
+				if chatID, ok := p["chat_id"].(float64); ok {
+					m.sendChats = append(m.sendChats, int64(chatID))
+				}
+			}
+		}
 		m.mu.Unlock()
 		var payload any
 		status := http.StatusOK
@@ -73,6 +82,23 @@ func (m *mockTG) callCount(method string) int {
 		}
 	}
 	return n
+}
+
+func (m *mockTG) resetCalls() {
+	m.mu.Lock()
+	m.calls = nil
+	m.sendChats = nil
+	m.mu.Unlock()
+}
+
+// sentChatIDs возвращает chat_id всех вызовов sendMessage (в порядке).
+func (m *mockTG) sentChatIDs(method string) []int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if method != "sendMessage" {
+		return nil
+	}
+	return m.sendChats
 }
 
 func (m *mockTG) lastBody(method string) map[string]any {

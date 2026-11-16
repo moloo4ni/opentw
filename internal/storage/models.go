@@ -416,6 +416,7 @@ type OutboxRow struct {
 	Payload       []byte
 	CreatedAt     time.Time
 	NextAttemptAt *time.Time // не раньше этого момента (retry_after от Telegram)
+	Attempts      int        // число неудачных попыток (расчёт backoff, 6.1)
 }
 
 // OutboxEvent is a prepared notification for one chat: the runner commits it
@@ -491,9 +492,12 @@ func (s *Store) EnqueueOutbox(chatID int64, kind, dedupeKey string, payload []by
 	return s.exec(context.Background(), outboxInsertSQL, chatID, kind, payload, dedupeKey, fmtTime(time.Now()))
 }
 
-// PendingOutbox returns unsent notifications in FIFO order.
+const outboxColumns = `id, chat_id, kind, dedupe_key, payload, created_at, next_attempt_at, attempts`
+
+// PendingOutbox returns unsent notifications in raw FIFO order (без фильтров:
+// инспекция очереди и тесты).
 func (s *Store) PendingOutbox(limit int) ([]OutboxRow, error) {
-	rows, err := s.db.Query(`SELECT id, chat_id, kind, dedupe_key, payload, created_at, next_attempt_at FROM notification_outbox
+	rows, err := s.db.Query(`SELECT `+outboxColumns+` FROM notification_outbox
 		WHERE sent_at IS NULL ORDER BY id LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("storage: pending outbox: %w", err)
@@ -510,10 +514,37 @@ func (s *Store) PendingOutbox(limit int) ([]OutboxRow, error) {
 	return out, rows.Err()
 }
 
+// PendingOutboxDue — строгий FIFO внутри чата для доставки (6.2/6.3):
+// для каждого чата только его созревшая (next_attempt_at) головная строка
+// (старейшая pending). Отложенная голова не выпускает более новые строки
+// своего чата (восстановление не обгонит падение), а чаты с отложенными
+// головами не занимают слоты батча и не блокируют чужие чаты.
+func (s *Store) PendingOutboxDue(limit int) ([]OutboxRow, error) {
+	rows, err := s.db.Query(`SELECT o.id, o.chat_id, o.kind, o.dedupe_key, o.payload, o.created_at, o.next_attempt_at, o.attempts
+		FROM notification_outbox o
+		WHERE o.sent_at IS NULL
+		  AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
+		  AND o.id = (SELECT MIN(p.id) FROM notification_outbox p WHERE p.chat_id = o.chat_id AND p.sent_at IS NULL)
+		ORDER BY o.id LIMIT ?`, fmtTime(time.Now()), limit)
+	if err != nil {
+		return nil, fmt.Errorf("storage: pending outbox due: %w", err)
+	}
+	defer rows.Close()
+	var out []OutboxRow
+	for rows.Next() {
+		r, err := scanOutbox(rows)
+		if err != nil {
+			return nil, fmt.Errorf("storage: pending outbox due: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func scanOutbox(scanner interface{ Scan(...any) error }) (OutboxRow, error) {
 	var r OutboxRow
 	var created, next sql.NullString
-	if err := scanner.Scan(&r.ID, &r.ChatID, &r.Kind, &r.DedupeKey, &r.Payload, &created, &next); err != nil {
+	if err := scanner.Scan(&r.ID, &r.ChatID, &r.Kind, &r.DedupeKey, &r.Payload, &created, &next, &r.Attempts); err != nil {
 		return r, err
 	}
 	if created.Valid {
@@ -553,7 +584,7 @@ func (s *Store) StaleOutboxChats(olderThan time.Duration) ([]int64, error) {
 
 // PendingOutboxChat returns all undelivered rows of one chat in FIFO order.
 func (s *Store) PendingOutboxChat(chatID int64) ([]OutboxRow, error) {
-	rows, err := s.db.Query(`SELECT id, chat_id, kind, dedupe_key, payload, created_at, next_attempt_at FROM notification_outbox
+	rows, err := s.db.Query(`SELECT `+outboxColumns+` FROM notification_outbox
 		WHERE sent_at IS NULL AND chat_id = ? ORDER BY id`, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("storage: pending outbox chat: %w", err)

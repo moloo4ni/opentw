@@ -21,6 +21,8 @@ const (
 	groupedLineCap   = 15                 // строк списка в сводке; остальное «... ещё N»
 	cleanupEvery     = time.Hour
 	floodFloor       = time.Second // минимум паузы батча после 429 без retry_after
+	backoffBase      = 30 * time.Second
+	backoffCap       = 15 * time.Minute
 )
 
 // RunDelivery — воркер доставки: панели и уведомления уходят асинхронно от
@@ -50,8 +52,11 @@ func (b *Bot) deliveryTick(ctx context.Context) {
 
 // processOutbox доставляет накопленные события: устаревший backlog чата
 // сворачивается в один дайджест (анти-лавина, P1-2), свежие строки идут
-// по одной в FIFO. 429 паузит весь батч: флуд-лимит у бота глобальный,
-// остальные строки только получат свой 429 (P1-3/P1-4).
+// по одной в строгом FIFO внутри чата (6.3): из очереди выбирается только
+// созревшая головная строка чата — более новые строки того же чата не могут
+// её обогнать, а чат с отложенной головой не занимает слоты батча и не
+// блокирует чужие чаты (6.2). 429 паузит весь батч: флуд-лимит у бота
+// глобальный (P1-3/P1-4). Временные ошибки дают нарастающий backoff (6.1).
 func (b *Bot) processOutbox(ctx context.Context) {
 	if until := b.floodUntil.Load(); until != 0 && time.Now().Unix() < until {
 		return
@@ -60,52 +65,78 @@ func (b *Bot) processOutbox(ctx context.Context) {
 	if b.digestStaleBacklogs(ctx, failedChat) {
 		return
 	}
-	rows, err := b.store.PendingOutbox(outboxBatch)
-	if err != nil {
-		b.log.Error("delivery: pending outbox", "err", err)
-		return
-	}
-	now := time.Now()
-	for _, row := range rows {
-		if ctx.Err() != nil { // остановка не завышает attempts и не шумит (P3-7)
+	// после доставки головы следующая строка чата становится головой и
+	// уезжает в этом же тике (прогресс пере-запрашивает очередь);
+	// ограничение проходов страхует от вечного цикла при сбойном MarkOutboxSent
+	budget := outboxBatch
+	for pass := 0; pass < outboxBatch; pass++ {
+		rows, err := b.store.PendingOutboxDue(outboxBatch)
+		if err != nil {
+			b.log.Error("delivery: pending outbox", "err", err)
 			return
 		}
-		if failedChat[row.ChatID] {
-			continue
+		if len(rows) == 0 {
+			return
 		}
-		if row.NextAttemptAt != nil && row.NextAttemptAt.After(now) {
-			continue // retry_after ещё не истёк
-		}
-		var p deliveryPayload
-		if err := json.Unmarshal(row.Payload, &p); err != nil {
-			b.log.Error("delivery: decode payload", "chat", row.ChatID, "err", err)
-			if err := b.store.MarkOutboxSent(row.ID); err != nil {
-				b.log.Error("delivery: drop broken row", "err", err)
-			}
-			continue
-		}
-		if _, err := b.api.SendMessage(ctx, row.ChatID, renderOutbox(p)); err != nil {
-			if chatUnavailable(err) {
-				b.dropDeadChat(row.ChatID)
-				continue
-			}
-			b.log.Error("delivery: send", "chat", row.ChatID, "err", err)
-			if after, flood := b.pauseAfter(err); flood {
-				if deferErr := b.store.DeferOutboxAttempt(row.ID, after); deferErr != nil {
-					b.log.Error("delivery: defer attempt", "err", deferErr)
-				}
+		progressed := false
+		for _, row := range rows {
+			if ctx.Err() != nil { // остановка не завышает attempts и не шумит (P3-7)
 				return
 			}
-			if bumpErr := b.store.BumpOutboxAttempt(row.ID); bumpErr != nil {
-				b.log.Error("delivery: bump attempt", "err", bumpErr)
+			if failedChat[row.ChatID] {
+				continue
 			}
-			failedChat[row.ChatID] = true
-			continue
+			var p deliveryPayload
+			if err := json.Unmarshal(row.Payload, &p); err != nil {
+				b.log.Error("delivery: decode payload", "chat", row.ChatID, "err", err)
+				if err := b.store.MarkOutboxSent(row.ID); err != nil {
+					b.log.Error("delivery: drop broken row", "err", err)
+				}
+				budget--
+				progressed = true
+				continue
+			}
+			if _, err := b.api.SendMessage(ctx, row.ChatID, renderOutbox(p)); err != nil {
+				if chatUnavailable(err) {
+					b.dropDeadChat(row.ChatID)
+					continue
+				}
+				b.log.Error("delivery: send", "chat", row.ChatID, "err", err)
+				if after, flood := b.pauseAfter(err); flood {
+					if deferErr := b.store.DeferOutboxAttempt(row.ID, after); deferErr != nil {
+						b.log.Error("delivery: defer attempt", "err", deferErr)
+					}
+					return
+				}
+				// 6.1: временная ошибка — нарастающий backoff (30с/1м/2м… до 15м):
+				// строка живёт до доставки или TTL, удаления «после N попыток» нет
+				if deferErr := b.store.DeferOutboxAttempt(row.ID, deferBackoff(row.Attempts)); deferErr != nil {
+					b.log.Error("delivery: defer attempt", "err", deferErr)
+				}
+				failedChat[row.ChatID] = true
+				continue
+			}
+			if err := b.store.MarkOutboxSent(row.ID); err != nil {
+				b.log.Error("delivery: mark sent", "chat", row.ChatID, "err", err)
+			}
+			budget--
+			progressed = true
 		}
-		if err := b.store.MarkOutboxSent(row.ID); err != nil {
-			b.log.Error("delivery: mark sent", "chat", row.ChatID, "err", err)
+		if !progressed || budget <= 0 {
+			return
 		}
 	}
+}
+
+// deferBackoff — нарастающая пауза между повторами временной ошибки
+// доставки (не 429: для него свой retry_after): 30с, 1м, 2м… до 15 минут.
+// attempts — число неудачных попыток строки до текущей.
+func deferBackoff(attempts int) time.Duration {
+	d := backoffBase << attempts
+	if d <= 0 || d > backoffCap { // переполнение сдвига — потолок
+		d = backoffCap
+	}
+	return d
 }
 
 // pauseAfter останавливает рассылку батча до retry_after для 429
@@ -125,7 +156,9 @@ func (b *Bot) pauseAfter(err error) (time.Duration, bool) {
 
 // dropDeadChat убирает чат, в который бот больше не может писать (заблокирован,
 // исключён, чат удалён): подписки и очередь мертвы. Лог обязателен — иначе
-// владелец не поймёт, куда пропали уведомления (P2-5).
+// владелец не поймёт, куда пропали уведомления (P2-5). Панельная привязка и
+// in-memory кэши тоже мертвы (6.4): иначе syncPanel вечно ловил бы ошибки
+// редактирования несуществующего сообщения.
 func (b *Bot) dropDeadChat(chatID int64) {
 	if err := b.store.DeleteSubscriptions(chatID); err != nil {
 		b.log.Error("delivery: drop dead chat subscriptions", "chat", chatID, "err", err)
@@ -135,6 +168,14 @@ func (b *Bot) dropDeadChat(chatID int64) {
 		b.log.Error("delivery: drop dead chat rows", "chat", chatID, "err", err)
 		return
 	}
+	if err := b.store.DeleteStatusMessage(chatID); err != nil {
+		b.log.Error("delivery: drop dead chat panel binding", "chat", chatID, "err", err)
+	}
+	b.mu.Lock()
+	delete(b.lastText, chatID)
+	delete(b.pinWarn, chatID)
+	delete(b.drafts, chatID)
+	b.mu.Unlock()
 	b.log.Info("delivery: chat unavailable, dropped subscriptions and queued events", "chat", chatID, "rows", n)
 }
 

@@ -256,7 +256,8 @@ func TestOutboxSurvivesRestart(t *testing.T) {
 	}
 }
 
-// Временный сбой Telegram: строка остаётся и доезжает позже.
+// Временный сбой Telegram: строка остаётся, ретраится не раньше backoff
+// (мгновенного перевзвешивания больше нет, 6.1) и доезжает после созревания.
 func TestTelegramTransientFailurePostpones(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -280,11 +281,20 @@ func TestTelegramTransientFailurePostpones(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("failed row must stay pending: %+v", rows)
 	}
+	// до истечения backoff — никакого повторного запроса
 	fail.Store(false)
 	m.handler = nil
 	b.deliveryTick(context.Background())
+	if n := m.callCount("sendMessage"); n != 1 {
+		t.Fatalf("row must not be retried before the backoff elapses, sends = %d", n)
+	}
+	// срок настал — строка доезжает
+	if err := store.DeferOutboxAttempt(rows[0].ID, -time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	b.deliveryTick(context.Background())
 	if n := m.callCount("sendMessage"); n < 2 {
-		t.Fatalf("row must be retried, sends = %d", n)
+		t.Fatalf("row must be retried after maturity, sends = %d", n)
 	}
 	rows, _ = store.PendingOutbox(10)
 	if len(rows) != 0 {
@@ -541,52 +551,6 @@ func Test429PausesWholeBatch(t *testing.T) {
 	}
 }
 
-// P2-6: сбойная строка не обгоняется более новыми строками того же чата —
-// «восстановилась» не приходит раньше опоздавшего «упала».
-func TestFailedRowNotOvertaken(t *testing.T) {
-	m := newMockTG(t)
-	b, store := newBot(t, m)
-	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil {
-		t.Fatal(err)
-	}
-	commitCycle(t, b, cycle(nil, transition("gpt-6-astra", status.Operational, status.Down, time.Now().Add(-time.Minute), nil)))
-	commitCycle(t, b, cycle(nil, transition("gpt-6-astra", status.Down, status.Operational, time.Now(), nil)))
-	var sent []string
-	var first atomic.Bool
-	first.Store(true)
-	m.handler = func(method string, body []byte) (any, int) {
-		if method == "sendMessage" {
-			var p map[string]any
-			json.Unmarshal(body, &p)
-			sent = append(sent, fmt.Sprint(p["text"]))
-			if first.CompareAndSwap(true, false) {
-				return map[string]any{"ok": false, "error_code": 500, "description": "boom"}, http.StatusInternalServerError
-			}
-		}
-		return nil, http.StatusOK
-	}
-	b.deliveryTick(context.Background())
-	if len(sent) != 1 || !strings.Contains(sent[0], "недоступна") {
-		t.Fatalf("only the older row must be attempted, got %v", sent)
-	}
-	m.handler = func(method string, body []byte) (any, int) {
-		if method == "sendMessage" {
-			var p map[string]any
-			json.Unmarshal(body, &p)
-			sent = append(sent, fmt.Sprint(p["text"]))
-			return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
-		}
-		return map[string]any{"ok": true, "result": true}, http.StatusOK
-	}
-	b.deliveryTick(context.Background())
-	if len(sent) != 3 {
-		t.Fatalf("both rows must be delivered in order, got %v", sent)
-	}
-	if !strings.Contains(sent[1], "недоступна") || !strings.Contains(sent[2], "восстановилась") {
-		t.Fatalf("FIFO order broken: %v", sent)
-	}
-}
-
 // D1: гонка дайджеста. ApplyCycle коммитит новое событие тому же чату ВО
 // ВРЕМЯ отправки дайджеста: строка не входила в отправленный текст — она
 // обязана остаться pending и доехать отдельным сообщением, а не быть
@@ -760,5 +724,283 @@ func TestBlindFallNotifiedEndToEnd(t *testing.T) {
 	}
 	if rows, _ := store.PendingOutbox(10); len(rows) != 0 {
 		t.Fatalf("outbox must be drained: %+v", rows)
+	}
+}
+
+// --- Этап 6.1/6.2/6.3/6.4 ---
+
+// cycleAt — цикл с заданным временем (уникальные dedupe-ключи строк).
+func cycleAt(at time.Time, trs ...monitor.Transition) monitor.CycleResult {
+	return monitor.CycleResult{CycleAt: at, NextAt: at.Add(15 * time.Minute), Transitions: trs}
+}
+
+// firstPendingRow возвращает старейшую pending-строку (для манипуляций).
+func firstPendingRow(t *testing.T, store *storage.Store) storage.OutboxRow {
+	t.Helper()
+	rows, err := store.PendingOutbox(10)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("pending row expected: %v %v", rows, err)
+	}
+	return rows[0]
+}
+
+// 6.1: канонический график нарастающего backoff: 30с, 1м, 2м, 4м, 8м,
+// потолок 15м (и дальше — потолок).
+func TestDeferBackoffSchedule(t *testing.T) {
+	want := []time.Duration{30 * time.Second, 60 * time.Second, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 15 * time.Minute, 15 * time.Minute}
+	for i, w := range want {
+		if got := deferBackoff(i); got != w {
+			t.Errorf("deferBackoff(%d) = %v, want %v", i, got, w)
+		}
+	}
+}
+
+// 6.1: временная ошибка доставки → нарастающий backoff, строка не удаляется
+// и не ретраится раньше срока.
+func TestTemporaryErrorBackoff(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil {
+		t.Fatal(err)
+	}
+	var fail atomic.Bool
+	fail.Store(true)
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "sendMessage" && fail.Load() {
+			return map[string]any{"ok": false, "error_code": 500, "description": "Internal Server Error"}, http.StatusInternalServerError
+		}
+		return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
+	}
+	commitCycle(t, b, cycleAt(time.Now(), transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
+
+	// первая неудача: пауза ~30с
+	b.deliveryTick(context.Background())
+	row := firstPendingRow(t, store)
+	if row.NextAttemptAt == nil {
+		t.Fatal("temporary failure must defer the row (backoff)")
+	}
+	d := time.Until(*row.NextAttemptAt)
+	if d < 25*time.Second || d > 35*time.Second {
+		t.Fatalf("first backoff = %v, want ~30s", d)
+	}
+	// до истечения backoff строка не ретраится
+	b.deliveryTick(context.Background())
+	if n := m.callCount("sendMessage"); n != 1 {
+		t.Fatalf("row must not be retried before the backoff elapses, sends = %d", n)
+	}
+	// «прошло 30 секунд»: вторая неудача — пауза строго больше первой
+	if err := store.DeferOutboxAttempt(row.ID, -time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	b.deliveryTick(context.Background())
+	row = firstPendingRow(t, store)
+	if row.NextAttemptAt == nil {
+		t.Fatal("second failure must defer again")
+	}
+	d2 := time.Until(*row.NextAttemptAt)
+	if d2 < 2*d {
+		t.Fatalf("backoff must grow: first = %v, second = %v", d, d2)
+	}
+	// третья — ещё больше, попытки растут, строка НЕ удаляется
+	if err := store.DeferOutboxAttempt(row.ID, -time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	b.deliveryTick(context.Background())
+	row = firstPendingRow(t, store)
+	d3 := time.Until(*row.NextAttemptAt)
+	if d3 < 2*d2 || d3 > backoffCap {
+		t.Fatalf("backoff must keep growing up to the cap: %v", d3)
+	}
+	if row.Attempts < 3 {
+		t.Fatalf("attempts = %d, want ≥3", row.Attempts)
+	}
+	// строка дожила и доехала: backoff не удаляет события (TTL — единственный
+	// механизм потери, и он не сокращён)
+	fail.Store(false)
+	m.handler = nil
+	if err := store.DeferOutboxAttempt(row.ID, -time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	b.deliveryTick(context.Background())
+	if rows, _ := store.PendingOutbox(10); len(rows) != 0 {
+		t.Fatalf("row must be delivered after recovery: %+v", rows)
+	}
+}
+
+// 6.2: недоступные чаты не занимают слоты батча — живой чат получает
+// уведомление немедленно, сколько бы ни стояло за головами мёртвых чатов.
+func TestUnavailableChatsDoNotStarveLiveOnes(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil { // «мёртвый» чат
+		t.Fatal(err)
+	}
+	if err := store.SetSubscription(200, "glm-5.3", true); err != nil { // живой чат
+		t.Fatal(err)
+	}
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "sendMessage" {
+			var p map[string]any
+			json.Unmarshal(body, &p)
+			if chatID, _ := p["chat_id"].(float64); int64(chatID) == 100 {
+				return map[string]any{"ok": false, "error_code": 500, "description": "Internal Server Error"}, http.StatusInternalServerError
+			}
+		}
+		return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
+	}
+	// 55 строк мёртвому чату (больше одного батча) + одна живому
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 55; i++ {
+		commitCycle(t, b, cycleAt(base.Add(time.Duration(i)*time.Second),
+			transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
+	}
+	commitCycle(t, b, cycleAt(base.Add(time.Minute), transition("glm-5.3", status.Operational, status.Down, time.Now(), nil)))
+	m.resetCalls()
+
+	b.deliveryTick(context.Background())
+	// голова мёртвого чата попытана один раз и отложена; живой чат получил свою строку
+	sent := 0
+	for _, c := range m.sentChatIDs("sendMessage") {
+		if c == 200 {
+			sent++
+		}
+	}
+	if sent != 1 {
+		t.Fatalf("live chat must get its notification immediately, got %d", sent)
+	}
+	if n := m.callCount("sendMessage"); n > 2 {
+		t.Fatalf("dead chat must not be hammered, sends = %d", n)
+	}
+	if rows, _ := store.PendingOutbox(100); len(rows) != 55 {
+		t.Fatalf("dead chat rows must stay queued: %d", len(rows))
+	}
+}
+
+// 6.3 (главный инвариант): более новое восстановление не приходит раньше
+// старого падения того же чата — ни в этом тике, ни после рестарта;
+// после созревания головы обе строки доезжают по порядку за один тик.
+func TestFIFORecoveryNeverOvertakesFall(t *testing.T) {
+	m := newMockTG(t)
+	path := t.TempDir() + "/bot.db"
+	b, store := newBotAt(t, m, path, []storage.Model{{ID: "gpt-6-astra", Family: "GPT"}})
+	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil {
+		t.Fatal(err)
+	}
+	commitCycle(t, b, cycleAt(time.Now().Add(-2*time.Minute), transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
+	commitCycle(t, b, cycleAt(time.Now().Add(-time.Minute), transition("gpt-6-astra", status.Down, status.Operational, time.Now(), nil)))
+
+	var sent []string
+	var firstFail atomic.Bool
+	firstFail.Store(true)
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "sendMessage" {
+			var p map[string]any
+			json.Unmarshal(body, &p)
+			sent = append(sent, fmt.Sprint(p["text"]))
+			if firstFail.CompareAndSwap(true, false) {
+				return map[string]any{"ok": false, "error_code": 500, "description": "boom"}, http.StatusInternalServerError
+			}
+		}
+		return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
+	}
+	b.deliveryTick(context.Background())
+	if len(sent) != 1 || !strings.Contains(sent[0], "недоступна") {
+		t.Fatalf("only the older row may be attempted, got %v", sent)
+	}
+
+	// рестарт: тот же файл БД, новый бот
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b2, store2 := newBotAt(t, m, path, []storage.Model{{ID: "gpt-6-astra", Family: "GPT"}})
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "sendMessage" {
+			var p map[string]any
+			json.Unmarshal(body, &p)
+			sent = append(sent, fmt.Sprint(p["text"]))
+		}
+		return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
+	}
+	// голова (падение) отложена backoff'ом: восстановления нет, пока она ждёт
+	b2.deliveryTick(context.Background())
+	if len(sent) != 1 {
+		t.Fatalf("recovery must not overtake the deferred fall notification (FIFO after restart): %v", sent)
+	}
+	if rows, _ := store2.PendingOutbox(10); len(rows) != 2 {
+		t.Fatalf("both rows must stay queued: %+v", rows)
+	}
+
+	// голова созрела: обе строки доезжают по порядку за один тик
+	row := firstPendingRow(t, store2)
+	if err := store2.DeferOutboxAttempt(row.ID, -time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	b2.deliveryTick(context.Background())
+	if len(sent) != 3 {
+		t.Fatalf("both rows must be delivered in order after maturity, got %v", sent)
+	}
+	if !strings.Contains(sent[1], "недоступна") || !strings.Contains(sent[2], "восстановилась") {
+		t.Fatalf("FIFO order broken: %v", sent)
+	}
+}
+
+// 6.4: мёртвый чат — очистка памяти: lastText, pinWarn, drafts и привязка
+// status_messages, а не только подписки и очередь.
+func TestDeadChatCleanupMemory(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetStatusMessage(100, 777); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	b.lastText[100] = "панель"
+	b.pinWarn[100] = true
+	b.drafts[100] = map[string]bool{"gpt-6-astra": true}
+	b.mu.Unlock()
+
+	m.handler = func(method string, body []byte) (any, int) {
+		return map[string]any{"ok": false, "error_code": 403, "description": "Forbidden: bot was blocked by the user"}, http.StatusForbidden
+	}
+	commitCycle(t, b, cycleAt(time.Now(), transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
+	b.deliveryTick(context.Background())
+
+	if sm, err := store.StatusMessage(100); err != nil || sm != nil {
+		t.Fatalf("panel binding of the dead chat must be dropped: %v %v", sm, err)
+	}
+	b.mu.Lock()
+	lt, pw := b.lastText[100], b.pinWarn[100]
+	dr := b.drafts[100]
+	b.mu.Unlock()
+	if lt != "" || pw || dr != nil {
+		t.Fatalf("in-memory state of the dead chat must be cleaned: lastText=%q pinWarn=%v drafts=%v", lt, pw, dr)
+	}
+}
+
+// 6.2: write-forbidden (бот заглушён в группе) — не «мёртвый» чат:
+// подписки и строка остаются, доставка откладывается backoff'ом.
+func TestWriteForbiddenKeepsSubscriptions(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil {
+		t.Fatal(err)
+	}
+	m.handler = func(method string, body []byte) (any, int) {
+		return map[string]any{"ok": false, "error_code": 400, "description": "Bad Request: chat_write_forbidden"}, http.StatusBadRequest
+	}
+	commitCycle(t, b, cycleAt(time.Now(), transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
+	b.deliveryTick(context.Background())
+	subs, _ := store.Subscriptions(100)
+	if len(subs) != 1 {
+		t.Fatalf("write-forbidden is not a confirmed permanent exclusion, subs = %v", subs)
+	}
+	rows, _ := store.PendingOutbox(10)
+	if len(rows) != 1 {
+		t.Fatalf("row must stay queued, got %+v", rows)
+	}
+	if rows[0].NextAttemptAt == nil {
+		t.Fatal("row must be deferred by backoff")
 	}
 }
