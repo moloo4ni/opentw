@@ -165,6 +165,12 @@ func (c *Client) UnpinChatMessage(ctx context.Context, chatID, messageID int64) 
 	return c.call(ctx, "unpinChatMessage", map[string]any{"chat_id": chatID, "message_id": messageID}, nil)
 }
 
+// DeleteMessage deletes a message (в личных чатах и группах бот может
+// удалять свои сообщения; в каналах нужно право администратора).
+func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) error {
+	return c.call(ctx, "deleteMessage", map[string]any{"chat_id": chatID, "message_id": messageID}, nil)
+}
+
 // GetChatMember fetches the membership of a user in a chat.
 func (c *Client) GetChatMember(ctx context.Context, chatID, userID int64) (*ChatMember, error) {
 	var member ChatMember

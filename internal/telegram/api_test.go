@@ -282,3 +282,15 @@ func TestNetworkError(t *testing.T) {
 		t.Fatal("network error expected")
 	}
 }
+
+func TestDeleteMessage(t *testing.T) {
+	m := newMockTG(t)
+	c := newTestBot(m)
+	if err := c.DeleteMessage(context.Background(), 100, 55); err != nil {
+		t.Fatal(err)
+	}
+	body := m.lastBody("deleteMessage")
+	if body["chat_id"].(float64) != 100 || body["message_id"].(float64) != 55 {
+		t.Fatalf("delete body = %v", body)
+	}
+}

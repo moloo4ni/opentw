@@ -88,7 +88,7 @@ func notifyErrorBody(modelID string, c storage.Check) string {
 	switch c.ErrorType {
 	case "http":
 		line := fmt.Sprintf("HTTP %d", c.HTTPStatus)
-		if c.ErrorMessage != "" && !dupMessage(modelID, c.ErrorMessage) {
+		if c.ErrorMessage != "" {
 			line += "\n" + EscapeHTML(oneLine(c.ErrorMessage))
 		}
 		b.WriteString(line)

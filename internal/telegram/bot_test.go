@@ -469,8 +469,8 @@ func TestHelpCommand(t *testing.T) {
 	}
 }
 
-// Кнопка «Отменить»: изменения не сохраняются, клавиатура закрывается,
-// черновик сбрасывается (повторное /subscribe показывает сохранённое состояние).
+// Кнопка «Отменить»: сообщение меню удаляется, черновик сбрасывается,
+// сохранённые подписки не трогаются; повторное /subscribe — от сохранённого.
 func TestSubscribeCancel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -493,9 +493,9 @@ func TestSubscribeCancel(t *testing.T) {
 	if !strings.Contains(answered, "Отменено") {
 		t.Fatalf("ack = %q", answered)
 	}
-	cancelledText := fmt.Sprint(m.lastBody("editMessageText")["text"])
-	if !strings.Contains(cancelledText, "не сохранены") {
-		t.Fatalf("cancel message = %q", cancelledText)
+	delBody := m.lastBody("deleteMessage")
+	if delBody["chat_id"].(float64) != 100 || delBody["message_id"].(float64) != 55 {
+		t.Fatalf("cancel must delete the menu message: %v", delBody)
 	}
 	subs, _ := store.Subscriptions(100)
 	if len(subs) != 1 || subs[0] != "glm-5.3" {
@@ -508,5 +508,33 @@ func TestSubscribeCancel(t *testing.T) {
 	reopened := fmt.Sprint(m.lastBody("sendMessage")["text"])
 	if !strings.Contains(reopened, "Выбрано: 1 модель") {
 		t.Fatalf("reopened draft must equal saved state: %q", reopened)
+	}
+}
+
+// Навигация меню подписок: f:<i> открывает экран семейства, back — корень.
+func TestSubscribeFamilyNavigation(t *testing.T) {
+	m := newMockTG(t)
+	b, _ := newBot(t, m)
+	ctx := context.Background()
+	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "f:0")); err != nil { // GPT
+		t.Fatal(err)
+	}
+	editText := fmt.Sprint(m.lastBody("editMessageText")["text"])
+	if !strings.Contains(editText, "<b>GPT</b>") || !strings.Contains(editText, "0 из 1") {
+		t.Fatalf("family screen wrong: %q", editText)
+	}
+	toggleMarkup := fmt.Sprint(m.lastBody("editMessageText")["reply_markup"])
+	if !strings.Contains(toggleMarkup, "s:0") || !strings.Contains(toggleMarkup, "back") {
+		t.Fatalf("family keyboard wrong: %s", toggleMarkup)
+	}
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "back")); err != nil {
+		t.Fatal(err)
+	}
+	rootText := fmt.Sprint(m.lastBody("editMessageText")["text"])
+	if !strings.Contains(rootText, "Настройка уведомлений") {
+		t.Fatalf("back must return to the root screen: %q", rootText)
 	}
 }

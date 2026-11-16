@@ -239,32 +239,51 @@ func TestSubscribePanel(t *testing.T) {
 		{ID: "glm-5.3", Family: "GLM"},
 		{ID: "glm-5.3-prime", Family: "GLM"},
 	}
-	text, kb := RenderSubscribePanel(models, map[string]bool{"gpt-6-astra": true, "glm-5.3": true})
+	draft := map[string]bool{"gpt-6-astra": true, "glm-5.3": true}
+
+	// корневой экран: семейства + Сохранить/Отменить
+	text, kb := RenderSubscribeRoot(models, draft)
 	if !strings.Contains(text, "OpenTW - Настройка уведомлений") {
 		t.Fatalf("header missing:\n%s", text)
 	}
 	if !strings.Contains(text, "Выбрано: 2 модели") {
 		t.Fatalf("selection counter wrong:\n%s", text)
 	}
-	// 2 ряда пар кнопок + ряд Сохранить/Отменить
-	if len(kb.InlineKeyboard) != 3 {
-		t.Fatalf("keyboard rows = %d", len(kb.InlineKeyboard))
+	if strings.Contains(text, "gpt-6-astra") {
+		t.Fatalf("root text must not list models:\n%s", text)
 	}
-	first := kb.InlineKeyboard[0][0]
-	if first.Text != "+ gpt-6-astra" || first.CallbackData != "s:0" {
-		t.Fatalf("first button = %+v", first)
+	if len(kb.InlineKeyboard) != 2 {
+		t.Fatalf("root rows = %d: %+v", len(kb.InlineKeyboard), kb.InlineKeyboard)
 	}
-	second := kb.InlineKeyboard[0][1]
-	if second.Text != "gpt-6.1-sol" || second.CallbackData != "s:1" {
-		t.Fatalf("second button = %+v", second)
+	famRow := kb.InlineKeyboard[0]
+	if len(famRow) != 2 || famRow[0].Text != "GPT 1/2" || famRow[0].CallbackData != "f:0" ||
+		famRow[1].Text != "GLM 1/2" || famRow[1].CallbackData != "f:1" {
+		t.Fatalf("family row = %+v", famRow)
 	}
-	third := kb.InlineKeyboard[1][0]
-	if third.Text != "+ glm-5.3" || third.CallbackData != "s:2" {
-		t.Fatalf("third button = %+v", third)
+	lastRow := kb.InlineKeyboard[1]
+	if len(lastRow) != 2 || lastRow[0].Text != "Сохранить" || lastRow[0].CallbackData != "save" ||
+		lastRow[1].Text != "Отменить" || lastRow[1].CallbackData != "cancel" {
+		t.Fatalf("save row = %+v", lastRow)
 	}
-	save := kb.InlineKeyboard[2][0]
-	if save.Text != "Сохранить" || save.CallbackData != "save" {
-		t.Fatalf("save button = %+v", save)
+
+	// экран семейства GPT: модели столбцом, глобальные индексы, Назад+Сохранить
+	text, kb = RenderSubscribeFamily("GPT", models, draft)
+	if !strings.Contains(text, "<b>GPT</b>") || !strings.Contains(text, "Выбрано: 1 из 2") {
+		t.Fatalf("family text wrong:\n%s", text)
+	}
+	if len(kb.InlineKeyboard) != 3 { // 2 модели + Назад/Сохранить
+		t.Fatalf("family rows = %d: %+v", len(kb.InlineKeyboard), kb.InlineKeyboard)
+	}
+	if kb.InlineKeyboard[0][0].Text != "+ gpt-6-astra" || kb.InlineKeyboard[0][0].CallbackData != "s:0" {
+		t.Fatalf("first model button = %+v", kb.InlineKeyboard[0][0])
+	}
+	if kb.InlineKeyboard[1][0].Text != "gpt-6.1-sol" || kb.InlineKeyboard[1][0].CallbackData != "s:1" {
+		t.Fatalf("second model button = %+v", kb.InlineKeyboard[1][0])
+	}
+	nav := kb.InlineKeyboard[2]
+	if len(nav) != 2 || nav[0].Text != "Назад" || nav[0].CallbackData != "back" ||
+		nav[1].Text != "Сохранить" || nav[1].CallbackData != "save" {
+		t.Fatalf("nav row = %+v", nav)
 	}
 }
 
@@ -281,7 +300,7 @@ func TestSubscribePlural(t *testing.T) {
 
 func TestSubscribeEmptySelection(t *testing.T) {
 	models := []storage.Model{{ID: "a", Family: "A"}}
-	text, _ := RenderSubscribePanel(models, nil)
+	text, _ := RenderSubscribeRoot(models, nil)
 	if !strings.Contains(text, "Выбрано: 0 моделей") {
 		t.Fatalf("text = %s", text)
 	}

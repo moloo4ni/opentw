@@ -124,19 +124,8 @@ func errorHead(modelID string, c storage.Check) string {
 	if c.ErrorMessage == "" || c.ErrorType == "invalid" {
 		return head
 	}
-	if dupMessage(modelID, c.ErrorMessage) {
-		return head
-	}
 	msg := trunc(oneLine(c.ErrorMessage), maxPanelErr)
 	return head + " · " + EscapeHTML(msg)
-}
-
-// dupMessage: сообщение провайдера, повторяющее model ID, — шум: ID уже показан.
-func dupMessage(modelID, msg string) bool {
-	if len(modelID) < 4 || msg == "" {
-		return false
-	}
-	return strings.Contains(strings.ToLower(msg), strings.ToLower(modelID))
 }
 
 func oneLine(s string) string {
@@ -306,48 +295,92 @@ func pluralModels(n int) string {
 	}
 }
 
-// RenderSubscribePanel renders the /subscribe view and its inline keyboard.
-// Callback data: "s:<index>" по порядку отсортированного списка моделей,
-// "save" — сохранение. Индексы стабильны, пока не изменён конфиг.
-func RenderSubscribePanel(models []storage.Model, subscribed map[string]bool) (string, *InlineKeyboardMarkup) {
+// RenderSubscribeRoot — первый экран /subscribe: кнопки семейств с числом
+// выбранных, Сохранить и Отменить. Callback data: "f:<familyIndex>".
+func RenderSubscribeRoot(models []storage.Model, subscribed map[string]bool) (string, *InlineKeyboardMarkup) {
 	var b strings.Builder
 	b.WriteString("OpenTW - Настройка уведомлений\n\n")
 	b.WriteString("Выберите модели, об изменениях состояния\nкоторых хотите получать уведомления.\n")
 
-	rows := make([][]InlineButton, 0, len(models)+1)
+	families := FamiliesOf(models)
+	counts := map[string][2]int{} // family: {selected, total}
+	for _, m := range models {
+		c := counts[m.Family]
+		c[1]++
+		if subscribed[m.ID] {
+			c[0]++
+		}
+		counts[m.Family] = c
+	}
 	selected := 0
-	// пары кнопок: 25 моделей одним столбцом неудобно; длинные ID — отдельным рядом
+	for _, c := range counts {
+		selected += c[0]
+	}
+	b.WriteString("\nВыбрано: " + pluralModels(selected))
+
+	var rows [][]InlineButton
 	var pair []InlineButton
-	flush := func() {
-		if len(pair) > 0 {
+	for fi, fam := range families {
+		c := counts[fam]
+		btn := InlineButton{
+			Text:         fmt.Sprintf("%s %d/%d", EscapeHTML(fam), c[0], c[1]),
+			CallbackData: fmt.Sprintf("f:%d", fi),
+		}
+		pair = append(pair, btn)
+		if len(pair) == 2 {
 			rows = append(rows, pair)
 			pair = nil
 		}
 	}
-	for i, m := range models {
-		label := EscapeHTML(m.ID)
-		if subscribed[m.ID] {
-			label = "+ " + label
-			selected++
-		}
-		btn := InlineButton{Text: label, CallbackData: fmt.Sprintf("s:%d", i)}
-		if len([]rune(label)) <= 16 {
-			pair = append(pair, btn)
-			if len(pair) == 2 {
-				flush()
-			}
-		} else {
-			flush()
-			rows = append(rows, []InlineButton{btn})
-		}
+	if len(pair) > 0 {
+		rows = append(rows, pair)
 	}
-	flush()
-	b.WriteString("\nВыбрано: " + pluralModels(selected))
 	rows = append(rows, []InlineButton{
 		{Text: "Сохранить", CallbackData: "save"},
 		{Text: "Отменить", CallbackData: "cancel"},
 	})
 	return b.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// RenderSubscribeFamily — экран одного семейства: модели столбцом с
+// глобальными индексами ("s:<i>" по всему списку моделей), Назад и Сохранить.
+func RenderSubscribeFamily(family string, allModels []storage.Model, subscribed map[string]bool) (string, *InlineKeyboardMarkup) {
+	var b strings.Builder
+	b.WriteString("<b>" + EscapeHTML(family) + "</b>\n\n")
+
+	var rows [][]InlineButton
+	selected, total := 0, 0
+	for i, m := range allModels {
+		if m.Family != family {
+			continue
+		}
+		total++
+		label := EscapeHTML(m.ID)
+		if subscribed[m.ID] {
+			label = "+ " + label
+			selected++
+		}
+		rows = append(rows, []InlineButton{{Text: label, CallbackData: fmt.Sprintf("s:%d", i)}})
+	}
+	b.WriteString(fmt.Sprintf("Выбрано: %d из %d", selected, total))
+	rows = append(rows, []InlineButton{
+		{Text: "Назад", CallbackData: "back"},
+		{Text: "Сохранить", CallbackData: "save"},
+	})
+	return b.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// FamiliesOf — семейства в порядке конфигурации без повторов.
+func FamiliesOf(models []storage.Model) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range models {
+		if !seen[m.Family] {
+			seen[m.Family] = true
+			out = append(out, m.Family)
+		}
+	}
+	return out
 }
 
 // RenderHelp renders /help.

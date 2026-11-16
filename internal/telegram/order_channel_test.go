@@ -64,8 +64,8 @@ func TestChannelSubscribePublishesKeyboard(t *testing.T) {
 	if markup == nil {
 		t.Fatal("channel subscribe must include an inline keyboard")
 	}
-	if !strings.Contains(fmt.Sprint(markup), "s:0") {
-		t.Fatalf("keyboard must carry model toggles: %v", markup)
+	if !strings.Contains(fmt.Sprint(markup), "f:0") {
+		t.Fatalf("keyboard must carry family buttons: %v", markup)
 	}
 	if !strings.Contains(fmt.Sprint(body["text"]), "Настройка уведомлений") {
 		t.Fatalf("text = %v", body["text"])
