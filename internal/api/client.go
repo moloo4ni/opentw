@@ -143,7 +143,7 @@ func (c *Client) Generate(ctx context.Context, modelID string, maxTokens int) *R
 
 func (c *Client) consumeStream(body io.Reader, res *RawResult, start time.Time) {
 	var firstContentAt time.Time
-	_, u, sawData, parsedAny, generated, err := readStream(body, func() {
+	u, sawData, parsedAny, generated, err := readStream(body, func() {
 		if firstContentAt.IsZero() {
 			firstContentAt = time.Now()
 		}
@@ -213,7 +213,14 @@ func (c *Client) consumeFull(body io.Reader, res *RawResult) {
 		generated = msg.Content != "" || msg.ReasoningContent != ""
 	}
 	if !generated {
-		res.ErrorKind, res.ErrorMessage = "empty", "empty generation"
+		res.ErrorKind = "empty"
+		// некоторые шлюзы возвращают 200 с JSON-ошибкой: её текст важнее
+		// бессмысленного «empty generation»
+		if parsed.Error != nil && parsed.Error.Message != "" {
+			res.ErrorMessage = truncate(parsed.Error.Message, 512)
+		} else {
+			res.ErrorMessage = "empty generation"
+		}
 	}
 	// Without streaming there is no first-token timing: TTFT/TPS stay N/A.
 }

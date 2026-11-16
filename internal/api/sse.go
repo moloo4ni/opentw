@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -29,12 +30,12 @@ type usage struct {
 }
 
 // readStream consumes an SSE body, recording the moment of the first
-// generated token and accumulating visible text and usage. Reasoning tokens
+// generated token and the final usage. Reasoning tokens
 // count as generation: reasoning models write their budget there first, and
 // a visible answer may never arrive at small max_tokens.
 // Individual malformed chunks are skipped: providers send keep-alive and odd
 // extensions; usable state is decided by the caller from the fields.
-func readStream(r io.Reader, onFirstContent func()) (text strings.Builder, u *usage, sawData, parsedAny, generated bool, err error) {
+func readStream(r io.Reader, onFirstContent func()) (u *usage, sawData, parsedAny, generated bool, err error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
 		line, readErr := br.ReadString('\n')
@@ -70,9 +71,6 @@ func readStream(r io.Reader, onFirstContent func()) (text strings.Builder, u *us
 							onFirstContent()
 						}
 					}
-					if ch.Delta.Content != "" {
-						text.WriteString(ch.Delta.Content)
-					}
 				}
 			}
 		}
@@ -83,7 +81,7 @@ func readStream(r io.Reader, onFirstContent func()) (text strings.Builder, u *us
 			break
 		}
 	}
-	return text, u, sawData, parsedAny, generated, err
+	return u, sawData, parsedAny, generated, err
 }
 
 // nonStreamResponse is a full chat completion object.
@@ -123,7 +121,7 @@ func extractProviderError(body []byte, code int) string {
 	}
 	trimmed := strings.TrimSpace(string(bytes.ToValidUTF8(body, nil)))
 	if trimmed == "" {
-		return "HTTP " + itoa(code)
+		return "HTTP " + strconv.Itoa(code)
 	}
 	return truncate(trimmed, 512)
 }
@@ -133,26 +131,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
-}
-
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-	var b [20]byte
-	pos := len(b)
-	for i > 0 {
-		pos--
-		b[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if neg {
-		pos--
-		b[pos] = '-'
-	}
-	return string(b[pos:])
 }

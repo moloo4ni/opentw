@@ -418,3 +418,21 @@ func TestListModelsErrors(t *testing.T) {
 		t.Fatal("expected error on non-JSON body")
 	}
 }
+
+// D13: HTTP 200 с JSON-ошибкой шлюза — текст ошибки сохраняется,
+// а не «пустая генерация».
+func TestNonStreamGatewayErrorInBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"error":{"message":"No available accounts. Please retry later.","type":"upstream_error","code":"no_accounts"}}`)
+	}))
+	defer srv.Close()
+	c := newTestClient(srv.URL, 5*time.Second, false)
+	res := c.Generate(context.Background(), "model-a", 64)
+	if res.ErrorKind != "empty" {
+		t.Fatalf("kind = %q, want empty (200, nothing generated)", res.ErrorKind)
+	}
+	if !strings.Contains(res.ErrorMessage, "No available accounts") {
+		t.Fatalf("gateway error text lost: %q", res.ErrorMessage)
+	}
+}
