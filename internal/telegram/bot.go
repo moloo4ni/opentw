@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"opentw/internal/status"
 	"opentw/internal/storage"
 )
 
@@ -36,11 +37,10 @@ type Bot struct {
 	drafts map[int64]map[string]bool // черновики подписок до «Сохранить»
 	mu     sync.Mutex
 
-	wake         chan struct{} // букс deliveries-воркера после цикла
-	floodUntil   atomic.Int64  // unix-сек паузы рассылки после 429 (флуд-лимит бота глобальный)
-	panelDirty   atomic.Bool   // цикл изменил состояние — панели надо обновить
-	lastCleanup  atomic.Int64  // unix-время последней очистки outbox
-	backlogStale time.Duration // порог дайджеста в тестах; 0 = 2×interval
+	wake        chan struct{} // букс deliveries-воркера после цикла
+	floodUntil  atomic.Int64  // unix-сек паузы рассылки после 429 (флуд-лимит бота глобальный)
+	panelDirty  atomic.Bool   // цикл изменил состояние — панели надо обновить
+	lastCleanup atomic.Int64  // unix-время последней очистки outbox
 }
 
 // wakeDelivery будит воркер доставки (неблокирующе).
@@ -219,9 +219,38 @@ func (b *Bot) handleModelDetail(ctx context.Context, chatID int64, modelID strin
 	} else if m.LastCheckAt != nil {
 		last = storage.Check{ModelID: modelID, At: *m.LastCheckAt, Status: m.LastStatus, ErrorType: m.ErrorType, ErrorMessage: m.ErrorMessage}
 	}
-	text := RenderModelDetail(modelID, m.LastStatus, last, checks)
-	_, err = b.api.SendMessage(ctx, chatID, text)
-	return err
+	return b.sendModelCard(ctx, chatID, modelID, m.LastStatus, last, checks)
+}
+
+// sendModelCard отправляет rich-карточку модели; не поместившийся в лимит
+// хвост секции «Ответ» — следующими rich-сообщениями, без молчаливой
+// обрезки. Куси считаются в ЭКРАНИРОВАННЫХ рунах: спец-символы
+// растут до 6 раз после EscapeHTML, лимит считается по итоговому HTML.
+func (b *Bot) sendModelCard(ctx context.Context, chatID int64, modelID string, st status.Status, last storage.Check, checks []storage.Check) error {
+	card, followup := renderModelCard(modelID, st, last, checks)
+	if _, err := b.api.SendRichMessage(ctx, chatID, card); err != nil {
+		return err
+	}
+	rest := []rune(followup)
+	const limit = maxRichMessage - 8 // запас на обёртку <p>…</p>
+	i := 0
+	for i < len(rest) {
+		cost := 0
+		j := i
+		for j < len(rest) {
+			c := escapedRuneLen(rest[j])
+			if cost+c > limit {
+				break // одиночная руна (макс 6) лимита не превышает
+			}
+			cost += c
+			j++
+		}
+		if _, err := b.api.SendRichMessage(ctx, chatID, "<p>"+EscapeHTML(string(rest[i:j]))+"</p>"); err != nil {
+			return err
+		}
+		i = j
+	}
+	return nil
 }
 
 // uniquePrefix — точное совпадение по префиксу, если оно единственное.
@@ -256,6 +285,31 @@ func codeIDs(ids []string) string {
 		parts[i] = codeID(id)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// handleStatusCallback — кнопки-ошибки в панелях и уведомлениях:
+// немедленный answerCallbackQuery, карточка — НОВЫМ сообщением в тот же
+// чат, панель не редактируется, подписки и черновики не трогаем.
+// Модель в статусе Down/Unknown — НЕ устаревшая кнопка:
+// недоступность не делает callback недействительным.
+func (b *Bot) handleStatusCallback(ctx context.Context, cb *CallbackQuery) error {
+	if cb.Message == nil {
+		// ни chat_id, ни message_id — карточку отправить некуда
+		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Не удалось открыть карточку модели.")
+	}
+	id, ok := resolveCallback(strings.TrimPrefix(cb.Data, "st:"), modelIDs(b.models))
+	if !ok {
+		// модель удалена из конфигурации: кнопка осталась в старом сообщении
+		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Модель больше не отслеживается.")
+	}
+	// индикатор загрузки снимается до тяжёлой работы
+	if err := b.api.AnswerCallbackQuery(ctx, cb.ID, ""); err != nil {
+		b.log.Warn("status callback: answer", "err", err)
+	}
+	if err := b.handleModelDetail(ctx, cb.Message.Chat.ID, id); err != nil {
+		b.log.Error("status callback: model detail", "model", id, "err", err)
+	}
+	return nil
 }
 
 // fatalTelegramErr returns a permanent error for configuration problems that

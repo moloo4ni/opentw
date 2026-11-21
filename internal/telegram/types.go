@@ -23,9 +23,6 @@ type Chat struct {
 	Type string `json:"type"` // private | group | supergroup | channel
 }
 
-// IsGroupLike reports groups, supergroups and channels.
-func (c Chat) IsGroupLike() bool { return c.Type != "private" }
-
 // User is a Telegram user.
 type User struct {
 	ID       int64  `json:"id"`

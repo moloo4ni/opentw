@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
-	"opentw/internal/monitor"
 	"opentw/internal/status"
 	"opentw/internal/storage"
 )
@@ -18,7 +16,6 @@ const (
 	deliveryInterval = 30 * time.Second
 	outboxRetention  = 7 * 24 * time.Hour // отправленное хранится неделю
 	outboxTTL        = 24 * time.Hour     // недоставленное старше суток — мусор
-	groupedLineCap   = 15                 // строк списка в сводке; остальное «... ещё N»
 	cleanupEvery     = time.Hour
 	floodFloor       = time.Second // минимум паузы батча после 429 без retry_after
 	backoffBase      = 30 * time.Second
@@ -26,7 +23,7 @@ const (
 )
 
 // RunDelivery — воркер доставки: панели и уведомления уходят асинхронно от
-// цикла мониторинга, переживают недоступность Telegram и рестарты (D2/D3).
+// цикла мониторинга, переживают недоступность Telegram и рестарты.
 func (b *Bot) RunDelivery(ctx context.Context) error {
 	ticker := time.NewTicker(deliveryInterval)
 	defer ticker.Stop()
@@ -50,25 +47,23 @@ func (b *Bot) deliveryTick(ctx context.Context) {
 	b.cleanupOutboxOnce()
 }
 
-// processOutbox доставляет накопленные события: устаревший backlog чата
-// сворачивается в один дайджест (анти-лавина, P1-2), свежие строки идут
-// по одной в строгом FIFO внутри чата (6.3): из очереди выбирается только
-// созревшая головная строка чата — более новые строки того же чата не могут
-// её обогнать, а чат с отложенной головой не занимает слоты батча и не
-// блокирует чужие чаты (6.2). 429 паузит весь батч: флуд-лимит у бота
-// глобальный (P1-3/P1-4). Временные ошибки дают нарастающий backoff (6.1).
+// processOutbox доставляет накопленные события сверкой актуальности.
+// FIFO внутри чата сохраняется: PendingOutboxDue отдаёт только
+// созревшую головную строку чата; при её обработке чат целиком сворачивается
+// в одно сообщение по ТЕКУЩИМ состояниям. 429 паузит весь батч: флуд-лимит
+// у бота глобальный. Временные ошибки дают нарастающий backoff.
+// Отправка есть — отчёта нет (коммит после отправки не прошёл) даёт
+// at-least-once: строка может доехать повтором, это задокументированное
+// ограничение, очередь не фризится.
 func (b *Bot) processOutbox(ctx context.Context) {
 	if until := b.floodUntil.Load(); until != 0 && time.Now().Unix() < until {
 		return
 	}
-	failedChat := map[int64]bool{} // чат с ошибкой не обгоняется новыми строками до доезда старых (P2-6)
-	if b.digestStaleBacklogs(ctx, failedChat) {
-		return
-	}
+	failedChat := map[int64]bool{} // чат с ошибкой не обгоняется новыми строками
+	budget := outboxBatch
 	// после доставки головы следующая строка чата становится головой и
 	// уезжает в этом же тике (прогресс пере-запрашивает очередь);
 	// ограничение проходов страхует от вечного цикла при сбойном MarkOutboxSent
-	budget := outboxBatch
 	for pass := 0; pass < outboxBatch; pass++ {
 		rows, err := b.store.PendingOutboxDue(outboxBatch)
 		if err != nil {
@@ -79,53 +74,230 @@ func (b *Bot) processOutbox(ctx context.Context) {
 			return
 		}
 		progressed := false
+		seen := map[int64]bool{} // один чат — одна свёртка за проход
 		for _, row := range rows {
-			if ctx.Err() != nil { // остановка не завышает attempts и не шумит (P3-7)
+			if ctx.Err() != nil { // остановка не завышает attempts и не шумит
 				return
 			}
-			if failedChat[row.ChatID] {
+			if failedChat[row.ChatID] || seen[row.ChatID] {
 				continue
 			}
-			var p deliveryPayload
-			if err := json.Unmarshal(row.Payload, &p); err != nil {
-				b.log.Error("delivery: decode payload", "chat", row.ChatID, "err", err)
-				if err := b.store.MarkOutboxSent(row.ID); err != nil {
-					b.log.Error("delivery: drop broken row", "err", err)
-				}
-				budget--
+			seen[row.ChatID] = true
+			switch b.deliverChat(ctx, row.ChatID) {
+			case deliverDone:
 				progressed = true
-				continue
-			}
-			if _, err := b.api.SendMessage(ctx, row.ChatID, renderOutbox(p)); err != nil {
-				if chatUnavailable(err) {
-					b.dropDeadChat(row.ChatID)
-					continue
-				}
-				b.log.Error("delivery: send", "chat", row.ChatID, "err", err)
-				if after, flood := b.pauseAfter(err); flood {
-					if deferErr := b.store.DeferOutboxAttempt(row.ID, after); deferErr != nil {
-						b.log.Error("delivery: defer attempt", "err", deferErr)
-					}
-					return
-				}
-				// 6.1: временная ошибка — нарастающий backoff (30с/1м/2м… до 15м):
-				// строка живёт до доставки или TTL, удаления «после N попыток» нет
-				if deferErr := b.store.DeferOutboxAttempt(row.ID, deferBackoff(row.Attempts)); deferErr != nil {
-					b.log.Error("delivery: defer attempt", "err", deferErr)
-				}
+			case deliverFlood:
+				return
+			case deliverFail:
 				failedChat[row.ChatID] = true
-				continue
-			}
-			if err := b.store.MarkOutboxSent(row.ID); err != nil {
-				b.log.Error("delivery: mark sent", "chat", row.ChatID, "err", err)
 			}
 			budget--
-			progressed = true
+			if budget <= 0 {
+				return
+			}
 		}
-		if !progressed || budget <= 0 {
+		if !progressed {
 			return
 		}
 	}
+}
+
+// deliverState — исход свёртки одного чата.
+type deliverState int
+
+const (
+	deliverDone deliverState = iota
+	deliverFlood
+	deliverFail
+)
+
+// deliverChat обрабатывает все pending-строки чата одной сверкой:
+// строки группируются по модели, решение принимается по ТЕКУЩЕМУ состоянию
+// (models.last_status) и chat_notified. cur Unknown → тишина; cur == notified
+// → тишина; иначе одна строка по cur. Строки — в порядке конфига, одним
+// rich-сообщением, без заголовков.
+//
+// OPW-01: пометка «отправлено» присваивается ТОЛЬКО строкам, все модели
+// которых наблюдаемы достоверно (или больше не наблюдаемы: отписка,
+// уход из конфигурации). Строки модели в ⚪ остаются pending:
+// неопределённость проверки не является доставкой и не уничтожает
+// свидетельство о недоставленном изменении. Строки одной модели решаются
+// вместе (факт определяется текущим статусом модели — восстановление не
+// обгонит недоставленное падение), строки чужих моделей не ждут
+// неопределённой (изоляция моделей одного чата).
+func (b *Bot) deliverChat(ctx context.Context, chatID int64) deliverState {
+	rows, err := b.store.PendingOutboxChat(chatID)
+	if err != nil {
+		b.log.Error("delivery: backlog rows", "chat", chatID, "err", err)
+		return deliverFail
+	}
+	if len(rows) == 0 {
+		return deliverDone
+	}
+	// Точные ID прочитанных строк: ApplyCycle может добавить чату новое
+	// событие прямо во время доставки — оно не входило в решение и обязано
+	// остаться pending.
+	type pendingRow struct {
+		row    storage.OutboxRow
+		models map[string]bool
+	}
+	decoded := make([]pendingRow, 0, len(rows))
+	modelsPending := map[string]bool{}
+	for _, row := range rows {
+		var p deliveryPayload
+		if err := json.Unmarshal(row.Payload, &p); err != nil {
+			b.log.Error("delivery: decode payload", "chat", row.ChatID, "err", err)
+			if err := b.store.MarkOutboxSent(row.ID); err != nil {
+				b.log.Error("delivery: drop broken row", "err", err)
+			}
+			continue
+		}
+		pr := pendingRow{row: row, models: map[string]bool{}}
+		for _, tr := range p.Trs {
+			pr.models[tr.ModelID] = true
+			modelsPending[tr.ModelID] = true
+		}
+		decoded = append(decoded, pr)
+	}
+	if len(decoded) == 0 {
+		return deliverDone
+	}
+
+	models, err := b.store.Models()
+	if err != nil {
+		b.log.Error("delivery: models", "chat", chatID, "err", err)
+		return b.deferHead(chatID, decoded[0].row)
+	}
+	cur := map[string]status.Status{}
+	for _, m := range models {
+		cur[m.ID] = m.LastStatus
+	}
+	lastChecks, err := b.store.LastChecks()
+	if err != nil {
+		b.log.Error("delivery: last checks", "chat", chatID, "err", err)
+		return b.deferHead(chatID, decoded[0].row)
+	}
+	// подписка могла быть снята между событием и доставкой: строку выбрасываем
+	subs, err := b.store.Subscriptions(chatID)
+	if err != nil {
+		b.log.Error("delivery: subscriptions", "chat", chatID, "err", err)
+		return b.deferHead(chatID, decoded[0].row)
+	}
+	subscribed := map[string]bool{}
+	for _, id := range subs {
+		subscribed[id] = true
+	}
+
+	var lines []string
+	notifiedSet := map[string]status.Status{}
+	for _, m := range b.models { // порядок строк — порядок конфига
+		if !modelsPending[m.ID] || !subscribed[m.ID] {
+			continue
+		}
+		st, exists := cur[m.ID]
+		if !exists {
+			continue // модель удалена из конфигурации: наблюдать нечего
+		}
+		if st != status.Operational && st != status.Down {
+			continue // cur Unknown (или старый статус): тишина, chat_notified не трогаем
+		}
+		notified, ok, err := b.store.ChatNotifiedState(chatID, m.ID)
+		if err != nil {
+			b.log.Error("delivery: chat notified state", "chat", chatID, "model", m.ID, "err", err)
+			return b.deferHead(chatID, decoded[0].row)
+		}
+		if ok && notified == st {
+			continue // пользователь уже знает: строк не отправлять, пометить sent
+		}
+		if st == status.Down {
+			c := lastChecks[m.ID]
+			if _, ok := lastChecks[m.ID]; !ok {
+				// модель без check-строки (теоретически): подпись из модели
+				c = storage.Check{ModelID: m.ID, Status: st, ErrorType: m.ErrorType, ErrorMessage: m.ErrorMessage}
+			}
+			lines = append(lines, downLine(m.ID, c))
+		} else {
+			lines = append(lines, recoveredLine(m.ID))
+		}
+		notifiedSet[m.ID] = st
+	}
+
+	// OPW-01: строка гасится (помечается sent) только если ВСЕ её модели
+	// наблюдаемы достоверно — ⚪-модель оставляет свою строку pending:
+	// неопределённость не имеет права поглощать единственное свидетельство
+	// о недоставленном изменении. Факт доставки определяется текущим
+	// статусом модели, поэтому строки одной модели решаются вместе.
+	var ids []int64
+	var stuckHead *storage.OutboxRow
+	for i := range decoded {
+		resolved := true
+		for mid := range decoded[i].models {
+			if !subscribed[mid] {
+				continue // отписка: строку выбрасываем
+			}
+			st, exists := cur[mid]
+			if !exists {
+				continue // модель ушла из конфигурации: наблюдать нечего
+			}
+			if st != status.Operational && st != status.Down {
+				resolved = false // cur Unknown: свид-во недоставленного изменения
+			}
+		}
+		if resolved {
+			ids = append(ids, decoded[i].row.ID)
+		} else if stuckHead == nil {
+			stuckHead = &decoded[i].row
+		}
+	}
+
+	if len(lines) > 0 {
+		if _, err := b.api.SendRichMessage(ctx, chatID, strings.Join(lines, "")); err != nil {
+			if chatUnavailable(err) {
+				b.dropDeadChat(chatID)
+				return deliverDone
+			}
+			b.log.Error("delivery: send", "chat", chatID, "err", err)
+			if after, flood := b.pauseAfter(err); flood {
+				_ = b.store.DeferOutboxAttempt(decoded[0].row.ID, after)
+				return deliverFlood
+			}
+			// 6.1: временная ошибка — нарастающий backoff (30с/1м/2м… до 15м):
+			// строки живут до доставки или TTL, удаления «после N попыток» нет
+			return b.deferHead(chatID, decoded[0].row)
+		}
+	}
+	// Порядок обязателен: сначала Telegram подтвердил отправку (выше), затем
+	// ОДНИМ коммитом фиксируются уведомлённые состояния и пометки строк.
+	// До ответа Telegram chat_notified не пишется — иначе при сбое доставки
+	// событие считалось бы отправленным и потерялось. Сбой коммита не признаёт
+	// доставку готовой: строки остаются pending (at-least-once — редкий дубль
+	// вместо потери), пауза через backoff без долбления БД.
+	if len(ids) > 0 || len(notifiedSet) > 0 {
+		if err := b.store.CommitDelivery(chatID, notifiedSet, ids); err != nil {
+			b.log.Error("delivery: commit", "chat", chatID, "err", err)
+			return b.deferHead(chatID, decoded[0].row)
+		}
+	}
+	if stuckHead != nil {
+		// ⚪-свидетельство остаётся pending; голова получает короткую паузу
+		// БЕЗ счётчика попыток (не искажает backoff реальных сбоев, не даёт
+		// чату занимать слоты батча и не гоняет свёртку вхолостую каждый тик).
+		if err := b.store.DeferOutboxRetry(stuckHead.ID, deliveryInterval); err != nil {
+			b.log.Error("delivery: defer stuck row", "chat", chatID, "err", err)
+		}
+		if len(ids) == 0 && len(notifiedSet) == 0 {
+			return deliverFail // свёртке нечего зафиксировать: чат в этом тике больше не трогаем
+		}
+	}
+	return deliverDone
+}
+
+// deferHead откладывает головную строку чата и возвращает исход «сбой».
+func (b *Bot) deferHead(chatID int64, head storage.OutboxRow) deliverState {
+	if err := b.store.DeferOutboxAttempt(head.ID, deferBackoff(head.Attempts)); err != nil {
+		b.log.Error("delivery: defer attempt", "chat", chatID, "err", err)
+	}
+	return deliverFail
 }
 
 // deferBackoff — нарастающая пауза между повторами временной ошибки
@@ -155,10 +327,9 @@ func (b *Bot) pauseAfter(err error) (time.Duration, bool) {
 }
 
 // dropDeadChat убирает чат, в который бот больше не может писать (заблокирован,
-// исключён, чат удалён): подписки и очередь мертвы. Лог обязателен — иначе
-// владелец не поймёт, куда пропали уведомления (P2-5). Панельная привязка и
-// in-memory кэши тоже мертвы (6.4): иначе syncPanel вечно ловил бы ошибки
-// редактирования несуществующего сообщения.
+// исключён, чат удалён): подписки, очередь, привязка панели и уведомлённые
+// состояния мертвы. Лог обязателен — иначе владелец не поймёт, куда пропали
+// уведомления. In-memory кэши тоже.
 func (b *Bot) dropDeadChat(chatID int64) {
 	if err := b.store.DeleteSubscriptions(chatID); err != nil {
 		b.log.Error("delivery: drop dead chat subscriptions", "chat", chatID, "err", err)
@@ -171,6 +342,9 @@ func (b *Bot) dropDeadChat(chatID int64) {
 	if err := b.store.DeleteStatusMessage(chatID); err != nil {
 		b.log.Error("delivery: drop dead chat panel binding", "chat", chatID, "err", err)
 	}
+	if err := b.store.DeleteChatNotifiedState(chatID); err != nil {
+		b.log.Error("delivery: drop dead chat notified state", "chat", chatID, "err", err)
+	}
 	b.mu.Lock()
 	delete(b.lastText, chatID)
 	delete(b.pinWarn, chatID)
@@ -179,69 +353,9 @@ func (b *Bot) dropDeadChat(chatID int64) {
 	b.log.Info("delivery: chat unavailable, dropped subscriptions and queued events", "chat", chatID, "rows", n)
 }
 
-// digestStaleBacklogs сворачивает устаревший backlog каждого чата в одно
-// дайджест-сообщение: восстановление Telegram после долгого простоя не
-// должно обрушивать лавину устаревших сообщений (P1-2). Чат с неудавшимся
-// дайджестом попадает в failed — в этом же тике его строки не пробуются
-// по одной. true — рассылка остановлена флуд-паузой.
-func (b *Bot) digestStaleBacklogs(ctx context.Context, failed map[int64]bool) bool {
-	chats, err := b.store.StaleOutboxChats(b.backlogStaleAfter())
-	if err != nil {
-		b.log.Error("delivery: stale chats", "err", err)
-		return false
-	}
-	for _, chatID := range chats {
-		if ctx.Err() != nil {
-			return false
-		}
-		rows, err := b.store.PendingOutboxChat(chatID)
-		if err != nil {
-			b.log.Error("delivery: backlog rows", "chat", chatID, "err", err)
-			continue
-		}
-		if len(rows) == 0 {
-			continue
-		}
-		// Точные ID прочитанных строк: ApplyCycle может добавить чату новое
-		// событие прямо во время отправки дайджеста — оно НЕ входило в
-		// отправленный текст и обязано остаться pending (D1).
-		ids := make([]int64, len(rows))
-		for i := range rows {
-			ids[i] = rows[i].ID
-		}
-		if _, err := b.api.SendMessage(ctx, chatID, renderDigest(rows)); err != nil {
-			if chatUnavailable(err) {
-				b.dropDeadChat(chatID)
-				continue
-			}
-			b.log.Error("delivery: digest send", "chat", chatID, "err", err)
-			if _, flood := b.pauseAfter(err); flood {
-				return true
-			}
-			failed[chatID] = true
-			continue // дайджест повторится следующим тиком
-		}
-		n, err := b.store.MarkOutboxSentByIDs(ids)
-		if err != nil {
-			b.log.Error("delivery: mark digest sent", "chat", chatID, "err", err)
-			continue
-		}
-		b.log.Info("delivery: backlog digest sent", "chat", chatID, "rows", n)
-	}
-	return false
-}
-
-// backlogStaleAfter — порог устаревания backlog: два интервала мониторинга.
-func (b *Bot) backlogStaleAfter() time.Duration {
-	if b.backlogStale > 0 {
-		return b.backlogStale
-	}
-	return 2 * b.interval()
-}
-
 // syncPanelsOnce обновляет панели всех чатов с привязкой, если цикл пометил
 // их грязными; текст строится из store.LastChecks() — неполный цикл не затирает
-// известное состояние (D1).
+// известное состояние.
 func (b *Bot) syncPanelsOnce(ctx context.Context) {
 	if !b.panelDirty.Swap(false) {
 		return
@@ -271,229 +385,11 @@ func (b *Bot) cleanupOutboxOnce() {
 	if _, err := b.store.DeleteOldOutbox(outboxRetention); err != nil {
 		b.log.Error("delivery: outbox cleanup", "err", err)
 	}
-	// TTL — предохранитель (при живом дайджесте недостижим); удалённое
-	// обязательно логируется: молчаливая потеря событий недопустима (P1-2)
+	// TTL — предохранитель; удалённое обязательно логируется: молчаливая
+	// потеря событий недопустима
 	if n, err := b.store.DropStaleOutbox(outboxTTL); err != nil {
 		b.log.Error("delivery: outbox ttl", "err", err)
 	} else if n > 0 {
 		b.log.Warn("delivery: dropped undeliverable events older than TTL", "rows", n)
 	}
 }
-
-// renderOutbox строит текст из сохранённого payload: единственное событие —
-// одиночный формат, иначе сводка цикла.
-func renderOutbox(p deliveryPayload) string {
-	if len(p.Trs) == 1 {
-		return RenderNotification(p.Trs[0])
-	}
-	return RenderGrouped(p)
-}
-
-// digestState — накопленный итог по одной модели за период недоставки.
-type digestState struct {
-	model  string
-	first  status.Status // состояние на начало окна
-	final  status.Status // итоговое состояние
-	flips  int           // сколько раз менялась
-	since  time.Time     // начало текущего плохого периода
-	lastAt time.Time     // время последнего перехода
-	dur    time.Duration // длительность завершившегося сбоя (последнее восстановление)
-}
-
-// digestLine — строка одной модели в дайджесте: итог + длительность + счётчик.
-func digestLine(st *digestState) string {
-	suffix := ""
-	if st.flips > 1 {
-		suffix = fmt.Sprintf(" (переключалась %s)", pluralEvents(st.flips))
-	}
-	switch st.final {
-	case status.Down:
-		if d := st.lastAt.Sub(st.since); d > 0 {
-			return codeID(st.model) + " - недоступна ~" + durationHuman(d) + suffix
-		}
-		return codeID(st.model) + " - недоступна" + suffix
-	case status.Degraded:
-		return codeID(st.model) + " - работает нестабильно" + suffix
-	default:
-		if st.dur > 0 {
-			return codeID(st.model) + " - сбой длился " + durationHuman(st.dur) + suffix
-		}
-		return codeID(st.model) + " - восстановилась" + suffix
-	}
-}
-
-// renderDigest строит одно дайджест-сообщение из накопленных строк чата:
-// итоговые состояния моделей и честные счётчики изменений вместо лавины
-// устаревших сообщений (P1-2). Порядок строк — порядок первых appearances.
-func renderDigest(rows []storage.OutboxRow) string {
-	states := map[string]*digestState{}
-	var order []string
-	total := 0
-	firstSeen, lastSeen, lastCheck := time.Time{}, time.Time{}, time.Time{}
-	for _, row := range rows {
-		var p deliveryPayload
-		if err := json.Unmarshal(row.Payload, &p); err != nil {
-			continue
-		}
-		total += len(p.Trs)
-		if firstSeen.IsZero() || row.CreatedAt.Before(firstSeen) {
-			firstSeen = row.CreatedAt
-		}
-		if row.CreatedAt.After(lastSeen) {
-			lastSeen = row.CreatedAt
-		}
-		for _, tr := range p.Trs {
-			st, ok := states[tr.ModelID]
-			if !ok {
-				st = &digestState{model: tr.ModelID, first: tr.From, since: tr.Check.At}
-				states[tr.ModelID] = st
-				order = append(order, tr.ModelID)
-			}
-			if tr.To != status.Operational && st.final == status.Operational {
-				st.since = tr.Check.At // вход в плохой период
-			}
-			st.final = tr.To
-			st.flips++
-			st.lastAt = tr.Check.At
-			if tr.To == status.Operational && tr.Incident != nil {
-				st.dur = tr.Incident.Duration
-			}
-			if tr.Check.At.After(lastCheck) {
-				lastCheck = tr.Check.At
-			}
-		}
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "📬 Пока Telegram был недоступен: %s за %s\n",
-		pluralEvents(total), durationHuman(lastSeen.Sub(firstSeen)))
-	shown, rest := 0, 0
-	for _, section := range []struct {
-		emoji string
-		title string
-		match func(status.Status) bool
-	}{{
-		emoji: "🔴", title: "Сейчас недоступны", match: func(s status.Status) bool { return s == status.Down },
-	}, {
-		emoji: "🟡", title: "Нестабильны", match: func(s status.Status) bool { return s == status.Degraded },
-	}, {
-		emoji: "🟢", title: "Восстановились", match: func(s status.Status) bool { return s == status.Operational },
-	}} {
-		var lines []string
-		for _, id := range order {
-			if states[id] != nil && section.match(states[id].final) {
-				lines = append(lines, digestLine(states[id]))
-			}
-		}
-		if len(lines) == 0 {
-			continue
-		}
-		limit := groupedLineCap - shown
-		if limit < 0 {
-			limit = 0
-		}
-		display := lines
-		if len(display) > limit {
-			rest += len(display) - limit
-			display = display[:limit]
-		}
-		shown += len(display)
-		fmt.Fprintf(&b, "\n%s %s (%d):\n", section.emoji, section.title, len(lines))
-		for _, l := range display {
-			b.WriteString(l + "\n")
-		}
-	}
-	if rest > 0 {
-		fmt.Fprintf(&b, "... ещё %s\n", pluralModels(rest))
-	}
-	b.WriteString("\nПроверено: " + fmtClockMSK(lastCheck) + " MSK")
-	return b.String()
-}
-
-func pluralEvents(n int) string {
-	mod10, mod100 := n%10, n%100
-	switch {
-	case mod10 == 1 && mod100 != 11:
-		return fmt.Sprintf("%d событие", n)
-	case mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14):
-		return fmt.Sprintf("%d события", n)
-	default:
-		return fmt.Sprintf("%d событий", n)
-	}
-}
-
-// RenderGrouped — сводка событий одного цикла для одного чата: заголовок
-// отражает масштаб, строки — только его подписки.
-func RenderGrouped(p deliveryPayload) string {
-	trs := p.Trs
-	var header string
-	allDown, allRecovered := true, true
-	for _, tr := range trs {
-		if tr.To != status.Down {
-			allDown = false
-		}
-		if tr.To != status.Operational {
-			allRecovered = false
-		}
-	}
-	switch {
-	case allDown && p.DownInCycle*2 >= p.Total:
-		header = fmt.Sprintf("🔴 Массовый сбой: %d из %d моделей недоступны", p.DownInCycle, p.Total)
-	case allDown:
-		header = "🔴 Недоступны: " + pluralModels(len(trs))
-	case allRecovered:
-		header = "🟢 Восстановились: " + pluralModels(len(trs))
-	default:
-		header = "Состояния изменились: " + pluralModels(len(trs))
-	}
-
-	var b strings.Builder
-	b.WriteString(header + "\n\n")
-	shown := trs
-	rest := 0
-	if len(shown) > groupedLineCap {
-		rest = len(shown) - groupedLineCap
-		shown = shown[:groupedLineCap]
-	}
-	checkedAt := time.Time{}
-	for _, tr := range shown {
-		if tr.Check.At.After(checkedAt) {
-			checkedAt = tr.Check.At
-		}
-		b.WriteString(groupedLine(tr) + "\n")
-	}
-	if rest > 0 {
-		b.WriteString("... ещё " + pluralModels(rest) + "\n")
-	}
-	for _, tr := range trs { // время = самая поздняя проверка цикла
-		if tr.Check.At.After(checkedAt) {
-			checkedAt = tr.Check.At
-		}
-	}
-	b.WriteString("\nПроверено: " + fmtClockMSK(checkedAt) + " MSK")
-	return b.String()
-}
-
-// groupedLine — строка модели в сводке: как строка панели, для восстановления —
-// длительность сбоя.
-func groupedLine(tr monitor.Transition) string {
-	switch tr.To {
-	case status.Operational:
-		if tr.Incident != nil && tr.Incident.Duration > 0 {
-			return codeID(tr.ModelID) + " - сбой длился " + durationHuman(tr.Incident.Duration)
-		}
-		return codeID(tr.ModelID) + " - восстановилась"
-	case status.Degraded:
-		return codeID(tr.ModelID) + " - работает нестабильно: " + errorHead(tr.Check)
-	default: // Down
-		line := codeID(tr.ModelID) + " - " + errorHead(tr.Check)
-		if tr.From == status.Unknown {
-			// модель вернулась из слепого окна уже упавшей (D2)
-			line += " (время падения неизвестно)"
-		}
-		return line
-	}
-}
-
-// panelErrorHead и shortDuration удалены (7.3): сводки и дайджест используют
-// единые errorHead и durationHuman из render.go — одна подпись на тип ошибки.

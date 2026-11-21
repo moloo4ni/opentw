@@ -44,6 +44,51 @@ func TestOutboxRoundtripAndDedupe(t *testing.T) {
 	}
 }
 
+// chat_notified: set/get, перезапись, отсутствие строки, чистка по чату.
+func TestChatNotifiedStateLifecycle(t *testing.T) {
+	s := openTest(t)
+	if _, ok, err := s.ChatNotifiedState(100, "m"); err != nil || ok {
+		t.Fatalf("no row must give ok=false, got ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := s.ChatNotifiedState(100, "other"); ok || err != nil {
+		t.Fatalf("unknown model still ok=false, got ok=%v err=%v", ok, err)
+	}
+	if err := s.SetChatNotifiedState(100, "m", status.Down); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetChatNotifiedState(100, "m2", status.Operational); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetChatNotifiedState(200, "m", status.Operational); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := s.ChatNotifiedState(100, "m"); err != nil || !ok || got != status.Down {
+		t.Fatalf("state(100,m) = %v %v %v, want down", got, ok, err)
+	}
+	// перезапись: последнее состояние важнее предыдущего
+	if err := s.SetChatNotifiedState(100, "m", status.Operational); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := s.ChatNotifiedState(100, "m"); err != nil || !ok || got != status.Operational {
+		t.Fatalf("overwrite = %v %v %v, want operational", got, ok, err)
+	}
+	// удаление — только строки одного чата
+	if err := s.DeleteChatNotifiedState(100); err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range []struct {
+		chat  int64
+		model string
+	}{{100, "m"}, {100, "m2"}} {
+		if _, ok, err := s.ChatNotifiedState(pair.chat, pair.model); err != nil || ok {
+			t.Fatalf("after delete (%d,%s) ok must be false, got %v %v", pair.chat, pair.model, ok, err)
+		}
+	}
+	if got, ok, err := s.ChatNotifiedState(200, "m"); err != nil || !ok || got != status.Operational {
+		t.Fatalf("delete-by-chat must not touch other chats: %v %v %v", got, ok, err)
+	}
+}
+
 // Очистка: отправленное старше 7д удаляется; не отправленное старше TTL дропается.
 func TestOutboxTTLAndCleanup(t *testing.T) {
 	s := openTest(t)
@@ -165,8 +210,10 @@ func TestOutboxDeferAttempt(t *testing.T) {
 	}
 }
 
-// Дайджест-запросы: устаревший чат, все его строки, отметка всего чата сразу.
-func TestStaleOutboxChatHelpers(t *testing.T) {
+// CommitDelivery: пометки строк и уведомлённые состояния фиксируются одним
+// вызовом (одной транзакцией); D1 — помечаются только заданные ID, поздние
+// строки чата остаются pending и доезжают отдельно.
+func TestCommitDelivery(t *testing.T) {
 	s := openTest(t)
 	for _, k := range []string{"k1", "k2", "k3"} {
 		if err := s.EnqueueOutbox(100, "single", k, []byte(`{}`)); err != nil {
@@ -175,17 +222,6 @@ func TestStaleOutboxChatHelpers(t *testing.T) {
 	}
 	if err := s.EnqueueOutbox(200, "single", "k4", []byte(`{}`)); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(`UPDATE notification_outbox SET created_at = ? WHERE chat_id = 100`,
-		fmtTime(time.Now().Add(-time.Hour))); err != nil {
-		t.Fatal(err)
-	}
-	chats, err := s.StaleOutboxChats(30 * time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(chats) != 1 || chats[0] != 100 {
-		t.Fatalf("stale chats = %v", chats)
 	}
 	rows, err := s.PendingOutboxChat(100)
 	if err != nil || len(rows) != 3 {
@@ -198,31 +234,43 @@ func TestStaleOutboxChatHelpers(t *testing.T) {
 	for i := range rows {
 		ids[i] = rows[i].ID
 	}
-	n, err := s.MarkOutboxSentByIDs(ids)
-	if err != nil || n != 3 {
-		t.Fatalf("mark digest rows by ids = %d, %v", n, err)
+	// коммит без уведомлённых состояний — только пометки строк (частичная
+	// доставка: старые ID отдают свои строки, поздние остаются)
+	if err := s.CommitDelivery(100, nil, ids[:2]); err != nil {
+		t.Fatal(err)
 	}
 	cnt, _ := s.PendingOutboxCount()
-	if cnt != 1 {
-		t.Fatalf("digest must leave fresh chats pending, got %d", cnt)
+	if cnt != 2 { // k3 чата 100 и k4 чата 200
+		t.Fatalf("one of three rows must stay pending, got %d", cnt)
 	}
-	// D1: помечаются только заданные ID — чужие строки чата остаются pending.
+	// D1: поздняя строка чата не помечается старыми ID и доедет отдельно
 	if err := s.EnqueueOutbox(100, "single", "k9", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.CommitDelivery(100, map[string]status.Status{"m1": status.Down}, ids); err != nil {
+		t.Fatal(err)
+	}
 	rows, _ = s.PendingOutboxChat(100)
-	if len(rows) != 1 {
+	if len(rows) != 1 || rows[0].DedupeKey != "k9" {
 		t.Fatalf("late row must stay pending: %+v", rows)
 	}
-	if n, err := s.MarkOutboxSentByIDs(ids); err != nil || n != 0 {
-		t.Fatalf("re-marking already-sent ids must affect nothing: %d, %v", n, err)
+	st, ok, err := s.ChatNotifiedState(100, "m1")
+	if err != nil || !ok || st != status.Down {
+		t.Fatalf("notified state must be committed: %q %v %v", st, ok, err)
 	}
-	rows, _ = s.PendingOutboxChat(100)
-	if len(rows) != 1 {
-		t.Fatalf("late row must survive marking of old ids: %+v", rows)
+	// повторный коммит тех же ID — пометки идемпотентны, состояние обновляется
+	if err := s.CommitDelivery(100, map[string]status.Status{"m1": status.Operational}, ids); err != nil {
+		t.Fatal(err)
 	}
-	if n, err := s.MarkOutboxSentByIDs(nil); err != nil || n != 0 {
-		t.Fatalf("empty ids must be a no-op: %d, %v", n, err)
+	if st, ok, _ := s.ChatNotifiedState(100, "m1"); !ok || st != status.Operational {
+		t.Fatalf("notified state must update: %q %v", st, ok)
+	}
+	if rows, _ = s.PendingOutboxChat(100); len(rows) != 1 {
+		t.Fatalf("re-marking already-sent ids must affect nothing: %+v", rows)
+	}
+	// пустые ids — коммит только уведомлённых состояний
+	if err := s.CommitDelivery(100, nil, nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

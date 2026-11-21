@@ -54,7 +54,7 @@ func (b *Bot) panelText(checks map[string]storage.Check) string {
 	if !latest.IsZero() {
 		updated = latest
 	}
-	return RenderStatusPanel(models, checks, updated, monitor.NextTick(b.interval(), updated), b.interval())
+	return RenderStatusPanel(models, checks, updated, monitor.NextTick(b.interval(), updated))
 }
 
 func (b *Bot) interval() time.Duration {
@@ -64,8 +64,8 @@ func (b *Bot) interval() time.Duration {
 	return 15 * time.Minute
 }
 
-// ensurePanel: /status из чата — всегда создаёт новую панель по правилам ТЗ §7:
-// новое сообщение закрепляется, прежнее открепляется после успешного закрепления
+// ensurePanel: /status из чата — всегда создаёт новую панель: новое
+// сообщение закрепляется, прежнее открепляется после успешного закрепления
 // нового, привязка обновляется только после успешной отправки.
 func (b *Bot) ensurePanel(ctx context.Context, chatID int64) error {
 	checks, err := b.store.LastChecks()
@@ -83,7 +83,7 @@ func (b *Bot) postPanel(ctx context.Context, chatID int64, checks map[string]sto
 		return err
 	}
 
-	msg, err := b.api.SendMessage(ctx, chatID, text)
+	msg, err := b.api.SendRichMessage(ctx, chatID, text)
 	if err != nil {
 		b.log.Error("panel: send", "chat", chatID, "err", err)
 		return err
@@ -175,7 +175,7 @@ func (b *Bot) syncPanel(ctx context.Context, chatID int64, text string) {
 	if err != nil || sm == nil {
 		return
 	}
-	err = b.api.EditMessageText(ctx, chatID, sm.MessageID, text, nil)
+	err = b.api.EditRichMessageText(ctx, chatID, sm.MessageID, text)
 	if err == nil {
 		b.cachePanel(chatID, text)
 		return
@@ -207,7 +207,7 @@ func (b *Bot) syncPanel(ctx context.Context, chatID int64, text string) {
 
 // postPanelCycle пересоздаёт панель во время цикла (сообщение удалено).
 func (b *Bot) postPanelCycle(ctx context.Context, chatID int64, text string) error {
-	msg, err := b.api.SendMessage(ctx, chatID, text)
+	msg, err := b.api.SendRichMessage(ctx, chatID, text)
 	if err != nil {
 		return err
 	}

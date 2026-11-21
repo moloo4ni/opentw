@@ -34,6 +34,10 @@ type Check struct {
 	OutputTokens *int64
 	ErrorType    string
 	ErrorMessage string
+	// Response — дословный текст ответа модели/API этой проверки:
+	// итоговая генерация либо оригинальное сообщение об ошибке провайдера.
+	// Хранится без перевода и интерпретации.
+	Response string
 }
 
 // Subscription is one chat's subscription to a model's events.
@@ -62,7 +66,7 @@ type Incident struct {
 }
 
 // IncidentOp — запланированное изменение инцидентов одной модели: ApplyCycle
-// выполняет его в той же транзакции, что состояния и события (D3): сбой
+// выполняет его в той же транзакции, что состояния и события: сбой
 // коммита не оставляет инциденты «наполовину обновлёнными».
 type IncidentOp struct {
 	ModelID string
@@ -104,17 +108,19 @@ func (s *Store) SyncModels(models []Model) error {
 			args = append(args, m.ID)
 		}
 		// Модель покинула конфигурацию: строка состояния уходит, а вместе с ней —
-		// подписки на неё (2.5, иначе события возвратившейся модели молча
-		// «оживали» бы старые подписки) и открытые инциденты (2.3, иначе они
-		// оставались открытыми навсегда и воровали длительность возврата).
-		// Инцидент закрывается без перехода (to = from): модель просто перестала
-		// наблюдаться, история сохраняется.
+		// подписки на неё (иначе события возвратившейся модели молча «оживали» бы
+		// старые подписки), уведомлённые состояния чатов (иначе первый
+		// повторный инцидент той же модели молча глух бы по stale chat_notified)
+		// и открытые инциденты (иначе они оставались открытыми навсегда
+		// и воровали длительность возврата). Инцидент закрывается без перехода
+		// (to = from): модель просто перестала наблюдаться, история сохраняется.
 		for _, q := range []struct {
 			sql  string
 			args []any
 		}{
 			{`DELETE FROM models WHERE model_id NOT IN (` + placeholders + `)`, args},
 			{`DELETE FROM subscriptions WHERE model_id NOT IN (` + placeholders + `)`, args},
+			{`DELETE FROM chat_notified WHERE model_id NOT IN (` + placeholders + `)`, args},
 			{`UPDATE incidents SET to_status = from_status, ended_at = ? WHERE model_id NOT IN (` + placeholders + `) AND ended_at IS NULL`,
 				append([]any{fmtTime(time.Now())}, args...)},
 		} {
@@ -172,22 +178,24 @@ func (s *Store) SetModelState(modelID string, status status.Status, errType, err
 
 // InsertCheck persists one check.
 func (s *Store) InsertCheck(c Check) error {
-	q := `INSERT INTO checks (model_id, ts, http_status, status, latency_us, ttft_us, gen_us, tps, input_tokens, output_tokens, error_type, error_message)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	return s.exec(context.Background(), q, c.ModelID, fmtTime(c.At), c.HTTPStatus, string(c.Status), c.LatencyUS, c.TTFTUS, c.GenUS, c.TPS, c.InputTokens, c.OutputTokens, c.ErrorType, c.ErrorMessage)
+	q := `INSERT INTO checks (model_id, ts, http_status, status, latency_us, ttft_us, gen_us, tps, input_tokens, output_tokens, error_type, error_message, response)
+	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	return s.exec(context.Background(), q, c.ModelID, fmtTime(c.At), c.HTTPStatus, string(c.Status), c.LatencyUS, c.TTFTUS, c.GenUS, c.TPS, c.InputTokens, c.OutputTokens, c.ErrorType, c.ErrorMessage, c.Response)
 }
 
-const checkColumns = `model_id, ts, http_status, status, latency_us, ttft_us, gen_us, tps, input_tokens, output_tokens, error_type, error_message`
+const checkColumns = `model_id, ts, http_status, status, latency_us, ttft_us, gen_us, tps, input_tokens, output_tokens, error_type, error_message, response`
 
 func scanCheck(scanner interface{ Scan(...any) error }) (Check, error) {
 	var c Check
 	var ts string
-	err := scanner.Scan(&c.ModelID, &ts, &c.HTTPStatus, &c.Status, &c.LatencyUS, &c.TTFTUS, &c.GenUS, &c.TPS, &c.InputTokens, &c.OutputTokens, &c.ErrorType, &c.ErrorMessage)
+	var resp sql.NullString
+	err := scanner.Scan(&c.ModelID, &ts, &c.HTTPStatus, &c.Status, &c.LatencyUS, &c.TTFTUS, &c.GenUS, &c.TPS, &c.InputTokens, &c.OutputTokens, &c.ErrorType, &c.ErrorMessage, &resp)
 	if err != nil {
 		return c, err
 	}
 	t, _ := parseTime(ts)
 	c.At = t
+	c.Response = resp.String
 	return c, nil
 }
 
@@ -342,7 +350,7 @@ func (s *Store) OpenIncident(modelID string, from status.Status, at time.Time) e
 }
 
 // CurrentIncident returns the model's newest open incident or nil —
-// планирование инцидентов цикла читает его до транзакции ApplyCycle (D2/D3).
+// планирование инцидентов цикла читает его до транзакции ApplyCycle.
 func (s *Store) CurrentIncident(modelID string) (*Incident, error) {
 	var inc Incident
 	var from, started string
@@ -430,10 +438,10 @@ type OutboxEvent struct {
 
 // ApplyCycle atomically commits one monitoring cycle: last states of all
 // checked models, the cycle's notification events and the incident changes
-// (D3: инциденты обновляются только вместе с фиксацией цикла — сбой/краш
+// (инциденты обновляются только вместе с фиксацией цикла — сбой/краш
 // посреди цикла не оставляет ни мусорных закрытий, ни дубликатов).
 // Событие не может существовать без нового состояния и наоборот
-// (P0-1 outbox-аудита: рестарт или сбой SQLite посреди цикла не теряет
+// (рестарт или сбой SQLite посреди цикла не теряет
 // события — следующий цикл переоткрывает переходы от прежнего состояния).
 // Сбой — не зафиксировано ничего.
 func (s *Store) ApplyCycle(checks map[string]Check, events []OutboxEvent, incidents ...IncidentOp) error {
@@ -490,6 +498,82 @@ const outboxInsertSQL = `INSERT INTO notification_outbox (chat_id, kind, payload
 // (chat_id, dedupe_key) is a no-op — повторная постановка цикла не дублирует.
 func (s *Store) EnqueueOutbox(chatID int64, kind, dedupeKey string, payload []byte) error {
 	return s.exec(context.Background(), outboxInsertSQL, chatID, kind, payload, dedupeKey, fmtTime(time.Now()))
+}
+
+// SetChatNotifiedState фиксирует последнее состояние, о котором чат реально
+// был уведомлён (основа сверки актуальности доставки). Рантайм
+// фиксирует его только через CommitDelivery — атомарно с пометками
+// outbox-строк; напрямую метод используют тесты.
+func (s *Store) SetChatNotifiedState(chatID int64, modelID string, st status.Status) error {
+	q := `INSERT INTO chat_notified (chat_id, model_id, status, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(chat_id, model_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`
+	return s.exec(context.Background(), q, chatID, modelID, string(st), fmtTime(time.Now()))
+}
+
+// ChatNotifiedState возвращает последнее состояние, о котором чат был
+// уведомлён; ok=false — чат никогда не получал уведомлений о модели.
+func (s *Store) ChatNotifiedState(chatID int64, modelID string) (status.Status, bool, error) {
+	var st string
+	err := s.db.QueryRow(`SELECT status FROM chat_notified WHERE chat_id = ? AND model_id = ?`, chatID, modelID).Scan(&st)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("storage: chat notified state: %w", err)
+	}
+	return status.Status(st), true, nil
+}
+
+// DeleteChatNotifiedState удаляет строки уведомлённого состояния чата
+// (чистка мёртвого чата).
+func (s *Store) DeleteChatNotifiedState(chatID int64) error {
+	return s.exec(context.Background(), `DELETE FROM chat_notified WHERE chat_id = ?`, chatID)
+}
+
+// StaleNotify — подписка «чат—модель», чьё достоверное зафиксированное
+// состояние расходится с последним уведомлённым чату (chat_notified):
+// сверочная строка доставки обязана существовать, пока
+// расхождение не закрыто (OPW-01: уведомление не может зависеть от
+// выживания исходной outbox-строки).
+type StaleNotify struct {
+	ChatID     int64
+	ModelID    string
+	Current    status.Status // достоверное зафиксированное состояние модели
+	Notified   status.Status // последнее состояние, о котором чат был уведомлён
+	NotifiedAt string        // сырой updated_at уведомлённого состояния — эпоха дедуп-ключа сверочной строки
+}
+
+// StaleNotifyPairs возвращает подписки, чей chat_notified расходится с
+// достоверным зафиксированным состоянием модели (основа сверочного резерва
+// доставки OPW-01: истёкший TTL или поглощённая строка не теряют
+// уведомление — сверка с chat_notified переживает любые потери очереди).
+// Пары без строки chat_notified (чат никогда не получал уведомлений о
+// модели) не возвращаются: базовое состояние новых подписок — тишина,
+// а не спам историей. Задокументированный компромисс (ревью P2-1): если
+// первое событие подписчика пролежало в очереди дольше TTL при
+// недоступном Telegram, оно теряется безвозвратно — сверке не с чем
+// сравнивать. Окно закрывается первой доставленной доставкой; далее
+// chat_notified существует всегда (до отписки/удаления модели/мёртвого чата).
+func (s *Store) StaleNotifyPairs() ([]StaleNotify, error) {
+	rows, err := s.db.Query(`SELECT sub.chat_id, sub.model_id, m.last_status, cn.status, cn.updated_at
+		FROM subscriptions sub
+		JOIN models m ON m.model_id = sub.model_id
+		JOIN chat_notified cn ON cn.chat_id = sub.chat_id AND cn.model_id = sub.model_id
+		WHERE m.last_status IN (?, ?) AND cn.status != m.last_status
+		ORDER BY sub.chat_id, sub.model_id`, string(status.Operational), string(status.Down))
+	if err != nil {
+		return nil, fmt.Errorf("storage: stale notify pairs: %w", err)
+	}
+	defer rows.Close()
+	out := []StaleNotify{}
+	for rows.Next() {
+		var p StaleNotify
+		if err := rows.Scan(&p.ChatID, &p.ModelID, &p.Current, &p.Notified, &p.NotifiedAt); err != nil {
+			return nil, fmt.Errorf("storage: stale notify pairs: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 const outboxColumns = `id, chat_id, kind, dedupe_key, payload, created_at, next_attempt_at, attempts`
@@ -560,28 +644,6 @@ func scanOutbox(scanner interface{ Scan(...any) error }) (OutboxRow, error) {
 	return r, nil
 }
 
-// StaleOutboxChats returns chats whose oldest undelivered row is older than
-// the threshold: их backlog сворачивается в один дайджест вместо лавины
-// устаревших сообщений (P1-2 outbox-аудита).
-func (s *Store) StaleOutboxChats(olderThan time.Duration) ([]int64, error) {
-	rows, err := s.db.Query(`SELECT chat_id FROM notification_outbox
-		WHERE sent_at IS NULL AND created_at < ?
-		GROUP BY chat_id ORDER BY MIN(id)`, fmtTime(time.Now().Add(-olderThan)))
-	if err != nil {
-		return nil, fmt.Errorf("storage: stale outbox chats: %w", err)
-	}
-	defer rows.Close()
-	var out []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
-}
-
 // PendingOutboxChat returns all undelivered rows of one chat in FIFO order.
 func (s *Store) PendingOutboxChat(chatID int64) ([]OutboxRow, error) {
 	rows, err := s.db.Query(`SELECT `+outboxColumns+` FROM notification_outbox
@@ -628,6 +690,16 @@ func (s *Store) DeferOutboxAttempt(id int64, retryAfter time.Duration) error {
 		fmtTime(time.Now().Add(retryAfter)), id)
 }
 
+// DeferOutboxRetry откладывает следующую попытку строки, НЕ считая её
+// неудачей: attempts не растёт, нарастающий backoff реальных ошибок
+// доставки не искажается. Пауза неопределённости состояния модели (OPW-01):
+// строка пережила сверку с cur=Unknown и ждёт достоверного статуса.
+func (s *Store) DeferOutboxRetry(id int64, retryAfter time.Duration) error {
+	return s.exec(context.Background(),
+		`UPDATE notification_outbox SET next_attempt_at = ? WHERE id = ?`,
+		fmtTime(time.Now().Add(retryAfter)), id)
+}
+
 // DeleteOldOutbox removes delivered rows older than the retention window.
 func (s *Store) DeleteOldOutbox(olderThan time.Duration) (int64, error) {
 	res, err := s.db.Exec(`DELETE FROM notification_outbox WHERE sent_at IS NOT NULL AND sent_at < ?`, fmtTime(time.Now().Add(-olderThan)))
@@ -648,29 +720,42 @@ func (s *Store) DropStaleOutbox(olderThan time.Duration) (int64, error) {
 	return res.RowsAffected()
 }
 
-// MarkOutboxSentByIDs marks exactly the given rows as sent — только те,
-// что вошли в отправленный дайджест; строки, добавленные чату во время
-// отправки, остаются pending и доезжают отдельно (D1).
-func (s *Store) MarkOutboxSentByIDs(ids []int64) (int64, error) {
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	q := `UPDATE notification_outbox SET sent_at = ? WHERE sent_at IS NULL AND id IN (`
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, fmtTime(time.Now()))
-	for i, id := range ids {
-		if i > 0 {
-			q += ","
-		}
-		q += "?"
-		args = append(args, id)
-	}
-	q += ")"
-	res, err := s.db.Exec(q, args...)
+// CommitDelivery фиксирует результат УСПЕШНОЙ доставки одним коммитом:
+// уведомлённые состояния чата и пометки отправленных outbox-строк либо
+// фиксируются вместе, либо не фиксируется ничего. Сбой коммита
+// оставляет строки pending — они доедут повтором: редкий дубль вместо
+// молчаливой потери события (at-least-once).
+func (s *Store) CommitDelivery(chatID int64, notified map[string]status.Status, ids []int64) error {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("storage: mark outbox sent: %w", err)
+		return fmt.Errorf("storage: commit delivery: %w", err)
 	}
-	return res.RowsAffected()
+	defer tx.Rollback()
+	now := fmtTime(time.Now())
+	for modelID, st := range notified {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_notified (chat_id, model_id, status, updated_at) VALUES (?, ?, ?, ?)
+			ON CONFLICT(chat_id, model_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`, chatID, modelID, string(st), now); err != nil {
+			return fmt.Errorf("storage: commit delivery: %w", err)
+		}
+	}
+	if len(ids) > 0 {
+		q := `UPDATE notification_outbox SET sent_at = ? WHERE sent_at IS NULL AND id IN (`
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, now)
+		for i, id := range ids {
+			if i > 0 {
+				q += ","
+			}
+			q += "?"
+			args = append(args, id)
+		}
+		q += ")"
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("storage: commit delivery: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // DeleteOutboxChat drops all undelivered rows of a dead chat.

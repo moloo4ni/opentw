@@ -5,9 +5,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"html"
-	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"opentw/internal/status"
 	"opentw/internal/storage"
@@ -17,19 +17,17 @@ import (
 var MSK = time.FixedZone("MSK", 3*60*60)
 
 const (
-	absent          = "N/A"
-	maxPanelErr     = 20   // панель — одна строка на десктопе; полный текст в /status model-id
-	detailErrMax    = 3500 // бюджет текста ошибки на детальной странице: page ≤ 4096 рун (7.1)
-	maxCallbackData = 64   // лимит Telegram на callback_data в байтах
+	maxRichMessage  = 32768 // лимит rich-сообщения в рунах
+	maxCallbackData = 64    // лимит Telegram на callback_data в байтах
 )
 
 func fmtClockMSK(t time.Time) string { return t.In(MSK).Format("15:04:05") }
 
 // fmtDateClockMSK — дата+время: панель трёхдневной свежести должна отличаться
-// от свежей (D8).
+// от свежей.
 func fmtDateClockMSK(t time.Time) string { return t.In(MSK).Format("02.01.2006 15:04:05") }
 
-// intervalHuman — интервал проверки словами для подвала панели.
+// intervalHuman — интервал проверки словами для справки.
 func intervalHuman(d time.Duration) string {
 	h, m := int(d.Hours()), int(d.Minutes())%60
 	switch {
@@ -42,22 +40,8 @@ func intervalHuman(d time.Duration) string {
 	}
 }
 
-func fmtSecs(us int64) string  { return fmt.Sprintf("%.2fs", float64(us)/1e6) }
+// fmtSecs1 — единая точность времени в карточке: один знак после запятой.
 func fmtSecs1(us int64) string { return fmt.Sprintf("%.1fs", float64(us)/1e6) }
-
-// statusTitleRu — русские подписи статусов (детальная страница; эмодзи уже передают цвет).
-func statusTitleRu(st status.Status) string {
-	switch st {
-	case status.Operational:
-		return "работает"
-	case status.Degraded:
-		return "нестабильно"
-	case status.Down:
-		return "недоступна"
-	default:
-		return "нет данных"
-	}
-}
 
 // EscapeHTML экранирует любые внешние строки перед отправкой в Telegram.
 func EscapeHTML(s string) string { return html.EscapeString(s) }
@@ -70,108 +54,30 @@ func trunc(s string, n int) string {
 	return string(r[:n]) + "..."
 }
 
-func f64Ptr(v *float64) (string, bool) {
-	if v == nil || *v <= 0 {
-		return absent, false
-	}
-	return fmt.Sprintf("%.1f", *v), true
-}
-
-func i64Ptr(v *int64) string {
-	if v == nil {
-		return absent
-	}
-	return fmt.Sprintf("%d", *v)
-}
-
-// panelLegend — расшифровка кружков (элемент IA Cliff), последняя строка панели.
-const panelLegend = "🟢 работает · 🟡 нестабильно · 🔴 недоступна · ⚪ нет данных"
-
-// RenderStatusPanel renders the pinned /status panel: one line per model,
-// grouped by family, exact model IDs, N/A for unknown metrics.
-func RenderStatusPanel(models []storage.Model, checks map[string]storage.Check, updatedAt, nextAt time.Time, interval time.Duration) string {
-	var b strings.Builder
-	b.WriteString("<b>OpenTW</b>\n\n")
-
-	checked := 0
-	counts := map[status.Status]int{}
-	for _, m := range models {
-		if c, ok := checks[m.ID]; ok && c.Status != "" {
-			checked++
-			counts[c.Status]++
-		}
-	}
-
-	if checked == 0 {
-		// до первого цикла честно предупреждаем вместо фальшивого «Обновлено: сейчас»
-		b.WriteString("Первый цикл проверки выполняется - панель обновится автоматически\n")
-	} else {
-		b.WriteString(panelSummary(counts) + "\n")
-		if counts[status.Unknown] == checked {
-			b.WriteString("⚠ Монитор не может проверить модели - возможна проблема ключа API\n")
-		}
-	}
-
-	family := ""
-	for _, m := range models {
-		if m.Family != family {
-			family = m.Family
-			b.WriteString("\n<b>" + EscapeHTML(family) + "</b>\n")
-		}
-		b.WriteString(modelLine(m, checks[m.ID]))
-		b.WriteString("\n")
-	}
-
-	if checked > 0 {
-		b.WriteString("\nОбновлено: " + fmtDateClockMSK(updatedAt) + " MSK\n")
-		b.WriteString(fmt.Sprintf("Следующая проверка: %s MSK (интервал %s)\n", fmtClockMSK(nextAt), intervalHuman(interval)))
-	}
-	b.WriteString(panelLegend)
-	return b.String()
-}
-
-// panelSummary — «Модели: 22 🟢 · 2 🟡 · 1 🔴»: ответ «всё ли ок» одним взглядом.
-func panelSummary(counts map[status.Status]int) string {
-	var parts []string
-	for _, st := range []status.Status{status.Operational, status.Degraded, status.Down, status.Unknown} {
-		if counts[st] > 0 {
-			parts = append(parts, fmt.Sprintf("%d %s", counts[st], st.Emoji()))
-		}
-	}
-	return "Модели: " + strings.Join(parts, " · ")
-}
-
-// codeID оборачивает model ID в моноширинный формат Telegram.
-func codeID(id string) string { return "<code>" + EscapeHTML(id) + "</code>" }
-
-// modelLine формирует строку одной модели (обязательно одну).
-func modelLine(m storage.Model, c storage.Check) string {
-	if c.Status == "" {
-		// ещё нет ни одной проверки этой модели
-		return "⚪ " + codeID(m.ID) + " - нет данных"
-	}
-	if c.Status == status.Unknown {
-		// ⚪ любой природы — проблема монитора, а не модели: причина и исходный
-		// текст — в /status model-id
-		return "⚪ " + codeID(m.ID) + " - ошибка монитора"
-	}
-	emoji := c.Status.Emoji()
-
-	switch {
-	case c.ErrorType == "perf":
-		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c) + " · деградация"
-	case c.ErrorType != "":
-		// шлюз вернул 200 с JSON-ошибкой: errorHead показывает его текст
-		// вместо «пустой генерации» (D13)
-		return emoji + " " + codeID(m.ID) + " - " + errorHead(c)
+// statusWordRu — единый словарь пользовательских названий трёх статусов:
+// легенда панели и /help, заголовок карточки, строки моделей и подпись
+// «Нет данных» у ошибок берут слово только отсюда.
+func statusWordRu(st status.Status) string {
+	switch st {
+	case status.Operational:
+		return "Работает"
+	case status.Down:
+		return "Недоступна"
 	default:
-		return emoji + " " + codeID(m.ID) + " - " + metricsTail(c)
+		return "Нет данных"
 	}
 }
 
-// errorKindLabel — единая подпись типа ошибки, одна на тип (7.3): панель,
-// сводки, дайджест, детальная страница и уведомления строятся на ней.
-func errorKindLabel(c storage.Check) string {
+// panelLegend — расшифровка кружков, последняя строка панели и справки.
+func panelLegend() string {
+	return status.Operational.Emoji() + " " + statusWordRu(status.Operational) +
+		" · " + status.Down.Emoji() + " " + statusWordRu(status.Down) +
+		" · " + status.Unknown.Emoji() + " " + statusWordRu(status.Unknown)
+}
+
+// shortErrorLabel — единая короткая подпись ошибки по проверке:
+// панель, уведомления и карточки строятся на ней. Operational не вызывается.
+func shortErrorLabel(c storage.Check) string {
 	switch c.ErrorType {
 	case "http":
 		return fmt.Sprintf("HTTP %d", c.HTTPStatus)
@@ -179,254 +85,259 @@ func errorKindLabel(c storage.Check) string {
 		return "Timeout"
 	case "connrefused":
 		return "Connection refused"
-	case "empty":
-		return "HTTP 200"
-	case "perf":
-		return "деградация производительности"
-	default: // invalid и неизвестные виды: монитор не осмыслил ответ
-		return "Некорректный ответ API"
+	case "response", "empty":
+		return "Unexpected response"
+	default: // unknown, нет данных, прочие мониторные варианты
+		return statusWordRu(status.Unknown)
 	}
 }
 
-// errorHead — краткое описание ошибки для панели и сводок (текст ≤ 20 рун).
-func errorHead(c storage.Check) string {
-	return errorHeadCapped(c, maxPanelErr)
+// stButtonData кодирует модель кнопки-ошибки: точный id; длинные id —
+// хэш-форма, как у всех callback-кнопок.
+func stButtonData(id string) string { return cbData("st", id) }
+
+// richErrorButton — кликабельная ошибка модели: текст и атрибут data
+// экранируются; визуально — ссылка без рамки.
+func richErrorButton(id, label string) string {
+	return fmt.Sprintf(`<tg-button type="callback_data" style="link" data="%s">%s</tg-button>`,
+		EscapeHTML(stButtonData(id)), EscapeHTML(label))
 }
 
-// errorHeadCapped — общий форматтер заголовка ошибки: единая подпись вида +
-// исходный текст ошибки в бюджете maxRunes рун. Обрезка не рвёт HTML-entity
-// (иначе Telegram 400 «can't parse entities»), «пустая генерация» уступает
-// место реальному тексту шлюза в 200-ответе (D13).
-func errorHeadCapped(c storage.Check, maxRunes int) string {
-	if c.ErrorType == "empty" && (c.ErrorMessage == "" || c.ErrorMessage == "empty generation") {
-		return "HTTP 200 · пустая генерация"
-	}
-	if c.ErrorMessage == "" || c.ErrorType == "perf" || c.ErrorType == "invalid" {
-		return errorKindLabel(c)
-	}
-	msg := oneLine(c.ErrorMessage)
-	if maxRunes <= maxPanelErr {
-		return errorKindLabel(c) + " · " + EscapeHTML(trunc(msg, maxRunes))
-	}
-	return errorKindLabel(c) + " · " + truncEscaped(msg, maxRunes)
+// codeID оборачивает model ID в моноширинный формат Telegram.
+func codeID(id string) string { return "<code>" + EscapeHTML(id) + "</code>" }
+
+// downModelLine — строка недоступной модели: единый HTML для главной панели
+// и уведомлений, различаются только caller-данные (model ID и label ошибки).
+func downModelLine(modelID, label string) string {
+	return "🔴 " + codeID(modelID) + " - " + richErrorButton(modelID, label)
 }
 
-// truncEscaped экранирует текст и обрезает до max рун УЖЕ экранированного
-// результата: entity (&amp; и т.п.) не разрывается посередине.
-func truncEscaped(s string, max int) string {
+// modelLine — rich-строка одной модели: Operational — только latency;
+// Down/Unknown/старые статусы — кнопка с подписью; порядок конфига задаёт
+// вызывающий код. Возвращает строку без обёртки: панели склеивают строки
+// семейства в один блок с <br/>, уведомления оборачивают в <p> сами.
+func modelLine(m storage.Model, c storage.Check) string {
+	id := codeID(m.ID)
+	switch c.Status {
+	case status.Operational:
+		if c.LatencyUS != nil {
+			return "🟢 " + id + " - " + fmtSecs1(*c.LatencyUS)
+		}
+		return "🟢 " + id
+	case status.Down:
+		return downModelLine(m.ID, shortErrorLabel(c))
+	default: // Unknown и старые статусы из payload — без паники
+		return "⚪ " + id + " - " + richErrorButton(m.ID, statusWordRu(status.Unknown))
+	}
+}
+
+// RenderStatusPanel renders the pinned /status panel: без сводки,
+// порядок строк — только конфиг,Operational показывает latency.
+func RenderStatusPanel(models []storage.Model, checks map[string]storage.Check, updatedAt, nextAt time.Time) string {
 	var b strings.Builder
+	b.WriteString("<p><b>OpenTW</b></p>")
+
+	checked := false
+	for _, m := range models {
+		if c, ok := checks[m.ID]; ok && c.Status != "" {
+			checked = true
+			break
+		}
+	}
+	if !checked {
+		// до первого цикла честно предупреждаем вместо фальшивого «Обновлено: сейчас»
+		b.WriteString("<p>Первый цикл проверки выполняется - панель обновится автоматически</p>")
+	}
+
+	// Семейство — один смысловой блок: заголовок и строки моделей через <br/>;
+	// обычные \n в rich-HTML игнорируются, визуальные интервалы дают
+	// только границы блоков <p>.
+	family := ""
+	var block []string
+	flush := func() {
+		if len(block) == 0 {
+			return
+		}
+		b.WriteString("<p><b>" + EscapeHTML(family) + "</b><br/>" + strings.Join(block, "<br/>") + "</p>")
+		block = block[:0]
+	}
+	for _, m := range models {
+		if m.Family != family {
+			flush()
+			family = m.Family
+		}
+		block = append(block, modelLine(m, checks[m.ID]))
+	}
+	flush()
+
+	if checked {
+		b.WriteString("<p>Обновлено: " + fmtDateClockMSK(updatedAt) + " MSK</p>")
+		b.WriteString("<p>Следующая проверка: " + fmtClockMSK(nextAt) + " MSK</p>")
+	}
+	b.WriteString("<p>" + panelLegend() + "</p>")
+	return b.String()
+}
+
+// renderModelCard — карточка и не поместившийся в лимит хвост секции «Ответ»
+// (сырой, неэкранированный текст): молчаливая обрезка данных запрещена.
+// Бюджет считается в ЭКРАНИРОВАННЫХ рунах: EscapeHTML растит спец-руны
+// в 4–6 раз, лимит rich-сообщения нарушается именно после экранирования.
+func renderModelCard(modelID string, st status.Status, last storage.Check, last24 []storage.Check) (string, string) {
+	card := buildModelCard(modelID, st, last, last24, EscapeHTML(last.Response))
+	if last.Response == "" || utf8.RuneCountInString(card) <= maxRichMessage {
+		return card, ""
+	}
+	// фиксированная часть задаёт бюджет ответа; обёртка секции = карточка
+	// с одной руной ответа минус карточка без ответа минус эта руна
+	fixed := utf8.RuneCountInString(buildModelCard(modelID, st, last, last24, ""))
+	one := utf8.RuneCountInString(buildModelCard(modelID, st, last, last24, "x"))
+	overhead := one - fixed - 1
+	budget := maxRichMessage - fixed - overhead
+	resp := []rune(last.Response)
+	// наибольший префикс, экранирование которого укладывается в бюджет
+	// (бинарный поиск: экранированная длина монотонна по префиксу)
+	lo, hi := 0, len(resp)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if escapedRunes(string(resp[:mid])) <= budget {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return buildModelCard(modelID, st, last, last24, EscapeHTML(string(resp[:lo]))), string(resp[lo:])
+}
+
+// escapedRunes — длина s в рунах ПОСЛЕ EscapeHTML: каждая спец-руна
+// становится entity из 4–6 символов, и именно экранированный текст
+// ограничен лимитом rich-сообщения.
+func escapedRunes(s string) int {
 	n := 0
 	for _, r := range s {
-		enc := html.EscapeString(string(r))
-		if n+len(enc) > max { // entity — ASCII: байты == руны
-			break
-		}
-		n += len(enc)
-		b.WriteString(enc)
+		n += escapedRuneLen(r)
 	}
-	return b.String()
+	return n
 }
 
-// durationHuman — единое форматирование длительностей (7.3): уведомления,
-// сводки и дайджест показывают одну и ту же форму (45с / 30м / 1ч 30м).
-func durationHuman(d time.Duration) string {
-	sec := int64(d.Seconds())
-	if sec < 0 {
-		sec = 0
-	}
-	switch {
-	case sec < 60:
-		return fmt.Sprintf("%dс", sec)
-	case sec < 3600:
-		return fmt.Sprintf("%dм", sec/60)
+func escapedRuneLen(r rune) int {
+	switch r {
+	case '&':
+		return 5 // &amp;
+	case '<', '>':
+		return 4 // &lt; / &gt;
+	case '\'':
+		return 5 // &#39;
+	case '"':
+		return 6 // &quot;
 	default:
-		return fmt.Sprintf("%dч %02dм", sec/3600, (sec%3600)/60)
+		return 1
 	}
 }
 
-func oneLine(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
-// metricsTail — компактные метрики строки панели: разделитель «·»,
-// одна десятичная секунды, токены «in/out» без слов (полные подписи — ТЗ §8).
-func metricsTail(c storage.Check) string {
-	var parts []string
-	if c.LatencyUS != nil {
-		parts = append(parts, fmtSecs1(*c.LatencyUS))
-	} else {
-		parts = append(parts, absent)
-	}
-	tps, _ := f64Ptr(c.TPS)
-	parts = append(parts, tps+" TPS")
-	if c.InputTokens != nil && c.OutputTokens != nil {
-		parts = append(parts, fmt.Sprintf("%d/%d", *c.InputTokens, *c.OutputTokens))
-	}
-	return strings.Join(parts, " · ")
-}
-
-// detailErrorLine — полная строка последней ошибки: единый заголовок
-// (errorHead), текст ошибки до detailErrMax рун (7.1).
-func detailErrorLine(c storage.Check) string {
-	return errorHeadCapped(c, detailErrMax)
-}
-
-// RenderModelDetail renders the /status model-id view.
-func RenderModelDetail(modelID string, st status.Status, last storage.Check, last24 []storage.Check) string {
+// buildModelCard — карточка модели; respHTML — экранированный дословный ответ
+// ("" — секция опускается). Поля без значения не выводятся.
+func buildModelCard(modelID string, st status.Status, last storage.Check, last24 []storage.Check, respHTML string) string {
 	var b strings.Builder
-	b.WriteString("<b>" + EscapeHTML(modelID) + "</b> - " + st.Emoji() + " " + statusTitleRu(st) + "\n\n")
-	if last.At.IsZero() {
-		// модель ещё ни разу не проверялась — осмысленной даты нет
-		b.WriteString("Последняя проверка: " + absent + "\n\n")
-	} else {
-		// 24-часовое окно пересекает полночь: отметки с датой (7.3)
-		b.WriteString("Последняя проверка: " + fmtDateClockMSK(last.At) + " MSK\n\n")
+	// Заголовок: эмодзи, model ID (<code>, как в строках панели) и статус
+	// в одной строке
+	b.WriteString("<p>" + st.Emoji() + " " + codeID(modelID) + " - " + statusWordRu(st) + "</p>")
+	if !last.At.IsZero() {
+		// 24-часовое окно пересекает полночь: отметки с датой
+		b.WriteString("<p>Последняя проверка: " + fmtDateClockMSK(last.At) + " MSK</p>")
 	}
-
-	b.WriteString("Последний запрос\n")
-	if last.HTTPStatus > 0 {
-		b.WriteString(fmt.Sprintf("HTTP: %d\n", last.HTTPStatus))
-	} else {
-		b.WriteString("HTTP: " + absent + "\n")
+	b.WriteString(requestBlock(last))
+	if respHTML != "" {
+		title := "Ответ API"
+		// Текст — генерация самой модели: успешный ответ («», т.е. OK) или
+		// неожиданный ответ вместо OK («response»); остальное — текст API.
+		if last.ErrorType == "" || last.ErrorType == "response" {
+			title = "Ответ модели"
+		}
+		b.WriteString("<p><b>" + title + "</b></p><p>" + respHTML + "</p>")
+	} else if last.Response == "" && last.HTTPStatus == 200 &&
+		(last.ErrorType == "" || last.ErrorType == "response" || last.ErrorType == "empty") {
+		// HTTP 200 был, но итогового пользовательского текста нет. Это факт,
+		// а не интерпретация причины; reasoning из отдельного поля не показываем.
+		b.WriteString("<p><b>Ответ модели</b></p><p>Итоговый текст отсутствует.</p>")
 	}
-	b.WriteString("Latency: " + secPtr(last.LatencyUS) + "\n")
-	b.WriteString("TTFT: " + secPtr(last.TTFTUS) + "\n")
-	b.WriteString("Generation time: " + secPtr(last.GenUS) + "\n")
-	tps, _ := f64Ptr(last.TPS)
-	b.WriteString("TPS: " + tps + "\n")
-	b.WriteString("Input tokens: " + i64Ptr(last.InputTokens) + "\n")
-	b.WriteString("Output tokens: " + i64Ptr(last.OutputTokens) + "\n")
-
-	b.WriteString("\nЗа последние 24 часа\n")
-	if len(last24) == 0 {
-		b.WriteString("Проверок: 0\n")
-	} else {
-		var okCount, degradedCount, downCount, unknownCount int
-		var latencies []float64
-		var tpsVals []float64
-		for _, c := range last24 {
-			switch c.Status {
-			case status.Operational:
-				okCount++
-			case status.Degraded:
-				degradedCount++ // 🟡 виден в статистике отдельной строкой (7.3)
-			case status.Down:
-				downCount++
-			case status.Unknown:
-				unknownCount++
-			}
-			if c.LatencyUS != nil && c.Status == status.Operational {
-				latencies = append(latencies, float64(*c.LatencyUS)/1e6)
-			}
-			if c.TPS != nil && *c.TPS > 0 && c.Status == status.Operational {
-				tpsVals = append(tpsVals, *c.TPS)
-			}
-		}
-		// ⚪ — не аптайм и не сбой: день с битым ключом монитора не должен
-		// обещать 100% доступности (D11)
-		known := len(last24) - unknownCount
-		if known > 0 {
-			up := float64(okCount) / float64(known) * 100
-			b.WriteString(fmt.Sprintf("Uptime: %.2f%%\n", up))
-		}
-		if unknownCount > 0 {
-			b.WriteString(fmt.Sprintf("Без данных (монитор): %d\n", unknownCount))
-		}
-		b.WriteString(fmt.Sprintf("Проверок: %d\n", len(last24)))
-		b.WriteString(fmt.Sprintf("Успешных: %d\n", okCount))
-		b.WriteString(fmt.Sprintf("Нестабильных: %d\n", degradedCount))
-		b.WriteString(fmt.Sprintf("Неудачных: %d\n", downCount))
-		if len(latencies) > 0 {
-			sort.Float64s(latencies)
-			mean := 0.0
-			for _, v := range latencies {
-				mean += v
-			}
-			mean /= float64(len(latencies))
-			b.WriteString(fmt.Sprintf("Средний latency: %.2fs\n", mean))
-			b.WriteString(fmt.Sprintf("P50 latency: %.2fs\n", percentileF(latencies, 0.50)))
-			b.WriteString(fmt.Sprintf("P95 latency: %.2fs\n", percentileF(latencies, 0.95)))
-		}
-		if len(tpsVals) > 0 {
-			mean := 0.0
-			for _, v := range tpsVals {
-				mean += v
-			}
-			mean /= float64(len(tpsVals))
-			b.WriteString(fmt.Sprintf("Средний TPS: %.1f\n", mean))
-		}
-		// флэппинг-наблюдаемость: по тем же данным, без новой семантики
-		if n, last, dwell := flappingStats(last24); n > 0 {
-			b.WriteString(fmt.Sprintf("Переключений состояния: %d\n", n))
-			b.WriteString("Последнее переключение: " + fmtDateClockMSK(last) + " MSK\n")
-			b.WriteString("Среднее пребывание в статусе: " + intervalHuman(dwell) + "\n")
-		}
-	}
-
-	// последняя ошибка — последняя проверка не в Operational с ошибкой
-	var lastErr *storage.Check
-	for i := len(last24) - 1; i >= 0; i-- {
-		if last24[i].Status == status.Down || last24[i].Status == status.Degraded {
-			c := last24[i]
-			lastErr = &c
-			break
-		}
-	}
-	if lastErr == nil && (last.Status == status.Down || last.Status == status.Degraded) {
-		lastErr = &last
-	}
-	if lastErr != nil {
-		b.WriteString("\nПоследняя ошибка\n")
-		b.WriteString(fmtDateClockMSK(lastErr.At) + " MSK · " + detailErrorLine(*lastErr))
+	if stats := last24Block(last24); stats != "" {
+		b.WriteString("<p><b>За последние 24 часа</b></p>")
+		b.WriteString(stats)
 	}
 	return b.String()
 }
 
-func secPtr(v *int64) string {
-	if v == nil {
-		return absent
+// requestBlock — блок «Последний запрос»: HTTP-код и latency. HTTP-ответ
+// получен — «Latency», даже если содержимое не прошло проверку (включая
+// 4xx/5xx: сервер ответил). «Время до ошибки» — только когда HTTP-ответа
+// не было вовсе (timeout, connection failure) и длительность измерена.
+// Время везде — одним знаком после запятой. Пустые поля опускаются.
+func requestBlock(c storage.Check) string {
+	var parts []string
+	if c.HTTPStatus > 0 {
+		parts = append(parts, fmt.Sprintf("HTTP %d", c.HTTPStatus))
 	}
-	return fmtSecs(*v)
+	if c.LatencyUS != nil {
+		lat := fmtSecs1(*c.LatencyUS)
+		if c.HTTPStatus > 0 {
+			parts = append(parts, "Latency "+lat)
+		} else {
+			parts = append(parts, "Время до ошибки "+lat)
+		}
+	}
+	// Диагностика выводится только когда итогового текста нет. nil не
+	// превращается в ноль, отсутствующий finish_reason не выдумывается.
+	if c.Response == "" {
+		if c.OutputTokens != nil {
+			parts = append(parts, fmt.Sprintf("Токенов ответа: %d", *c.OutputTokens))
+		}
+		if reason := finishReason(c.ErrorMessage); reason != "" {
+			parts = append(parts, "Завершение: "+EscapeHTML(reason))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "<p><b>Последний запрос</b></p><p>" + strings.Join(parts, " · ") + "</p>"
 }
 
-// flappingStats — переключения за окно, время последнего и среднее пребывание
-// в статусе (равные интервалы проверки → среднее = окно/переключений).
-// ⚪ не считается: слепота монитора — не смена состояния модели (7.3).
-func flappingStats(checks []storage.Check) (int, time.Time, time.Duration) {
-	var n int
-	var last, firstKept time.Time
-	prev := status.Status("")
-	kept := 0
+// finishReason извлекает только значение служебного диагностического
+// finish_reason=...; обычный текст провайдера не интерпретируется.
+func finishReason(message string) string {
+	for _, part := range strings.Split(message, "; ") {
+		if reason, ok := strings.CutPrefix(part, "finish_reason="); ok && reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// last24Block — статистика 24 часов: Uptime = ok/(ok+down), Unknown не
+// входит в знаменатель; блок целиком опускается без истории.
+func last24Block(checks []storage.Check) string {
+	if len(checks) == 0 {
+		return ""
+	}
+	var okCount, downCount, unknownCount int
 	for _, c := range checks {
-		if c.Status == status.Unknown {
-			continue
+		switch c.Status {
+		case status.Operational:
+			okCount++
+		case status.Down:
+			downCount++
+		default: // Unknown и старые статусы
+			unknownCount++
 		}
-		if kept == 0 {
-			firstKept = c.At
-		}
-		if prev != "" && c.Status != prev {
-			n++
-			last = c.At
-		}
-		prev = c.Status
-		kept++
 	}
-	if n == 0 || kept < 2 {
-		return 0, time.Time{}, 0
+	var lines []string
+	if n := okCount + downCount; n > 0 {
+		// 23/24 → 95.83%: две значащие цифры, как в согласованном формате
+		lines = append(lines, fmt.Sprintf("Uptime: %.2f%%", float64(okCount)/float64(n)*100))
 	}
-	span := last.Sub(firstKept)
-	return n, last, span / time.Duration(n)
-}
-
-func percentileF(sorted []float64, q float64) float64 {
-	if len(sorted) == 0 {
-		return 0
-	}
-	idx := int(q * float64(len(sorted)))
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
-	return sorted[idx]
+	lines = append(lines, fmt.Sprintf("Проверок: %d", len(checks)))
+	// статусные эмодзи — только в строке категорий; слово Unknown — из словаря
+	lines = append(lines, fmt.Sprintf("🟢 Успешных: %d · 🔴 Неудачных: %d · ⚪ %s: %d", okCount, downCount, statusWordRu(status.Unknown), unknownCount))
+	return "<p>" + strings.Join(lines, "<br/><br/>") + "</p>"
 }
 
 func pluralModels(n int) string {
@@ -460,7 +371,8 @@ func shortHash(s string) string {
 
 // resolveCallback сопоставляет payload нажатой кнопки с идентификатором
 // из текущей конфигурации; ok=false — кнопка ссылается на удалённую
-// модель/семейство (устаревшая клавиатура).
+// модель/семейство (устаревшая клавиатура). Точное совпадение, потом
+// хэш-форма; кандидатов по префиксу нет.
 func resolveCallback(payload string, candidates []string) (string, bool) {
 	for _, id := range candidates {
 		if id == payload {
@@ -477,7 +389,7 @@ func resolveCallback(payload string, candidates []string) (string, bool) {
 	return "", false
 }
 
-// modelIDs — список ID моделей (кандидаты для кнопок "s:").
+// modelIDs — список ID моделей (кандидаты для кнопок "s:"/"st:").
 func modelIDs(models []storage.Model) []string {
 	ids := make([]string, len(models))
 	for i, m := range models {
@@ -514,7 +426,7 @@ func diffBracket(scope []storage.Model, draft, saved map[string]bool) string {
 func RenderSubscribeRoot(models []storage.Model, draft, saved map[string]bool) (string, *InlineKeyboardMarkup) {
 	var b strings.Builder
 	b.WriteString("OpenTW - Настройка уведомлений\n\n")
-	b.WriteString("Уведомления приходят только по выбранным моделям\nпри смене их состояния. Панель /status не зависит от подписок.\n")
+	b.WriteString("Уведомления приходят только по выбранным моделям при смене их состояния. Панель /status не зависит от подписок.\n")
 
 	families := FamiliesOf(models)
 	counts := map[string][2]int{} // family: {selected, total}
@@ -620,14 +532,14 @@ func RenderHelp(interval time.Duration) string {
 		"OpenTW - мониторинг доступности моделей.",
 		"",
 		"/status - статус всех моделей (панель закрепляется и обновляется сама).",
-		"/status model-id - детали: метрики, статистика 24ч, последняя ошибка.",
+		"/status model-id - карточка модели: последняя проверка, ответ и статистика 24ч.",
 		"/subscribe - выбрать модели для уведомлений.",
 		"/start - то же, что /status.",
 		"/help - эта справка.",
 		"",
-		"Статусы: 🟢 работает · 🟡 нестабильно · 🔴 недоступна · ⚪ нет данных.",
-		"Latency, TPS и токены - метрики одного проверочного запроса (" + perCycle + ").",
-		"Уведомления приходят только по выбранным моделям; панель /status показывает все.",
+		"Нажатие на ошибку в панели или уведомлении открывает карточку модели.",
+		"Статусы: " + panelLegend(),
+		"Уведомления приходят по выбранным моделям при смене состояния (" + perCycle + ").",
 		"Отключить надоевшую модель: /subscribe -> семейство -> снять отметку -> Сохранить.",
 	}, "\n")
 }

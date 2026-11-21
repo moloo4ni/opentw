@@ -171,6 +171,36 @@ func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, t
 	return c.call(ctx, "editMessageText", payload, nil)
 }
 
+// SendRichMessage sends a Bot API rich message (html, no entity detection).
+func (c *Client) SendRichMessage(ctx context.Context, chatID int64, html string) (*Message, error) {
+	payload := map[string]any{
+		"chat_id": chatID,
+		"rich_message": map[string]any{
+			"html":                  html,
+			"skip_entity_detection": true,
+		},
+	}
+	var msg Message
+	if err := c.call(ctx, "sendRichMessage", payload, &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
+// EditRichMessageText replaces the content of a message via rich_message
+// (no parse_mode: rich-разметка редактирования панели).
+func (c *Client) EditRichMessageText(ctx context.Context, chatID, messageID int64, html string) error {
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"rich_message": map[string]any{
+			"html":                  html,
+			"skip_entity_detection": true,
+		},
+	}
+	return c.call(ctx, "editMessageText", payload, nil)
+}
+
 // PinChatMessage pins a message.
 func (c *Client) PinChatMessage(ctx context.Context, chatID, messageID int64) error {
 	return c.call(ctx, "pinChatMessage", map[string]any{"chat_id": chatID, "message_id": messageID, "disable_notification": true}, nil)

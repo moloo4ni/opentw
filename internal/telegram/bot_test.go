@@ -79,12 +79,13 @@ func cycle(checks map[string]storage.Check, transitions ...monitor.Transition) m
 	}
 }
 
+// check — успешная проверка «сейчас»; поля ошибки донастраиваются на месте.
 func check(id string, st status.Status) storage.Check {
 	return storage.Check{ModelID: id, At: time.Now(), Status: st, HTTPStatus: 200}
 }
 
 // commitCycle повторяет фиксацию цикла раннером: бот готовит события,
-// а коммитит их вместе с состояниями одним ApplyCycle (P0-1).
+// а коммитит их вместе с состояниями одним ApplyCycle.
 func commitCycle(t *testing.T, b *Bot, res monitor.CycleResult) {
 	t.Helper()
 	events, err := b.OnCycle(context.Background(), res)
@@ -107,8 +108,18 @@ func seedCheck(t *testing.T, b *Bot, checks map[string]storage.Check) {
 	}
 }
 
-// Сценарий: /status создаёт и закрепляет панель.
-func TestStatusCommandPinsPanel(t *testing.T) {
+// callIndex возвращает индекс первого вхождения метода в последовательности вызовов.
+func callIndex(m *mockTG, method string) int {
+	for i, c := range m.callList() {
+		if c == method {
+			return i
+		}
+	}
+	return -1
+}
+
+// Сценарий: /status отправляет rich-панель и закрепляет её.
+func TestStatusCommandPinsRichPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
 	ctx := context.Background()
@@ -116,8 +127,11 @@ func TestStatusCommandPinsPanel(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/status")); err != nil {
 		t.Fatal(err)
 	}
-	if m.callCount("sendMessage") != 1 {
-		t.Fatalf("sendMessage calls = %d", m.callCount("sendMessage"))
+	if m.callCount("sendRichMessage") != 1 {
+		t.Fatalf("sendRichMessage calls = %d", m.callCount("sendRichMessage"))
+	}
+	if m.callCount("sendMessage") != 0 {
+		t.Fatal("panel must be a rich message, not classic sendMessage")
 	}
 	if m.callCount("pinChatMessage") != 1 {
 		t.Fatalf("panel must be pinned")
@@ -126,9 +140,14 @@ func TestStatusCommandPinsPanel(t *testing.T) {
 	if sm == nil || sm.MessageID != 1 {
 		t.Fatalf("binding = %+v", sm)
 	}
-	body := m.lastBody("sendMessage")
-	if !strings.Contains(fmt.Sprint(body["text"]), "OpenTW") {
-		t.Fatalf("panel text = %v", body["text"])
+	html := lastRichHTML(t, m, "sendRichMessage")
+	for _, want := range []string{"<b>OpenTW</b>", panelLegend(), "<code>gpt-6-astra</code>"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("panel html missing %q:\n%s", want, html)
+		}
+	}
+	if strings.Contains(html, "Модели:") {
+		t.Errorf("summary line must be gone:\n%s", html)
 	}
 }
 
@@ -140,16 +159,16 @@ func TestStartIsStatusSynonym(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/start")); err != nil {
 		t.Fatal(err)
 	}
-	if m.callCount("sendMessage") != 1 || m.callCount("pinChatMessage") != 1 {
-		t.Fatalf("start must behave like status: send=%d pin=%d", m.callCount("sendMessage"), m.callCount("pinChatMessage"))
+	if m.callCount("sendRichMessage") != 1 || m.callCount("pinChatMessage") != 1 {
+		t.Fatalf("start must behave like status: rich=%d pin=%d", m.callCount("sendRichMessage"), m.callCount("pinChatMessage"))
 	}
-	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	if !strings.Contains(text, "OpenTW") || !strings.Contains(text, "Первый цикл проверки выполняется") {
-		t.Fatalf("start must render the status panel, got %q", text)
+	if html := lastRichHTML(t, m, "sendRichMessage"); !strings.Contains(html, "OpenTW") || !strings.Contains(html, "Первый цикл проверки выполняется") {
+		t.Fatalf("start must render the status panel, got %q", html)
 	}
 }
 
-// Сценарий 20: повторный /status открепляет старое, закрепляет новое, обновляет message_id.
+// Сценарий 20: повторный /status — новая панель закрепляется, прежняя
+// открепляется только ПОСЛЕ этого; привязка обновляется.
 func TestRepeatStatusReplacesPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -160,8 +179,8 @@ func TestRepeatStatusReplacesPanel(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/status")); err != nil {
 		t.Fatal(err)
 	}
-	if m.callCount("sendMessage") != 2 {
-		t.Fatalf("two panels expected, got %d sends", m.callCount("sendMessage"))
+	if m.callCount("sendRichMessage") != 2 {
+		t.Fatalf("two panels expected, got %d rich sends", m.callCount("sendRichMessage"))
 	}
 	if m.callCount("pinChatMessage") != 2 {
 		t.Fatalf("new panel must be pinned: %d", m.callCount("pinChatMessage"))
@@ -173,13 +192,52 @@ func TestRepeatStatusReplacesPanel(t *testing.T) {
 	if unpinBody["message_id"].(float64) != 1 {
 		t.Fatalf("must unpin the OLD message, got %v", unpinBody["message_id"])
 	}
+	// новый pin раньше открепления старого: двух закреплённых панелей не бывает
+	if !(callIndex(m, "pinChatMessage") < callIndex(m, "unpinChatMessage")) {
+		t.Fatalf("new panel must be pinned before the old one is unpinned: %v", m.callList())
+	}
 	sm, _ := store.StatusMessage(100)
 	if sm == nil || sm.MessageID != 2 {
 		t.Fatalf("binding must point to the new message, got %+v", sm)
 	}
 }
 
-// Сценарий 21: цикл мониторинга редактирует существующую панель.
+// Закрепление новой панели не удалось — прежняя НЕ открепляется (никогда не
+// остаёмся без закреплённой панели), бот пробует её переподтвердить.
+func TestPinFailureKeepsOldPanelPinned(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	ctx := context.Background()
+	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/status")); err != nil {
+		t.Fatal(err)
+	}
+	m.resetCalls()
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "pinChatMessage" {
+			return map[string]any{"ok": false, "error_code": 400, "description": "Bad Request: not enough rights to manage pinned messages in the chat"}, http.StatusBadRequest
+		}
+		if method == "sendRichMessage" {
+			return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
+		}
+		return map[string]any{"ok": true, "result": true}, http.StatusOK
+	}
+	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/status")); err != nil {
+		t.Fatal(err)
+	}
+	if m.callCount("unpinChatMessage") != 0 {
+		t.Fatalf("old panel must stay pinned while the new one is not: %v", m.callList())
+	}
+	// прежняя панель переподтверждается попыткой повторного pin
+	if m.callCount("pinChatMessage") != 2 { // новый (упал) + старый (проба)
+		t.Fatalf("pin calls = %d: %v", m.callCount("pinChatMessage"), m.callList())
+	}
+	sm, _ := store.StatusMessage(100)
+	if sm == nil || sm.MessageID != 2 {
+		t.Fatalf("binding must still move to the new message: %+v", sm)
+	}
+}
+
+// Сценарий 21: цикл мониторинга редактирует существующую панель rich-текстом.
 func TestCycleEditsPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -187,9 +245,10 @@ func TestCycleEditsPanel(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/status")); err != nil {
 		t.Fatal(err)
 	}
+	at := time.Now()
 	checks := map[string]storage.Check{
-		"gpt-6-astra": check("gpt-6-astra", status.Operational),
-		"glm-5.3":     check("glm-5.3", status.Operational),
+		"gpt-6-astra": {ModelID: "gpt-6-astra", At: at, Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)},
+		"glm-5.3":     {ModelID: "glm-5.3", At: at, Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(3_100_000)},
 	}
 	seedCheck(t, b, checks)
 	commitCycle(t, b, cycle(checks))
@@ -197,8 +256,12 @@ func TestCycleEditsPanel(t *testing.T) {
 	if m.callCount("editMessageText") != 1 {
 		t.Fatalf("panel must be edited, got %d", m.callCount("editMessageText"))
 	}
-	if m.callCount("sendMessage") != 1 {
+	if m.callCount("sendRichMessage") != 1 {
 		t.Fatal("no new messages must be sent on a cycle update")
+	}
+	html := lastRichHTML(t, m, "editMessageText")
+	if !strings.Contains(html, "🟢 <code>gpt-6-astra</code> - 2.0s") {
+		t.Fatalf("edited panel html wrong:\n%s", html)
 	}
 }
 
@@ -223,7 +286,36 @@ func TestCycleSkipsUnchangedText(t *testing.T) {
 	}
 }
 
-// Сценарий 22: панель удалена (edit → 400) — бот создаёт новую и закрепляет.
+// «message is not modified» при редактировании панели — штатный случай (двойной цикл).
+func TestPanelEditNotModifiedIsBenign(t *testing.T) {
+	m := newMockTG(t)
+	b, _ := newBot(t, m)
+	ctx := context.Background()
+	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/status")); err != nil {
+		t.Fatal(err)
+	}
+	m.handler = func(method string, body []byte) (any, int) {
+		if method == "editMessageText" {
+			return map[string]any{"ok": false, "error_code": 400, "description": "Bad Request: message is not modified"}, http.StatusBadRequest
+		}
+		if method == "sendRichMessage" {
+			return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
+		}
+		return map[string]any{"ok": true, "result": true}, http.StatusOK
+	}
+	checks := map[string]storage.Check{"gpt-6-astra": check("gpt-6-astra", status.Operational)}
+	seedCheck(t, b, checks)
+	commitCycle(t, b, cycle(checks))
+	b.deliveryTick(ctx)
+	if m.callCount("sendRichMessage") != 1 {
+		t.Fatalf("not-modified must not recreate the panel: %v", m.callList())
+	}
+	if m.callCount("editMessageText") != 1 {
+		t.Fatal("edit must have been attempted")
+	}
+}
+
+// Сценарий 22: панель удалена (edit → 400 not found) — бот создаёт новую и закрепляет.
 func TestDeletedPanelRecreated(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -236,17 +328,18 @@ func TestDeletedPanelRecreated(t *testing.T) {
 		if method == "editMessageText" && editFails {
 			return map[string]any{"ok": false, "error_code": 400, "description": "Bad Request: message to edit not found"}, http.StatusBadRequest
 		}
-		if method == "sendMessage" {
+		if method == "sendRichMessage" {
 			return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
 		}
 		return map[string]any{"ok": true, "result": true}, http.StatusOK
 	}
 	editFails = true
-	seedCheck(t, b, map[string]storage.Check{"gpt-6-astra": check("gpt-6-astra", status.Operational)})
-	commitCycle(t, b, cycle(map[string]storage.Check{"gpt-6-astra": check("gpt-6-astra", status.Operational)}))
+	checks := map[string]storage.Check{"gpt-6-astra": check("gpt-6-astra", status.Operational)}
+	seedCheck(t, b, checks)
+	commitCycle(t, b, cycle(checks))
 	b.deliveryTick(ctx)
-	if m.callCount("sendMessage") != 2 {
-		t.Fatalf("deleted panel must be re-sent: %d", m.callCount("sendMessage"))
+	if m.callCount("sendRichMessage") != 2 {
+		t.Fatalf("deleted panel must be re-sent: %d", m.callCount("sendRichMessage"))
 	}
 	if m.callCount("pinChatMessage") != 2 {
 		t.Fatal("re-created panel must be pinned")
@@ -265,8 +358,9 @@ func TestPanelRestoredAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	seedCheck(t, b, map[string]storage.Check{"glm-5.3": check("glm-5.3", status.Operational)})
-	commitCycle(t, b, cycle(map[string]storage.Check{"glm-5.3": check("glm-5.3", status.Operational)}))
+	checks := map[string]storage.Check{"glm-5.3": check("glm-5.3", status.Operational)}
+	seedCheck(t, b, checks)
+	commitCycle(t, b, cycle(checks))
 	b.deliveryTick(ctx)
 	if m.callCount("editMessageText") != 1 {
 		t.Fatalf("restored panel must be edited: %d", m.callCount("editMessageText"))
@@ -275,19 +369,19 @@ func TestPanelRestoredAfterRestart(t *testing.T) {
 	if body["message_id"].(float64) != 77 {
 		t.Fatalf("must edit the restored message, got %v", body["message_id"])
 	}
-	if m.callCount("sendMessage") != 0 {
+	if m.callCount("sendRichMessage") != 0 {
 		t.Fatal("restore must not send new messages")
 	}
 }
 
-// Сценарий: у бота нет права закреплять — сообщение сохраняется, пользователь уведомляется один раз.
+// Сценарий: у бота нет права закреплять — сообщение сохраняется, пользователь уведомляется.
 func TestPinForbiddenStillBinds(t *testing.T) {
 	m := newMockTG(t)
 	m.handler = func(method string, body []byte) (any, int) {
 		if method == "pinChatMessage" {
 			return map[string]any{"ok": false, "error_code": 400, "description": "Bad Request: not enough rights to manage pinned messages in the chat"}, http.StatusBadRequest
 		}
-		if method == "sendMessage" {
+		if method == "sendRichMessage" {
 			return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
 		}
 		return map[string]any{"ok": true, "result": true}, http.StatusOK
@@ -315,34 +409,138 @@ func TestPinForbiddenStillBinds(t *testing.T) {
 	}
 }
 
-// Сценарий: /status model-id — детальная информация; неизвестный ID — сообщение.
+// Сценарий: /status model-id — rich-карточка, не закрепляется; неизвестный ID — сообщение.
 func TestStatusModelDetail(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
-	if err := store.SetModelState("glm-5.3", status.Operational, "", "", time.Now()); err != nil {
+	at := time.Now()
+	if err := store.SetModelState("glm-5.3", status.Operational, "", "", at); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.InsertCheck(storage.Check{ModelID: "glm-5.3", At: time.Now(), HTTPStatus: 200, Status: status.Operational}); err != nil {
+	if err := store.InsertCheck(storage.Check{ModelID: "glm-5.3", At: at, HTTPStatus: 200, Status: status.Operational,
+		LatencyUS: ptr1(2_000_000), Response: "OK"}); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/status glm-5.3")); err != nil {
 		t.Fatal(err)
 	}
-	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	if !strings.Contains(text, "<b>glm-5.3</b> - 🟢 работает") {
-		t.Fatalf("detail wrong: %q", text)
+	if m.callCount("sendRichMessage") != 1 || m.callCount("sendMessage") != 0 {
+		t.Fatalf("card must be a rich message: rich=%d classic=%d", m.callCount("sendRichMessage"), m.callCount("sendMessage"))
 	}
 	if m.callCount("pinChatMessage") != 0 {
-		t.Fatal("detail reply must not be pinned")
+		t.Fatal("card must not be pinned")
+	}
+	html := lastRichHTML(t, m, "sendRichMessage")
+	for _, want := range []string{"🟢 <code>glm-5.3</code> - Работает", "<b>Ответ модели</b></p><p>OK</p>"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("card missing %q:\n%s", want, html)
+		}
 	}
 
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/status nope")); err != nil {
 		t.Fatal(err)
 	}
-	text = fmt.Sprint(m.lastBody("sendMessage")["text"])
-	if !strings.Contains(text, "не найдена") {
+	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
+	if !strings.Contains(text, "Модель не найдена") {
 		t.Fatalf("unknown model: %q", text)
+	}
+}
+
+// Карточка без check-строк строится из состояния модели (last_check_at).
+func TestModelDetailFallsBackToModelState(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	at := time.Now()
+	if err := store.SetModelState("gpt-6-astra", status.Down, "http", "boom", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/status gpt-6-astra")); err != nil {
+		t.Fatal(err)
+	}
+	html := lastRichHTML(t, m, "sendRichMessage")
+	for _, want := range []string{"<code>gpt-6-astra</code>", "🔴 <code>gpt-6-astra</code> - Недоступна"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("fallback card missing %q:\n%s", want, html)
+		}
+	}
+	if strings.Contains(html, "За последние 24 часа") {
+		t.Errorf("no history must omit the 24h block:\n%s", html)
+	}
+}
+
+// Длинный ответ модели: карточка в лимите rich-сообщения, хвост — следующим
+// rich-сообщением; данные не теряются и не обрезаются молча.
+func TestModelCardLongResponseSentAsFollowups(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	at := time.Now()
+	resp := strings.Repeat("ж", 40000) // «ж» не встречается в самом шаблоне карточки
+	if err := store.SetModelState("gpt-6-astra", status.Down, "http", "upstream boom", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertCheck(storage.Check{ModelID: "gpt-6-astra", At: at, Status: status.Down,
+		HTTPStatus: 500, ErrorType: "http", Response: resp}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/status gpt-6-astra")); err != nil {
+		t.Fatal(err)
+	}
+	if n := m.callCount("sendRichMessage"); n < 2 {
+		t.Fatalf("long answer must be split into follow-up rich messages, got %d", n)
+	}
+	total := 0
+	for _, body := range m.callBodies("sendRichMessage") {
+		var p map[string]any
+		if err := json.Unmarshal(body, &p); err != nil {
+			t.Fatal(err)
+		}
+		html := richHTML(t, p)
+		if l := len([]rune(html)); l > maxRichMessage {
+			t.Fatalf("each rich message must fit the limit, got %d runes", l)
+		}
+		total += strings.Count(html, "ж")
+	}
+	if total != 40000 {
+		t.Fatalf("response data lost: %d of 40000 runes", total)
+	}
+}
+
+// Регрессия: длинный ответ из экранируемых символов
+// («&», рост ×5) — каждое отправленное rich-сообщение обязано укладываться
+// в лимит 32768, данные не теряются.
+func TestModelCardEscapableLongResponseFollowups(t *testing.T) {
+	m := newMockTG(t)
+	b, store := newBot(t, m)
+	at := time.Now()
+	resp := strings.Repeat("&", 40000)
+	if err := store.SetModelState("gpt-6-astra", status.Down, "http", "upstream boom", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertCheck(storage.Check{ModelID: "gpt-6-astra", At: at, Status: status.Down,
+		HTTPStatus: 500, ErrorType: "http", Response: resp}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/status gpt-6-astra")); err != nil {
+		t.Fatal(err)
+	}
+	if n := m.callCount("sendRichMessage"); n < 2 {
+		t.Fatalf("escapable long answer must be split, got %d rich messages", n)
+	}
+	amp := 0
+	for _, body := range m.callBodies("sendRichMessage") {
+		var p map[string]any
+		if err := json.Unmarshal(body, &p); err != nil {
+			t.Fatal(err)
+		}
+		html := richHTML(t, p)
+		if l := len([]rune(html)); l > maxRichMessage {
+			t.Fatalf("each rich message must fit the limit after escaping, got %d runes", l)
+		}
+		amp += strings.Count(html, "&amp;")
+	}
+	if amp != 40000 {
+		t.Fatalf("response data lost: %d of 40000 runes", amp)
 	}
 }
 
@@ -416,8 +614,7 @@ func TestSubscribeSavePersists(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
-	cb := cbUpdate(100, 1, "s:gpt-6-astra")
-	if err := b.HandleUpdate(ctx, cb); err != nil {
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:gpt-6-astra")); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:glm-5.3")); err != nil {
@@ -463,7 +660,7 @@ func TestSubscribeToggleIdempotent(t *testing.T) {
 	}
 }
 
-// Каналы: /status постит панель в канал и закрепляет её.
+// Каналы: /status постит rich-панель в канал и закрепляет её.
 func TestChannelStatusPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -479,10 +676,10 @@ func TestChannelStatusPanel(t *testing.T) {
 	if err := b.HandleUpdate(ctx, upd); err != nil {
 		t.Fatal(err)
 	}
-	if m.callCount("sendMessage") != 1 || m.callCount("pinChatMessage") != 1 {
-		t.Fatalf("channel post must create+pin panel, got send=%d pin=%d", m.callCount("sendMessage"), m.callCount("pinChatMessage"))
+	if m.callCount("sendRichMessage") != 1 || m.callCount("pinChatMessage") != 1 {
+		t.Fatalf("channel post must create+pin rich panel, got rich=%d pin=%d", m.callCount("sendRichMessage"), m.callCount("pinChatMessage"))
 	}
-	body := m.lastBody("sendMessage")
+	body := m.lastBody("sendRichMessage")
 	if body["chat_id"].(float64) != -300 {
 		t.Fatalf("must post to the channel chat, got %v", body["chat_id"])
 	}

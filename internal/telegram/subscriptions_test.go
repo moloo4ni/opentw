@@ -10,7 +10,7 @@ import (
 	"opentw/internal/storage"
 )
 
-// P0 (AC-1): рестарт бота между открытием /subscribe и «Сохранить»
+// Рестарт бота между открытием /subscribe и «Сохранить»
 // не стирает сохранённые подписки — черновик гидратируется из БД.
 func TestStaleMenuSaveKeepsSubscriptions(t *testing.T) {
 	m := newMockTG(t)
@@ -39,7 +39,7 @@ func TestStaleMenuSaveKeepsSubscriptions(t *testing.T) {
 	}
 }
 
-// AC-2: «Сохранить» без открытого меню (после рестарта) не меняет сохранённое.
+// «Сохранить» без открытого меню (после рестарта) не меняет сохранённое.
 func TestSaveWithoutMenuKeepsSubscriptions(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -55,7 +55,7 @@ func TestSaveWithoutMenuKeepsSubscriptions(t *testing.T) {
 	}
 }
 
-// AC-3: масс-кнопки на обоих экранах, данные в лимите 64 байт.
+// Масс-кнопки на обоих экранах, данные в лимите 64 байт.
 func TestMassButtonsPresent(t *testing.T) {
 	models := []storage.Model{
 		{ID: "g1", Family: "GPT"},
@@ -95,7 +95,7 @@ func TestMassButtonsPresent(t *testing.T) {
 	}
 }
 
-// AC-4: `fa:` меняет только черновик до save; после save — всё семейство.
+// `fa:` меняет только черновик до save; после save — всё семейство.
 func TestFamilySelectAllDraftThenSave(t *testing.T) {
 	m := newMockTG(t)
 	models := []storage.Model{
@@ -120,7 +120,7 @@ func TestFamilySelectAllDraftThenSave(t *testing.T) {
 	}
 }
 
-// AC-5: «Снять всё» — счётчик с диффом, текст нуля после save.
+// «Снять всё» — счётчик с диффом, текст нуля после save.
 func TestNoneDeselectsAll(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -153,7 +153,7 @@ func TestNoneDeselectsAll(t *testing.T) {
 	}
 }
 
-// AC-6: дифф относительно сохранённого состояния; без изменений скобка опускается.
+// Дифф относительно сохранённого состояния; без изменений скобка опускается.
 func TestDraftDiffAgainstSaved(t *testing.T) {
 	m := newMockTG(t)
 	models := []storage.Model{
@@ -198,7 +198,7 @@ func TestDraftDiffAgainstSaved(t *testing.T) {
 	}
 }
 
-// AC-7: «Отменить» на экране семейства удаляет меню, не сохраняя и не стирая.
+// «Отменить» на экране семейства удаляет меню, не сохраняя и не стирая.
 func TestFamilyScreenCancel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -245,21 +245,21 @@ func TestSubscribeSaveDBErrorKeepsDraft(t *testing.T) {
 	}
 }
 
-// /status с уникальным префиксом находит модель; неоднозначный — подсказывает.
+// /status с уникальным префиксом находит модель (rich-карточка); неоднозначный — подсказывает.
 func TestStatusPrefixLookup(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
 	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/status gpt-6")); err != nil {
 		t.Fatal(err)
 	}
-	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	if !strings.Contains(text, "<b>gpt-6-astra</b>") {
-		t.Fatalf("unique prefix must resolve:\n%s", text)
+	html := lastRichHTML(t, m, "sendRichMessage")
+	if !strings.Contains(html, "<code>gpt-6-astra</code>") {
+		t.Fatalf("unique prefix must resolve:\n%s", html)
 	}
 	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/status g")); err != nil {
 		t.Fatal(err)
 	}
-	text = fmt.Sprint(m.lastBody("sendMessage")["text"])
+	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
 	if !strings.Contains(text, "Уточните") || !strings.Contains(text, "gpt-6-astra") || !strings.Contains(text, "glm-5.3") {
 		t.Fatalf("ambiguous prefix must suggest candidates:\n%s", text)
 	}

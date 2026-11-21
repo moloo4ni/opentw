@@ -23,7 +23,9 @@ type mockTG struct {
 	token     string
 	url       string
 	msgID     int64
-	sendChats []int64 // chat_id каждого sendMessage, по порядку
+	sendChats []int64  // chat_id каждого sendMessage, по порядку
+	richChats []int64  // chat_id каждого sendRichMessage, по порядку
+	bodiesLog [][]byte // тело каждого вызова, параллельно calls
 }
 
 func (m *mockTG) nextMessageID() int64 {
@@ -42,15 +44,19 @@ func newMockTG(t *testing.T) *mockTG {
 		token := strings.TrimSuffix(path, "/"+method)
 		m.mu.Lock()
 		m.calls = append(m.calls, method)
-		body := make([]byte, r.ContentLength)
-		r.Body.Read(body)
+		body, _ := io.ReadAll(r.Body)
+		m.bodiesLog = append(m.bodiesLog, body)
 		m.bodies[method] = body
 		m.token = token
-		if method == "sendMessage" {
+		if method == "sendMessage" || method == "sendRichMessage" {
 			var p map[string]any
 			if json.Unmarshal(body, &p) == nil {
 				if chatID, ok := p["chat_id"].(float64); ok {
-					m.sendChats = append(m.sendChats, int64(chatID))
+					if method == "sendMessage" {
+						m.sendChats = append(m.sendChats, int64(chatID))
+					} else {
+						m.richChats = append(m.richChats, int64(chatID))
+					}
 				}
 			}
 		}
@@ -59,7 +65,7 @@ func newMockTG(t *testing.T) *mockTG {
 		status := http.StatusOK
 		if m.handler != nil {
 			payload, status = m.handler(method, body)
-		} else if method == "sendMessage" {
+		} else if method == "sendMessage" || method == "sendRichMessage" {
 			payload = map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}
 		} else {
 			payload = map[string]any{"ok": true, "result": true}
@@ -87,18 +93,63 @@ func (m *mockTG) callCount(method string) int {
 func (m *mockTG) resetCalls() {
 	m.mu.Lock()
 	m.calls = nil
+	m.bodiesLog = nil
 	m.sendChats = nil
+	m.richChats = nil
 	m.mu.Unlock()
 }
 
-// sentChatIDs возвращает chat_id всех вызовов sendMessage (в порядке).
+// callList — копия последовательности вызванных методов (для проверок порядка).
+func (m *mockTG) callList() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.calls...)
+}
+
+// callBodies — тела всех вызовов метода в порядке следования.
+func (m *mockTG) callBodies(method string) [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out [][]byte
+	for i, c := range m.calls {
+		if c == method && i < len(m.bodiesLog) {
+			out = append(out, m.bodiesLog[i])
+		}
+	}
+	return out
+}
+
+// sentChatIDs возвращает chat_id всех вызовов sendMessage/sendRichMessage (в порядке).
 func (m *mockTG) sentChatIDs(method string) []int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if method != "sendMessage" {
-		return nil
+	switch method {
+	case "sendMessage":
+		return m.sendChats
+	case "sendRichMessage":
+		return m.richChats
 	}
-	return m.sendChats
+	return nil
+}
+
+// richHTML извлекает html из rich_message полезной нагрузки вызова.
+func richHTML(t *testing.T, body map[string]any) string {
+	t.Helper()
+	rm, ok := body["rich_message"].(map[string]any)
+	if !ok {
+		t.Fatalf("rich_message missing in body: %v", body)
+	}
+	h, _ := rm["html"].(string)
+	if h == "" {
+		t.Fatalf("rich_message.html empty: %v", body)
+	}
+	return h
+}
+
+// lastRichHTML — html последнего вызова sendRichMessage/editMessageText(панель).
+func lastRichHTML(t *testing.T, m *mockTG, method string) string {
+	t.Helper()
+	return richHTML(t, m.lastBody(method))
 }
 
 func (m *mockTG) lastBody(method string) map[string]any {
@@ -320,6 +371,59 @@ func TestDeleteMessage(t *testing.T) {
 	body := m.lastBody("deleteMessage")
 	if body["chat_id"].(float64) != 100 || body["message_id"].(float64) != 55 {
 		t.Fatalf("delete body = %v", body)
+	}
+}
+
+// §4: панели/уведомления/карточки — rich-сообщения: html + skip_entity_detection,
+// без parse_mode и text.
+func TestSendRichMessagePayload(t *testing.T) {
+	m := newMockTG(t)
+	c := newTestBot(m)
+	msg, err := c.SendRichMessage(context.Background(), 100, "<p>🔴 <code>m</code></p>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.MessageID != 1 {
+		t.Fatalf("message id = %d", msg.MessageID)
+	}
+	body := m.lastBody("sendRichMessage")
+	if body["chat_id"].(float64) != 100 {
+		t.Fatalf("chat_id = %v", body["chat_id"])
+	}
+	if got := richHTML(t, body); got != "<p>🔴 <code>m</code></p>" {
+		t.Fatalf("html = %q", got)
+	}
+	rm := body["rich_message"].(map[string]any)
+	if rm["skip_entity_detection"] != true {
+		t.Fatalf("skip_entity_detection = %v", rm["skip_entity_detection"])
+	}
+	if _, ok := body["parse_mode"]; ok {
+		t.Fatal("rich message must not set parse_mode")
+	}
+	if _, ok := body["text"]; ok {
+		t.Fatal("rich message must not set text")
+	}
+}
+
+// §4: редактирование панели — editMessageText с rich_message вместо text.
+func TestEditRichMessageTextPayload(t *testing.T) {
+	m := newMockTG(t)
+	c := newTestBot(m)
+	if err := c.EditRichMessageText(context.Background(), 100, 7, "<p>panel</p>"); err != nil {
+		t.Fatal(err)
+	}
+	body := m.lastBody("editMessageText")
+	if body["chat_id"].(float64) != 100 || body["message_id"].(float64) != 7 {
+		t.Fatalf("body = %v", body)
+	}
+	if got := richHTML(t, body); got != "<p>panel</p>" {
+		t.Fatalf("html = %q", got)
+	}
+	if _, ok := body["text"]; ok {
+		t.Fatal("rich edit must not set text")
+	}
+	if _, ok := body["parse_mode"]; ok {
+		t.Fatal("rich edit must not set parse_mode")
 	}
 }
 

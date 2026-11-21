@@ -34,15 +34,15 @@ func TestPanelKeepsConfigOrder(t *testing.T) {
 	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/status")); err != nil {
 		t.Fatal(err)
 	}
-	text := fmt.Sprint(m.lastBody("sendMessage")["text"])
-	iAstra := strings.Index(text, "gpt-6-astra")
-	iDot := strings.Index(text, "gpt-6.1-sol")
-	iSol := strings.Index(text, "gpt-6-sol")
+	html := lastRichHTML(t, m, "sendRichMessage")
+	iAstra := strings.Index(html, "gpt-6-astra")
+	iDot := strings.Index(html, "gpt-6.1-sol")
+	iSol := strings.Index(html, "gpt-6-sol")
 	if iAstra < 0 || iDot < 0 || iSol < 0 {
-		t.Fatalf("missing models in panel:\n%s", text)
+		t.Fatalf("missing models in panel:\n%s", html)
 	}
 	if !(iAstra < iDot && iDot < iSol) {
-		t.Fatalf("panel must keep config order (astra, 6.1-sol, 6-sol), got:\n%s", text)
+		t.Fatalf("panel must keep config order (astra, 6.1-sol, 6-sol), got:\n%s", html)
 	}
 }
 

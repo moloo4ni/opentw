@@ -57,7 +57,7 @@ func (b *Bot) loadDraft(ctx context.Context, chatID int64) map[string]bool {
 
 // draftOf возвращает черновик чата; если меню не открывали в этом процессе
 // (рестарт между открытием и «Сохранить»), черновик гидратируется из
-// сохранённых подписок — иначе пустой черновик стёр бы их (P0).
+// сохранённых подписок — иначе пустой черновик стёр бы их.
 //
 // Инвариант: черновики читаются и пишутся только горутиной bot.Run —
 // колбэки обрабатываются последовательно в цикле polling, — поэтому
@@ -101,9 +101,15 @@ func (b *Bot) userIsAdmin(ctx context.Context, chat Chat, userID int64) (bool, e
 // Кнопки несут идентификаторы моделей/семейств (не индексы): устаревшие
 // клавиатуры после смены конфигурации вежливо отвергаются.
 func (b *Bot) handleCallback(ctx context.Context, cb *CallbackQuery) error {
+	if strings.HasPrefix(cb.Data, "st:") {
+		// кнопки-ошибки панелей/уведомлений идут раньше меню подписок:
+		// не пересекаются с f:/fa:/fn:/s:/save/cancel/back/all/none и
+		// всегда отвечают сами
+		return b.handleStatusCallback(ctx, cb)
+	}
 	if cb.Message == nil {
 		// колбэк без сообщения (отозванная/старая клавиатура): ни chat_id, ни
-		// message_id — обработка испортила бы данные нулевым chat_id (7.2);
+		// message_id — обработка испортила бы данные нулевым chat_id;
 		// отвечаем тостом, чтобы у пользователя не висел спиннер
 		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Кнопка устарела, откройте /subscribe заново")
 	}
@@ -191,7 +197,7 @@ func (b *Bot) savedMap(chatID int64) map[string]bool {
 
 // editMenu перерисовывает сообщение меню; «message is not modified» —
 // штатный случай (двойной клик по кнопке), а не ошибка; при настоящей
-// неудаче даёт понятный тост (7.2).
+// неудаче даёт понятный тост.
 func (b *Bot) editMenu(ctx context.Context, chat Chat, cb *CallbackQuery, text string, kb *InlineKeyboardMarkup) error {
 	err := b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, text, kb)
 	var apiErr *ApiError

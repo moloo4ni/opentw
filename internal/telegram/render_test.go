@@ -2,7 +2,6 @@ package telegram
 
 import (
 	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +23,14 @@ func mskTime(t *testing.T, h, m, s int) time.Time {
 func ptr1(v int64) *int64     { return &v }
 func ptrF(v float64) *float64 { return &v }
 
-func TestPanelFormatSuccess(t *testing.T) {
+// stBtn — кнопка-ошибка модели: точный ожидаемый фрагмент строки.
+func stBtn(id, label string) string {
+	return `<tg-button type="callback_data" style="link" data="st:` + id + `">` + label + `</tg-button>`
+}
+
+// Панель успешных моделей: заголовок, семейства, latency в строке,
+// футер с датой, легенда последней строкой, БЕЗ сводки и метрик.
+func TestPanelFormatOperational(t *testing.T) {
 	models := []storage.Model{
 		{ID: "gpt-6-astra", Family: "GPT"},
 		{ID: "glm-5.3", Family: "GLM"},
@@ -32,105 +38,483 @@ func TestPanelFormatSuccess(t *testing.T) {
 	checks := map[string]storage.Check{
 		"gpt-6-astra": {ModelID: "gpt-6-astra", Status: status.Operational, HTTPStatus: 200,
 			LatencyUS: ptr1(2_700_000), TTFTUS: ptr1(420_000), GenUS: ptr1(2_280_000),
-			TPS: ptrF(42.3), InputTokens: ptr1(154), OutputTokens: ptr1(96)},
+			TPS: ptrF(42.3), InputTokens: ptr1(154), OutputTokens: ptr1(96), Response: "OK"},
 		"glm-5.3": {ModelID: "glm-5.3", Status: status.Operational, HTTPStatus: 200,
-			LatencyUS: ptr1(4_200_000), TTFTUS: ptr1(630_000), GenUS: ptr1(3_570_000), TPS: ptrF(54.1)},
+			LatencyUS: ptr1(4_200_000), TTFTUS: ptr1(630_000), TPS: ptrF(54.1)},
 	}
-	text := RenderStatusPanel(models, checks, mskTime(t, 16, 15, 3), mskTime(t, 16, 30, 0), 15*time.Minute)
-	wantLines := []string{
-		"<b>OpenTW</b>",
-		"",
-		"Модели: 2 🟢",
-		"",
-		"<b>GPT</b>",
-		"🟢 <code>gpt-6-astra</code> - 2.7s · 42.3 TPS · 154/96",
-		"",
-		"<b>GLM</b>",
-		"🟢 <code>glm-5.3</code> - 4.2s · 54.1 TPS",
-		"",
-		"Обновлено: 16.11.2026 16:15:03 MSK",
-		"Следующая проверка: 16:30:00 MSK (интервал 15 мин)",
-		"🟢 работает · 🟡 нестабильно · 🔴 недоступна · ⚪ нет данных",
-	}
-	got := strings.Split(strings.TrimRight(text, "\n"), "\n")
-	if len(got) != len(wantLines) {
-		t.Fatalf("panel lines = %d:\n%s", len(got), text)
-	}
-	for i, want := range wantLines {
-		if got[i] != want {
-			t.Fatalf("line %d:\n got: %q\nwant: %q", i, got[i], want)
-		}
-	}
-}
-
-func TestPanelOneLinePerModel(t *testing.T) {
-	models := []storage.Model{}
-	for i := 0; i < 30; i++ {
-		f := "F"
-		if i%2 == 1 {
-			f = "G"
-		}
-		models = append(models, storage.Model{ID: strings.Repeat("m", 10), Family: f})
-	}
-	text := RenderStatusPanel(models, nil, time.Now(), time.Now(), 15*time.Minute)
-	modelLines := 0
-	for _, l := range strings.Split(text, "\n") {
-		if strings.Contains(l, "<code>") {
-			modelLines++
-		}
-	}
-	if modelLines != 30 {
-		t.Fatalf("model lines = %d, want 30", modelLines)
-	}
-}
-
-func TestPanelErrorLinesAndNA(t *testing.T) {
-	models := []storage.Model{
-		{ID: "gpt-6-sol", Family: "GPT"},
-		{ID: "glm-5.3-fast", Family: "GLM"},
-		{ID: "claude-opus-5", Family: "Claude"},
-		{ID: "glm-5.3", Family: "GLM"},
-		{ID: "un", Family: "U"},
-	}
-	checks := map[string]storage.Check{
-		"gpt-6-sol":     {Status: status.Degraded, HTTPStatus: 429, ErrorType: "http", ErrorMessage: "Upstream rate limit"},
-		"glm-5.3-fast":  {Status: status.Down, HTTPStatus: 404, ErrorType: "http", ErrorMessage: "Invalid model."},
-		"claude-opus-5": {Status: status.Unknown, ErrorType: "invalid", ErrorMessage: "unparseable response body"},
-		"glm-5.3":       {Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(3_100_000)},
-		"un":            {Status: status.Down, ErrorType: "timeout", ErrorMessage: "context deadline exceeded"},
-	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
+	text := RenderStatusPanel(models, checks, mskTime(t, 16, 15, 3), mskTime(t, 16, 30, 0))
 	for _, want := range []string{
-		"🟡 <code>gpt-6-sol</code> - HTTP 429 · Upstream rate limit",
-		"🔴 <code>glm-5.3-fast</code> - HTTP 404 · Invalid model.",
-		"⚪ <code>claude-opus-5</code> - ошибка монитора",
-		"🔴 <code>un</code> - Timeout",
-		"🟢 <code>glm-5.3</code> - 3.1s · N/A TPS",
+		"<p><b>OpenTW</b></p>",
+		"<p><b>GPT</b><br/>🟢 <code>gpt-6-astra</code> - 2.7s</p>",
+		"<p><b>GLM</b><br/>🟢 <code>glm-5.3</code> - 4.2s</p>",
+		"<p>Обновлено: 16.11.2026 16:15:03 MSK</p>",
+		"<p>Следующая проверка: 16:30:00 MSK</p>",
+		"<p>🟢 Работает · 🔴 Недоступна · ⚪ Нет данных</p>",
 	} {
 		if !strings.Contains(text, want) {
-			t.Errorf("panel missing line %q\npanel:\n%s", want, text)
+			t.Errorf("panel missing %q:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "glm-5.3</code> - 3.1s · N/A TPS ·") {
-		t.Error("tokens block must be omitted when tokens are unknown")
+	for _, bad := range []string{
+		"Модели:", // сводка удалена
+		"TPS",     // метрики удалены
+		"TTFT",
+		"tokens",
+		"154",
+		"42.3",
+	} {
+		if strings.Contains(text, bad) {
+			t.Errorf("panel must not contain %q:\n%s", bad, text)
+		}
 	}
 }
 
-func TestPanelPerfDegradedAndEmptyAndNoData(t *testing.T) {
+// Матрица строк панели: три статуса, кнопка у ошибок, latency у Operational,
+// Operational без latency — без « - »; семейство — один блок с <br/>.
+func TestPanelThreeStatusLines(t *testing.T) {
 	models := []storage.Model{
-		{ID: "a-perf", Family: "A"},
-		{ID: "a-empty", Family: "A"},
-		{ID: "a-new", Family: "A"},
+		{ID: "m-down", Family: "M"},
+		{ID: "m-un", Family: "M"},
+		{ID: "m-ok", Family: "M"},
+		{ID: "m-ok-nolat", Family: "M"},
 	}
 	checks := map[string]storage.Check{
-		"a-perf":  {Status: status.Degraded, HTTPStatus: 200, LatencyUS: ptr1(30_000_000), TTFTUS: ptr1(3_000_000), TPS: ptrF(12.3), ErrorType: "perf"},
-		"a-empty": {Status: status.Degraded, HTTPStatus: 200, ErrorType: "empty", ErrorMessage: "empty generation"},
+		"m-down":     {Status: status.Down, HTTPStatus: 404, ErrorType: "http", ErrorMessage: "Invalid model."},
+		"m-un":       {Status: status.Unknown, ErrorType: "timeout", ErrorMessage: "deadline"},
+		"m-ok":       {Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)},
+		"m-ok-nolat": {Status: status.Operational},
 	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
+	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
+	want := "<p><b>M</b><br/>" +
+		"🔴 <code>m-down</code> - " + stBtn("m-down", "HTTP 404") + "<br/>" +
+		"⚪ <code>m-un</code> - " + stBtn("m-un", "Нет данных") + "<br/>" +
+		"🟢 <code>m-ok</code> - 2.0s<br/>" +
+		"🟢 <code>m-ok-nolat</code></p>"
+	if !strings.Contains(text, want) {
+		t.Errorf("panel family block wrong, want:\n%s\ngot:\n%s", want, text)
+	}
+	// служебное сообщение об ошибке в панель не показывается — есть кнопка с label
+	if strings.Contains(text, "Invalid model.") || strings.Contains(text, "deadline") {
+		t.Fatalf("error messages must not surface in the panel:\n%s", text)
+	}
+}
+
+// Единая короткая подпись ошибки — вся матрица только в этих вариантах.
+func TestShortErrorLabel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		c    storage.Check
+		want string
+	}{
+		{"http 400", storage.Check{ErrorType: "http", HTTPStatus: 400}, "HTTP 400"},
+		{"http 404", storage.Check{ErrorType: "http", HTTPStatus: 404}, "HTTP 404"},
+		{"http 429", storage.Check{ErrorType: "http", HTTPStatus: 429}, "HTTP 429"},
+		{"http 503", storage.Check{ErrorType: "http", HTTPStatus: 503}, "HTTP 503"},
+		{"timeout", storage.Check{ErrorType: "timeout"}, "Timeout"},
+		{"connrefused", storage.Check{ErrorType: "connrefused"}, "Connection refused"},
+		{"response", storage.Check{ErrorType: "response"}, "Unexpected response"},
+		{"empty", storage.Check{ErrorType: "empty"}, "Unexpected response"},
+		{"invalid (монитор)", storage.Check{ErrorType: "invalid"}, "Нет данных"},
+		{"нет типа/нет данных", storage.Check{}, "Нет данных"},
+	} {
+		if got := shortErrorLabel(tc.c); got != tc.want {
+			t.Errorf("%s: shortErrorLabel = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Матрица кнопок: каждый вид ошибки даёт кнопку с корректным label.
+func TestPanelErrorButtonMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		c    storage.Check
+		want string
+	}{
+		{"400", storage.Check{Status: status.Down, ErrorType: "http", HTTPStatus: 400}, "HTTP 400"},
+		{"404", storage.Check{Status: status.Down, ErrorType: "http", HTTPStatus: 404}, "HTTP 404"},
+		{"429", storage.Check{Status: status.Down, ErrorType: "http", HTTPStatus: 429}, "HTTP 429"},
+		{"503", storage.Check{Status: status.Down, ErrorType: "http", HTTPStatus: 503}, "HTTP 503"},
+		{"timeout", storage.Check{Status: status.Down, ErrorType: "timeout"}, "Timeout"},
+		{"connrefused", storage.Check{Status: status.Down, ErrorType: "connrefused"}, "Connection refused"},
+		{"unexpected", storage.Check{Status: status.Down, ErrorType: "response"}, "Unexpected response"},
+		{"unknown-статус монитора", storage.Check{Status: status.Unknown, ErrorType: "invalid"}, "Нет данных"},
+	} {
+		models := []storage.Model{{ID: "m", Family: "M"}}
+		text := RenderStatusPanel(models, map[string]storage.Check{"m": tc.c}, time.Now(), time.Now())
+		prefix := "🔴"
+		if tc.c.Status == status.Unknown {
+			prefix = "⚪"
+		}
+		if !strings.Contains(text, "<p><b>M</b><br/>"+prefix+" <code>m</code> - "+stBtn("m", tc.want)+"</p>") {
+			t.Errorf("%s: line with label %q missing:\n%s", tc.name, tc.want, text)
+		}
+	}
+}
+
+// Порядок строк панели — только конфигурация при любом сочетании статусов.
+func TestPanelOrderFollowsConfig(t *testing.T) {
+	models := []storage.Model{
+		{ID: "m1", Family: "F1"},
+		{ID: "m2", Family: "F1"},
+		{ID: "m3", Family: "F2"},
+	}
+	checks := map[string]storage.Check{
+		"m3": {Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)},
+		"m1": {Status: status.Down, HTTPStatus: 503, ErrorType: "http"},
+		"m2": {Status: status.Unknown},
+	}
+	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
+	i1 := strings.Index(text, "<code>m1</code>")
+	i2 := strings.Index(text, "<code>m2</code>")
+	i3 := strings.Index(text, "<code>m3</code>")
+	if !(i1 < i2 && i2 < i3) {
+		t.Fatalf("config order broken: %d %d %d\n%s", i1, i2, i3, text)
+	}
+}
+
+// Экранирование model ID в <code> и в атрибуте data кнопки.
+func TestPanelEscapesModelID(t *testing.T) {
+	models := []storage.Model{{ID: `x<y>&z`, Family: "M"}}
+	checks := map[string]storage.Check{
+		`x<y>&z`: {Status: status.Down, HTTPStatus: 500, ErrorType: "http"},
+	}
+	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
+	if !strings.Contains(text, "<code>x&lt;y&gt;&amp;z</code>") {
+		t.Fatalf("code id must be escaped:\n%s", text)
+	}
+	if !strings.Contains(text, `data="st:x&lt;y&gt;&amp;z"`) {
+		t.Fatalf("button data must be escaped:\n%s", text)
+	}
+}
+
+// До первого цикла панель честна: без «Обновлено», у модели — кнопка «Нет данных».
+func TestPanelFirstCycle(t *testing.T) {
+	models := []storage.Model{{ID: "a", Family: "A"}}
+	text := RenderStatusPanel(models, nil, time.Now(), time.Now())
+	wants := []string{
+		"Первый цикл проверки выполняется",
+		"<p><b>A</b><br/>⚪ <code>a</code> - " + stBtn("a", "Нет данных") + "</p>",
+		"<p>🟢 Работает · 🔴 Недоступна · ⚪ Нет данных</p>",
+	}
+	for _, want := range wants {
+		if !strings.Contains(text, want) {
+			t.Errorf("first-cycle panel missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "Обновлено:") || strings.Contains(text, "Следующая проверка:") {
+		t.Fatalf("no times before the first cycle:\n%s", text)
+	}
+}
+
+// Полный список из config.example.yaml: все 25 моделей, в лимите rich-сообщения.
+func TestPanelFullExampleConfigFitsRich(t *testing.T) {
+	raw, err := os.ReadFile("../../config.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Models []struct {
+			Family string   `yaml:"family"`
+			IDs    []string `yaml:"ids"`
+		} `yaml:"models"`
+	}
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	var models []storage.Model
+	for _, fam := range cfg.Models {
+		for _, id := range fam.IDs {
+			models = append(models, storage.Model{ID: id, Family: fam.Family})
+		}
+	}
+	if len(models) != 25 {
+		t.Fatalf("example config must hold 25 models, got %d", len(models))
+	}
+	checks := map[string]storage.Check{}
+	for i, m := range models {
+		if i%7 == 0 {
+			checks[m.ID] = storage.Check{Status: status.Down, HTTPStatus: 503, ErrorType: "http"}
+		} else {
+			checks[m.ID] = storage.Check{Status: status.Operational, HTTPStatus: 200,
+				LatencyUS: ptr1(int64(2_000_000 + i*100_000))}
+			if i%5 == 0 {
+				checks[m.ID] = storage.Check{Status: status.Unknown, ErrorType: "invalid"}
+			}
+		}
+	}
+	text := RenderStatusPanel(models, checks, time.Now(), time.Now())
+	if l := utf8.RuneCountInString(text); l > maxRichMessage {
+		t.Fatalf("panel too long for a rich message: %d runes", l)
+	}
+	for _, m := range models {
+		if !strings.Contains(text, "<code>"+m.ID+"</code>") {
+			t.Fatalf("model %s missing from panel", m.ID)
+		}
+	}
+}
+
+// Длинный id: кнопка — в форме устойчивого хэша в пределах 64 байт; resolveCallback понимает её.
+func TestStButtonDataLongIDHashForm(t *testing.T) {
+	long := strings.Repeat("m", 100)
+	data := stButtonData(long)
+	if !strings.HasPrefix(data, "st:h:") || len(data) > maxCallbackData {
+		t.Fatalf("long id must become st:h:<hash> ≤64 bytes: %q", data)
+	}
+	if _, ok := resolveCallback(strings.TrimPrefix(data, "st:"), []string{long}); !ok {
+		t.Fatalf("hash form must resolve back to the model")
+	}
+	if got := stButtonData("m"); got != "st:m" {
+		t.Fatalf("short ids must stay exact: %q", got)
+	}
+}
+
+// --- Карточка модели ---
+
+// Доступная модель: заголовок, статус, дата последней проверки,
+// «Последний запрос» с Latency, «Ответ модели», статистика 24ч.
+// Никаких TTFT/TPS/токенов/переключений.
+func TestModelDetailOperational(t *testing.T) {
+	last := storage.Check{ModelID: "gpt-6-astra", At: mskTime(t, 16, 15, 3), Status: status.Operational,
+		HTTPStatus: 200, LatencyUS: ptr1(2_700_000), TTFTUS: ptr1(420_000), TPS: ptrF(42.3),
+		InputTokens: ptr1(154), OutputTokens: ptr1(96), Response: "OK"}
+	base := time.Now().Add(-23 * time.Hour)
+	var checks []storage.Check
+	for i := 0; i < 23; i++ {
+		c := last
+		c.At = base.Add(time.Duration(i) * time.Hour)
+		c.LatencyUS = ptr1(2_900_000)
+		c.TTFTUS, c.TPS, c.InputTokens, c.OutputTokens = nil, nil, nil, nil
+		checks = append(checks, c)
+	}
+	checks = append(checks, storage.Check{ModelID: "gpt-6-astra", At: base.Add(23 * time.Hour),
+		Status: status.Down, HTTPStatus: 429, ErrorType: "http", LatencyUS: nil})
+	text, _ := renderModelCard("gpt-6-astra", status.Operational, last, checks)
 	for _, want := range []string{
-		"🟡 <code>a-perf</code> - 30.0s · 12.3 TPS · деградация",
-		"🟡 <code>a-empty</code> - HTTP 200 · пустая генерация",
-		"⚪ <code>a-new</code> - нет данных",
+		"<p>🟢 <code>gpt-6-astra</code> - Работает</p>",
+		"Последняя проверка: 16.11.2026 16:15:03 MSK",
+		"<p><b>Последний запрос</b></p><p>HTTP 200 · Latency 2.7s</p>",
+		"<p><b>Ответ модели</b></p><p>OK</p>",
+		"Uptime: 95.83%",
+		"Проверок: 24",
+		"🟢 Успешных: 23 · 🔴 Неудачных: 1 · ⚪ Нет данных: 0",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("card missing %q in:\n%s", want, text)
+		}
+	}
+	for _, bad := range []string{
+		"TTFT", "TPS", "токен", "Переключени", "Среднее", "P50", "P95", "Нестабильн", "N/A",
+	} {
+		if strings.Contains(text, bad) {
+			t.Errorf("card must not contain %q:\n%s", bad, text)
+		}
+	}
+	// карточка не ссылается на саму себя
+	if strings.Contains(text, `data="st:gpt-6-astra"`) {
+		t.Errorf("card must not contain a self-link:\n%s", text)
+	}
+}
+
+// Статистика 24 часов: два полноценных вертикальных промежутка между тремя
+// строками, но ни одного горизонтального отступа. Проверяем итоговый rich-HTML
+// целиком, чтобы изменения не затронули остальные блоки карточки.
+func TestModelCard24HourStatsVerticalSpacingWithoutIndent(t *testing.T) {
+	last := storage.Check{
+		ModelID:    "glm-5.3-prime",
+		At:         time.Date(2026, 11, 21, 17, 45, 9, 0, MSK),
+		Status:     status.Operational,
+		HTTPStatus: 200,
+		LatencyUS:  ptr1(36_700_000),
+		Response:   "OK",
+	}
+	checks := make([]storage.Check, 0, 97)
+	for i := 0; i < 55; i++ {
+		checks = append(checks, storage.Check{ModelID: "glm-5.3-prime", Status: status.Operational})
+	}
+	for i := 0; i < 38; i++ {
+		checks = append(checks, storage.Check{ModelID: "glm-5.3-prime", Status: status.Down})
+	}
+	for i := 0; i < 4; i++ {
+		checks = append(checks, storage.Check{ModelID: "glm-5.3-prime", Status: status.Unknown})
+	}
+	got, _ := renderModelCard("glm-5.3-prime", status.Operational, last, checks)
+	want := "<p>🟢 <code>glm-5.3-prime</code> - Работает</p>" +
+		"<p>Последняя проверка: 21.11.2026 17:45:09 MSK</p>" +
+		"<p><b>Последний запрос</b></p><p>HTTP 200 · Latency 36.7s</p>" +
+		"<p><b>Ответ модели</b></p><p>OK</p>" +
+		"<p><b>За последние 24 часа</b></p>" +
+		"<p>Uptime: 59.14%<br/><br/>Проверок: 97<br/><br/>" +
+		"🟢 Успешных: 55 · 🔴 Неудачных: 38 · ⚪ Нет данных: 4</p>"
+	if got != want {
+		t.Fatalf("model card HTML mismatch\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+// Упавшая модель: HTTP-код с «Latency» (HTTP-ответ получен), секция «Ответ API» дословно.
+func TestModelDetailDownWithResponse(t *testing.T) {
+	last := storage.Check{ModelID: "m", At: mskTime(t, 16, 15, 3), Status: status.Down,
+		HTTPStatus: 429, ErrorType: "http", LatencyUS: ptr1(1_220_000),
+		Response: "unknown provider for model m"}
+	checks := []storage.Check{last, last}
+	text, _ := renderModelCard("m", status.Down, last, checks)
+	for _, want := range []string{
+		"<p>🔴 <code>m</code> - Недоступна</p>",
+		"<p><b>Последний запрос</b></p><p>HTTP 429 · Latency 1.2s</p>",
+		"<p><b>Ответ API</b></p><p>unknown provider for model m</p>",
+		"Uptime: 0.00%",
+		"🟢 Успешных: 0 · 🔴 Неудачных: 2 · ⚪ Нет данных: 0",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("card missing %q in:\n%s", want, text)
+		}
+	}
+}
+
+// Заголовок секции ответа: «Ответ модели» для текста модели («» и «response»),
+// «Ответ API» для остальных. HTTP 200 без итогового текста всё равно
+// показывает факт его отсутствия; у HTTP/транспортной ошибки такой секции нет.
+func TestModelDetailAnswerSectionTitle(t *testing.T) {
+	for _, tc := range []struct {
+		errType string
+		want    string
+	}{
+		{"", "Ответ модели"},
+		{"response", "Ответ модели"},
+		{"http", "Ответ API"},
+		{"timeout", "Ответ API"},
+		{"connrefused", "Ответ API"},
+		{"invalid", "Ответ API"},
+	} {
+		last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+			ErrorType: tc.errType, Response: "текст ответа"}
+		text, _ := renderModelCard("m", status.Down, last, nil)
+		if want := "<p><b>" + tc.want + "</b></p><p>текст ответа</p>"; !strings.Contains(text, want) {
+			t.Errorf("errType=%q: section %q missing:\n%s", tc.errType, want, text)
+		}
+	}
+	empty := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		ErrorType: "response", HTTPStatus: 200, ErrorMessage: "finish_reason=stop"}
+	text, _ := renderModelCard("m", status.Down, empty, nil)
+	if want := "<p><b>Ответ модели</b></p><p>Итоговый текст отсутствует.</p>"; !strings.Contains(text, want) {
+		t.Fatalf("HTTP 200 with empty Response must say that the final text is missing:\n%s", text)
+	}
+
+	httpEmpty := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down, ErrorType: "http", HTTPStatus: 429}
+	text, _ = renderModelCard("m", status.Down, httpEmpty, nil)
+	if strings.Contains(text, "Ответ API") || strings.Contains(text, "Ответ модели") {
+		t.Fatalf("empty HTTP-error Response must omit the model/API answer section:\n%s", text)
+	}
+}
+
+// Диагностика пустого итогового ответа: только фактически доступные данные.
+// Ноль и отсутствующий finish_reason не выдумываются, непустой ответ не
+// подменяется диагностикой, HTTP и транспортные ошибки не превращаются в
+// «ответ модели».
+func TestModelCardEmptyResponseDiagnostics(t *testing.T) {
+	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		HTTPStatus: 200, ErrorType: "response", LatencyUS: ptr1(4_100_000),
+		OutputTokens: ptr1(64), ErrorMessage: "finish_reason=length"}
+	text, _ := renderModelCard("m", status.Down, last, nil)
+	for _, want := range []string{
+		"<p><b>Последний запрос</b></p><p>HTTP 200 · Latency 4.1s · Токенов ответа: 64 · Завершение: length</p>",
+		"<p><b>Ответ модели</b></p><p>Итоговый текст отсутствует.</p>",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q:\n%s", want, text)
+		}
+	}
+
+	last = storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		HTTPStatus: 200, ErrorType: "empty", LatencyUS: ptr1(4_100_000), ErrorMessage: "finish_reason=stop"}
+	text, _ = renderModelCard("m", status.Down, last, nil)
+	if strings.Contains(text, "Токенов ответа") {
+		t.Errorf("unknown output tokens must be omitted:\n%s", text)
+	}
+	if !strings.Contains(text, "Завершение: stop") || !strings.Contains(text, "Итоговый текст отсутствует.") {
+		t.Errorf("stop reason and missing final text must be shown without inventing a token limit:\n%s", text)
+	}
+
+	last = storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		HTTPStatus: 200, ErrorType: "empty", LatencyUS: ptr1(4_100_000), ErrorMessage: "empty generation"}
+	text, _ = renderModelCard("m", status.Down, last, nil)
+	if strings.Contains(text, "Токенов ответа") || strings.Contains(text, "Завершение") {
+		t.Errorf("absent diagnostics must not be invented:\n%s", text)
+	}
+	if !strings.Contains(text, "Итоговый текст отсутствует.") {
+		t.Errorf("missing final text remains factual:\n%s", text)
+	}
+
+	reasoning := "Let me think through this carefully..."
+	last = storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		HTTPStatus: 200, ErrorType: "response", LatencyUS: ptr1(4_100_000),
+		OutputTokens: ptr1(64), Response: reasoning}
+	text, _ = renderModelCard("m", status.Down, last, nil)
+	if !strings.Contains(text, "<p><b>Ответ модели</b></p><p>"+reasoning+"</p>") {
+		t.Errorf("reasoning in user content must stay verbatim:\n%s", text)
+	}
+	if strings.Contains(text, "Итоговый текст отсутствует.") || strings.Contains(text, "Токенов ответа") {
+		t.Errorf("nonempty response must not be replaced by diagnostics:\n%s", text)
+	}
+
+	last = storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		HTTPStatus: 429, ErrorType: "http", LatencyUS: ptr1(1_000_000), Response: "Upstream rate limit"}
+	text, _ = renderModelCard("m", status.Down, last, nil)
+	if !strings.Contains(text, "<p><b>Ответ API</b></p><p>Upstream rate limit</p>") {
+		t.Errorf("HTTP provider text must be preserved:\n%s", text)
+	}
+	if strings.Contains(text, "Итоговый текст отсутствует.") {
+		t.Errorf("HTTP error must not be shown as an empty model answer:\n%s", text)
+	}
+
+	last = storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		ErrorType: "timeout", LatencyUS: ptr1(3_000_000), ErrorMessage: "context deadline exceeded"}
+	text, _ = renderModelCard("m", status.Down, last, nil)
+	if !strings.Contains(text, "<p>Время до ошибки 3.0s</p>") {
+		t.Errorf("transport error timing must be preserved:\n%s", text)
+	}
+	if strings.Contains(text, "Ответ модели") || strings.Contains(text, "Итоговый текст отсутствует.") {
+		t.Errorf("transport error has no model answer section:\n%s", text)
+	}
+}
+
+// Поля без значения не выводятся вообще: ни N/A, ни пустых блоков.
+func TestModelDetailOmitsAbsentFields(t *testing.T) {
+	// timeout без HTTP-кода и latency: блока «Последний запрос» нет
+	last := storage.Check{ModelID: "m", Status: status.Down, ErrorType: "timeout", ErrorMessage: "deadline"}
+	text, _ := renderModelCard("m", status.Down, last, nil)
+	for _, bad := range []string{"Последний запрос", "N/A", "0001", "Последняя проверка:"} {
+		if strings.Contains(text, bad) {
+			t.Errorf("must not contain %q:\n%s", bad, text)
+		}
+	}
+	// нет истории — блока статистики нет
+	if strings.Contains(text, "За последние 24 часа") || strings.Contains(text, "Проверок:") {
+		t.Fatalf("no history must omit the 24h block:\n%s", text)
+	}
+	// Operational без latency: только дата проверки и статус
+	ok := storage.Check{ModelID: "m", At: time.Now(), Status: status.Operational}
+	text, _ = renderModelCard("m", status.Operational, ok, nil)
+	if strings.Contains(text, "Последний запрос") {
+		t.Fatalf("no latency, no request block:\n%s", text)
+	}
+}
+
+// Uptime не считает ⚪: знаменатель — только ok+down.
+func TestModelDetailUptimeExcludesUnknown(t *testing.T) {
+	base := time.Now().Add(-2 * time.Hour)
+	var checks []storage.Check
+	for i, st := range []status.Status{
+		status.Operational, status.Operational, status.Operational, status.Operational,
+		status.Operational, status.Operational, status.Operational,
+		status.Down, status.Down, status.Unknown,
+	} {
+		checks = append(checks, storage.Check{ModelID: "m", At: base.Add(time.Duration(i) * 15 * time.Minute), Status: st})
+	}
+	text, _ := renderModelCard("m", status.Operational, checks[len(checks)-1], checks)
+	for _, want := range []string{
+		"Uptime: 77.78%",
+		"Проверок: 10",
+		"🟢 Успешных: 7 · 🔴 Неудачных: 2 · ⚪ Нет данных: 1",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing %q in:\n%s", want, text)
@@ -138,110 +522,189 @@ func TestPanelPerfDegradedAndEmptyAndNoData(t *testing.T) {
 	}
 }
 
-func TestPanelEscapesProviderText(t *testing.T) {
-	models := []storage.Model{{ID: "m", Family: "M"}}
-	checks := map[string]storage.Check{
-		"m": {Status: status.Down, HTTPStatus: 500, ErrorType: "http", ErrorMessage: "<script>alert('x')</script>"},
+// Все проверки за 24 часа — ⚪: строки Uptime нет, счётчики остаются.
+func TestModelDetailUptimeAllUnknown(t *testing.T) {
+	checks := []storage.Check{
+		{ModelID: "m", At: time.Now(), Status: status.Unknown, ErrorType: "invalid"},
+		{ModelID: "m", At: time.Now(), Status: status.Unknown, ErrorType: "timeout"},
 	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
+	text, _ := renderModelCard("m", status.Unknown, checks[len(checks)-1], checks)
+	if strings.Contains(text, "Uptime:") {
+		t.Fatalf("no ok+down — no uptime line:\n%s", text)
+	}
+	for _, want := range []string{"Проверок: 2", "🟢 Успешных: 0 · 🔴 Неудачных: 0 · ⚪ Нет данных: 2"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in:\n%s", want, text)
+		}
+	}
+}
+
+// Ответ хранится дословно и экранируется перед отправкой.
+func TestModelDetailEscapesResponse(t *testing.T) {
+	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		ErrorType: "response", Response: "<script>alert('x')</script>"}
+	text, _ := renderModelCard("m", status.Down, last, nil)
 	if strings.Contains(text, "<script>") {
-		t.Fatal("raw HTML must be escaped")
+		t.Fatalf("raw HTML leaked:\n%s", text)
 	}
 	if !strings.Contains(text, "&lt;script&gt;") {
-		t.Fatalf("escaped text missing:\n%s", text)
+		t.Fatalf("escaped response missing:\n%s", text)
 	}
 }
 
-func TestPanelTruncatesLongError(t *testing.T) {
-	long := strings.Repeat("a", 200)
-	models := []storage.Model{{ID: "m", Family: "M"}}
-	checks := map[string]storage.Check{
-		"m": {Status: status.Down, HTTPStatus: 500, ErrorType: "http", ErrorMessage: long},
+// Длинный «Ответ» не обрезается молча: карточка в лимите, хвост — follow-up.
+func TestModelCardLongResponseSplit(t *testing.T) {
+	resp := strings.Repeat("a", 40000)
+	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		ErrorType: "http", HTTPStatus: 500, Response: resp}
+	card, followup := renderModelCard("m", status.Down, last, nil)
+	if l := utf8.RuneCountInString(card); l > maxRichMessage {
+		t.Fatalf("card must fit the rich limit, %d runes", l)
 	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
-	lineIdx := strings.Index(text, "🔴 <code>m</code> -")
-	line := text[lineIdx:]
-	if nl := strings.IndexByte(line, '\n'); nl >= 0 {
-		line = line[:nl]
+	if followup == "" {
+		t.Fatal("overflow must not be silently dropped")
 	}
-	if strings.Count(line, "a") > 24 {
-		t.Fatalf("long error not truncated: %s", line)
+	cardA := strings.Count(card, "a")
+	if got := cardA + utf8.RuneCountInString(followup); got != 40000 {
+		t.Fatalf("response data lost: %d of 40000 runes", got)
 	}
-	if !strings.HasSuffix(strings.TrimSpace(line), "...") {
-		t.Fatalf("truncation marker missing: %q", line)
+	if !strings.Contains(card, "<b>Ответ API</b>") {
+		t.Fatalf("answer head must stay in the card:\n%.200s", card)
 	}
 }
 
-func TestModelDetailFormat(t *testing.T) {
-	last := storage.Check{ModelID: "gpt-6-astra", At: mskTime(t, 16, 15, 3), Status: status.Operational,
-		HTTPStatus: 200, LatencyUS: ptr1(2_700_000), TTFTUS: ptr1(420_000), GenUS: ptr1(2_280_000),
-		TPS: ptrF(42.3), InputTokens: ptr1(154), OutputTokens: ptr1(96)}
-	base := time.Now().Add(-23 * time.Hour)
-	var checks []storage.Check
-	for i := 0; i < 144; i++ {
-		c := last
-		c.At = base.Add(time.Duration(i) * 6 * time.Minute)
-		c.LatencyUS = ptr1(2_900_000)
-		c.TPS = ptrF(45.7)
-		c.InputTokens, c.OutputTokens = nil, nil
-		if i == 100 {
-			c.Status = status.Down
-			c.HTTPStatus = 429
-			c.ErrorType = "http"
-			c.ErrorMessage = "Upstream rate limit"
-			c.LatencyUS, c.TPS, c.TTFTUS, c.GenUS = nil, nil, nil, nil
-		}
-		checks = append(checks, c)
+// Регрессия: спец-символы растут в 5–6 раз после
+// экранирования — бюджет должен считаться по экранированному тексту,
+// иначе карточка превышает лимит и не отправляется вовсе.
+func TestModelCardEscapableResponseSplitFitsLimit(t *testing.T) {
+	resp := strings.Repeat("&", 40000) // & → &amp; (×5)
+	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		ErrorType: "http", HTTPStatus: 500, Response: resp}
+	card, followup := renderModelCard("m", status.Down, last, nil)
+	if l := utf8.RuneCountInString(card); l > maxRichMessage {
+		t.Fatalf("card must fit the rich limit after escaping, %d runes", l)
 	}
-	text := RenderModelDetail("gpt-6-astra", status.Operational, last, checks)
-	for _, want := range []string{
-		"<b>gpt-6-astra</b> - 🟢 работает",
-		"Последняя проверка: 16.11.2026 16:15:03 MSK",
-		"HTTP: 200",
-		"Latency: 2.70s",
-		"TTFT: 0.42s",
-		"Generation time: 2.28s",
-		"TPS: 42.3",
-		"Input tokens: 154",
-		"Output tokens: 96",
-		"Uptime: 99.31%",
-		"Проверок: 144",
-		"Средний latency: 2.90s",
-		"Средний TPS: 45.7",
-		"HTTP 429 · Upstream rate limit",
+	if followup == "" {
+		t.Fatal("overflow must not be silently dropped")
+	}
+	amp := strings.Count(card, "&amp;") + strings.Count(followup, "&")
+	if amp != 40000 {
+		t.Fatalf("response data lost: %d of 40000 runes", amp)
+	}
+	if !strings.Contains(card, "<b>Ответ API</b>") {
+		t.Fatalf("answer head must stay in the card:\n%.200s", card)
+	}
+}
+
+// Единый словарь статусов: слова трёх статусов живут только в statusWordRu;
+// легенда панели, /help, заголовок карточки, строки моделей и подпись ошибок
+// строятся из него — любое расхождение ловится здесь.
+func TestStatusWordsSingleSource(t *testing.T) {
+	for st, want := range map[status.Status]string{
+		status.Operational: "Работает",
+		status.Down:        "Недоступна",
+		status.Unknown:     "Нет данных",
 	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("detail missing %q in:\n%s", want, text)
+		if got := statusWordRu(st); got != want {
+			t.Errorf("statusWordRu(%s) = %q, want %q", st, got, want)
 		}
 	}
-	if strings.Contains(text, "N/A") {
-		t.Errorf("unexpected N/A in fully populated detail:\n%s", text)
+	if got := panelLegend(); got != "🟢 Работает · 🔴 Недоступна · ⚪ Нет данных" {
+		t.Errorf("panel legend = %q", got)
+	}
+	// /help показывает ту же легенду — без завершающей точки, как панель
+	help := RenderHelp(15 * time.Minute)
+	if !strings.Contains(help, "Статусы: "+panelLegend()+"\n") {
+		t.Errorf("help legend must equal the panel legend with no trailing period:\n%s", help)
+	}
+	// подпись «Нет данных» у ошибок и строки Unknown — тоже из словаря
+	if got := shortErrorLabel(storage.Check{}); got != statusWordRu(status.Unknown) {
+		t.Errorf("shortErrorLabel default = %q, want %q", got, statusWordRu(status.Unknown))
+	}
+	line := modelLine(storage.Model{ID: "m-un", Family: "M"}, storage.Check{Status: status.Unknown})
+	if !strings.Contains(line, stBtn("m-un", statusWordRu(status.Unknown))) {
+		t.Errorf("unknown line must use the dictionary word:\n%s", line)
+	}
+	card, _ := renderModelCard("m", status.Down, storage.Check{}, nil)
+	if !strings.Contains(card, "🔴 <code>m</code> - "+statusWordRu(status.Down)) {
+		t.Errorf("card header must use the dictionary word:\n%s", card)
 	}
 }
 
-func TestModelDetailNoHistory(t *testing.T) {
-	last := storage.Check{ModelID: "x", At: time.Now().Add(-time.Hour), Status: status.Down,
-		HTTPStatus: 503, ErrorType: "http", ErrorMessage: "Service Unavailable"}
-	text := RenderModelDetail("x", status.Down, last, nil)
-	if strings.Contains(text, "Uptime:") {
-		t.Fatalf("no uptime without history:\n%s", text)
+// Заголовок карточки: model ID в <code>, как в строках панели, не в жирном.
+func TestModelCardHeaderCodeID(t *testing.T) {
+	last := storage.Check{ModelID: "deepseek-v4.1-flash", At: time.Now(), Status: status.Operational}
+	card, _ := renderModelCard("deepseek-v4.1-flash", status.Operational, last, nil)
+	if !strings.Contains(card, "<p>🟢 <code>deepseek-v4.1-flash</code> - Работает</p>") {
+		t.Fatalf("header must wrap model ID in <code>:\n%s", card)
 	}
-	if !strings.Contains(text, "Проверок: 0") {
-		t.Fatalf("checks counter missing:\n%s", text)
+	if strings.Contains(card, "<p>🟢 <b>") {
+		t.Fatalf("header must not use bold for model ID:\n%s", card)
 	}
-	if !strings.Contains(text, "HTTP 503 · Service Unavailable") {
-		t.Fatalf("last error missing:\n%s", text)
+	// экранирование сохраняется и в заголовке
+	card, _ = renderModelCard("x<y>", status.Down, storage.Check{}, nil)
+	if !strings.Contains(card, "<p>🔴 <code>x&lt;y&gt;</code> - Недоступна</p>") {
+		t.Fatalf("header must escape model ID:\n%s", card)
 	}
 }
 
-func TestModelDetailErrorWithNA(t *testing.T) {
-	last := storage.Check{ModelID: "x", At: time.Now(), Status: status.Down, HTTPStatus: 0,
-		ErrorType: "timeout", ErrorMessage: "deadline"}
-	text := RenderModelDetail("x", status.Down, last, nil)
-	if !strings.Contains(text, "TPS: N/A") || !strings.Contains(text, "Latency: N/A") || !strings.Contains(text, "HTTP: N/A") {
-		t.Fatalf("N/A metrics expected:\n%s", text)
+// Единая точность времени в карточке: один знак после запятой и у Latency,
+// и у «Времени до ошибки»; различие только в названии метрики.
+func TestModelCardLatencySingleDecimal(t *testing.T) {
+	// HTTP-ответ получен, содержимое не прошло проверку — всё равно Latency
+	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		HTTPStatus: 200, ErrorType: "response", LatencyUS: ptr1(1_220_000)}
+	text, _ := renderModelCard("m", status.Down, last, nil)
+	if !strings.Contains(text, "<p>HTTP 200 · Latency 1.2s</p>") {
+		t.Errorf("HTTP 200 with unexpected content must show Latency 1.2s:\n%s", text)
+	}
+	// HTTP-ответа не было (timeout) — «Время до ошибки» из измеренной длительности
+	last = storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
+		ErrorType: "timeout", LatencyUS: ptr1(3_000_000)}
+	text, _ = renderModelCard("m", status.Down, last, nil)
+	if !strings.Contains(text, "<p>Время до ошибки 3.0s</p>") {
+		t.Errorf("timeout without HTTP response must show Время до ошибки 3.0s:\n%s", text)
+	}
+	// двух знаков после запятой нет нигде
+	for _, bad := range []string{"1.22s", "3.00s", ".00s"} {
+		if strings.Contains(text, bad) {
+			t.Errorf("single decimal expected, found %q:\n%s", bad, text)
+		}
 	}
 }
+
+// Примеры уведомлений в README соответствуют фактическому формату строк:
+// разделитель после model ID — ASCII « - », не «·».
+func TestReadmeNotificationExamples(t *testing.T) {
+	raw, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "- 🔴 `model-id` - `HTTP 429`") {
+		t.Errorf("down notification example must use the actual ` - ` separator")
+	}
+	if !strings.Contains(text, "- 🟢 `model-id` - Восстановилась") {
+		t.Errorf("recovery notification example must use the actual ` - ` separator")
+	}
+	if strings.Contains(text, "`model-id` · `HTTP 429`") || strings.Contains(text, "`model-id` · Восстановилась") {
+		t.Errorf("notification examples must not use the `·` separator after model ID")
+	}
+}
+
+// Root-меню подписок: фраза без искусственного переноса внутри предложения —
+// перенос строк отдаёт клиенту Telegram.
+func TestSubscribeRootNoManualBreak(t *testing.T) {
+	text, _ := RenderSubscribeRoot(nil, nil, nil)
+	if !strings.Contains(text, "Уведомления приходят только по выбранным моделям при смене их состояния. Панель /status не зависит от подписок.") {
+		t.Fatalf("sentence must be whole, no manual line break:\n%s", text)
+	}
+	if strings.Contains(text, "моделям\nпри") {
+		t.Fatalf("no manual break inside the sentence:\n%s", text)
+	}
+}
+
+// --- Меню подписок (не изменилось) и /help ---
 
 func TestSubscribePanel(t *testing.T) {
 	models := []storage.Model{
@@ -253,7 +716,6 @@ func TestSubscribePanel(t *testing.T) {
 	draft := map[string]bool{"gpt-6-astra": true, "glm-5.3": true}
 	saved := map[string]bool{"glm-5.3-prime": true}
 
-	// корневой экран: семейства + масс-операции + Сохранить/Отменить
 	text, kb := RenderSubscribeRoot(models, draft, saved)
 	if !strings.Contains(text, "OpenTW - Настройка уведомлений") {
 		t.Fatalf("header missing:\n%s", text)
@@ -261,51 +723,32 @@ func TestSubscribePanel(t *testing.T) {
 	if !strings.Contains(text, "Выбрано: 2 из 4 (изменения: +2 -1)") {
 		t.Fatalf("selection counter with diff wrong:\n%s", text)
 	}
-	if strings.Contains(text, "gpt-6-astra") {
-		t.Fatalf("root text must not list models:\n%s", text)
-	}
 	if len(kb.InlineKeyboard) != 3 { // пары семейств + масс + Сохранить/Отменить
 		t.Fatalf("root rows = %d: %+v", len(kb.InlineKeyboard), kb.InlineKeyboard)
 	}
-	famRow := kb.InlineKeyboard[0]
-	if len(famRow) != 2 || famRow[0].Text != "GPT 1/2" || famRow[0].CallbackData != "f:GPT" ||
+	if famRow := kb.InlineKeyboard[0]; len(famRow) != 2 || famRow[0].Text != "GPT 1/2" || famRow[0].CallbackData != "f:GPT" ||
 		famRow[1].Text != "GLM 1/2" || famRow[1].CallbackData != "f:GLM" {
 		t.Fatalf("family row = %+v", famRow)
 	}
-	massRow := kb.InlineKeyboard[1]
-	if len(massRow) != 2 || massRow[0].Text != "Выбрать всё" || massRow[0].CallbackData != "all" ||
-		massRow[1].Text != "Снять всё" || massRow[1].CallbackData != "none" {
+	if massRow := kb.InlineKeyboard[1]; len(massRow) != 2 || massRow[0].CallbackData != "all" || massRow[1].CallbackData != "none" {
 		t.Fatalf("mass row = %+v", massRow)
 	}
-	lastRow := kb.InlineKeyboard[2]
-	if len(lastRow) != 2 || lastRow[0].Text != "Сохранить" || lastRow[0].CallbackData != "save" ||
-		lastRow[1].Text != "Отменить" || lastRow[1].CallbackData != "cancel" {
+	if lastRow := kb.InlineKeyboard[2]; len(lastRow) != 2 || lastRow[0].CallbackData != "save" || lastRow[1].CallbackData != "cancel" {
 		t.Fatalf("save row = %+v", lastRow)
 	}
 
-	// экран семейства GPT: модели столбцом, масс-операции семейства, Назад/Отменить/Сохранить
 	text, kb = RenderSubscribeFamily("GPT", models, draft, saved)
 	if !strings.Contains(text, "<b>GPT</b>") || !strings.Contains(text, "Выбрано: 1 из 2 (изменения: +1)") {
 		t.Fatalf("family text wrong:\n%s", text)
 	}
-	if len(kb.InlineKeyboard) != 4 { // 2 модели + масс + навигация
+	if len(kb.InlineKeyboard) != 4 {
 		t.Fatalf("family rows = %d: %+v", len(kb.InlineKeyboard), kb.InlineKeyboard)
 	}
-	if kb.InlineKeyboard[0][0].Text != "+ gpt-6-astra" || kb.InlineKeyboard[0][0].CallbackData != "s:gpt-6-astra" {
-		t.Fatalf("first model button = %+v", kb.InlineKeyboard[0][0])
-	}
-	if kb.InlineKeyboard[1][0].Text != "gpt-6.1-sol" || kb.InlineKeyboard[1][0].CallbackData != "s:gpt-6.1-sol" {
-		t.Fatalf("second model button = %+v", kb.InlineKeyboard[1][0])
-	}
-	mass := kb.InlineKeyboard[2]
-	if len(mass) != 2 || mass[0].Text != "Выбрать всё" || mass[0].CallbackData != "fa:GPT" ||
-		mass[1].Text != "Снять всё" || mass[1].CallbackData != "fn:GPT" {
-		t.Fatalf("family mass row = %+v", mass)
+	if b := kb.InlineKeyboard[0][0]; b.Text != "+ gpt-6-astra" || b.CallbackData != "s:gpt-6-astra" {
+		t.Fatalf("first model button = %+v", b)
 	}
 	nav := kb.InlineKeyboard[3]
-	if len(nav) != 3 || nav[0].Text != "Назад" || nav[0].CallbackData != "back" ||
-		nav[1].Text != "Отменить" || nav[1].CallbackData != "cancel" ||
-		nav[2].Text != "Сохранить" || nav[2].CallbackData != "save" {
+	if len(nav) != 3 || nav[0].CallbackData != "back" || nav[1].CallbackData != "cancel" || nav[2].CallbackData != "save" {
 		t.Fatalf("nav row = %+v", nav)
 	}
 }
@@ -336,392 +779,26 @@ func TestHelp(t *testing.T) {
 			t.Errorf("help missing %q:\n%s", cmd, text)
 		}
 	}
-	if strings.Contains(text, "/models") || strings.Contains(text, "/errors") {
+	if strings.Contains(text, "/models") || strings.Contains(text, "/errors") || strings.Contains(text, "/digest") {
 		t.Error("help must not advertise commands that do not exist")
 	}
 }
 
-// Модель ни разу не проверялась (zero time): вместо бессмысленной даты
-// должен показываться N/A.
-func TestModelDetailZeroTimeShowsNA(t *testing.T) {
-	text := RenderModelDetail("x", status.Unknown, storage.Check{}, nil)
-	if !strings.Contains(text, "Последняя проверка: N/A") {
-		t.Fatalf("zero time must render as N/A:\n%s", text)
-	}
-	if strings.Contains(text, "0001") {
-		t.Fatalf("meaningless date leaked:\n%s", text)
-	}
-}
-
-// Сводка состояния сразу после заголовка, легенда — последней строкой (AC-8).
-func TestPanelSummaryAndLegend(t *testing.T) {
-	models := []storage.Model{
-		{ID: "a", Family: "A"},
-		{ID: "b", Family: "A"},
-		{ID: "c", Family: "A"},
-	}
-	checks := map[string]storage.Check{
-		"a": {Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)},
-		"b": {Status: status.Degraded, HTTPStatus: 429, ErrorType: "http", ErrorMessage: "rate limit"},
-		"c": {Status: status.Down, HTTPStatus: 500, ErrorType: "http", ErrorMessage: "boom"},
-	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
-	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
-	if lines[2] != "Модели: 1 🟢 · 1 🟡 · 1 🔴" {
-		t.Fatalf("summary line = %q\n%s", lines[2], text)
-	}
-	last := lines[len(lines)-1]
-	if last != "🟢 работает · 🟡 нестабильно · 🔴 недоступна · ⚪ нет данных" {
-		t.Fatalf("legend must be the last line: %q", last)
-	}
-}
-
-// Все проверенные ⚪: сводка без нотифицируемых + предупреждение (AC-12).
-func TestPanelAllUnknownWarnsMonitor(t *testing.T) {
-	models := []storage.Model{{ID: "a", Family: "A"}, {ID: "b", Family: "A"}}
-	checks := map[string]storage.Check{
-		"a": {Status: status.Unknown, ErrorType: "http", HTTPStatus: 401, ErrorMessage: "Invalid API key"},
-		"b": {Status: status.Unknown, ErrorType: "timeout", ErrorMessage: "deadline"},
-	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
-	if !strings.Contains(text, "Модели: 2 ⚪") {
-		t.Fatalf("summary must show only unknown:\n%s", text)
-	}
-	if !strings.Contains(text, "⚠ Монитор не может проверить модели") {
-		t.Fatalf("monitor warning missing:\n%s", text)
-	}
-	if !strings.Contains(text, "⚪ <code>a</code> - ошибка монитора") {
-		t.Fatalf("unknown model line:\n%s", text)
-	}
-}
-
-// До первого цикла панель честна: без «Обновлено» (AC-11).
-func TestPanelFirstCycle(t *testing.T) {
-	models := []storage.Model{{ID: "a", Family: "A"}}
-	text := RenderStatusPanel(models, nil, time.Now(), time.Now(), 15*time.Minute)
-	if !strings.Contains(text, "Первый цикл проверки выполняется - панель обновится автоматически") {
-		t.Fatalf("first-cycle line missing:\n%s", text)
-	}
-	if strings.Contains(text, "Обновлено:") || strings.Contains(text, "Следующая проверка:") {
-		t.Fatalf("no times before the first cycle:\n%s", text)
-	}
-	if !strings.Contains(text, "⚪ <code>a</code> - нет данных") {
-		t.Fatalf("unchecked model line:\n%s", text)
-	}
-	if !strings.Contains(text, "🟢 работает · 🟡 нестабильно · 🔴 недоступна · ⚪ нет данных") {
-		t.Fatalf("legend must stay:\n%s", text)
-	}
-}
-
-// Порядок строк панели — порядок конфигурации при любом сочетании статусов (AC-9).
-func TestPanelOrderFollowsConfig(t *testing.T) {
-	models := []storage.Model{
-		{ID: "m1", Family: "F1"},
-		{ID: "m2", Family: "F1"},
-		{ID: "m3", Family: "F2"},
-	}
-	checks := map[string]storage.Check{
-		"m3": {Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)},
-		"m1": {Status: status.Down, HTTPStatus: 503, ErrorType: "http", ErrorMessage: "x"},
-		"m2": {Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)},
-	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
-	i1 := strings.Index(text, "<code>m1</code>")
-	i2 := strings.Index(text, "<code>m2</code>")
-	i3 := strings.Index(text, "<code>m3</code>")
-	if !(i1 < i2 && i2 < i3) {
-		t.Fatalf("config order broken: %d %d %d\n%s", i1, i2, i3, text)
-	}
-}
-
-// Дата в «Обновлено» + интервал в подвале (D8, AC-21).
-func TestPanelDateAndInterval(t *testing.T) {
-	models := []storage.Model{{ID: "a", Family: "A"}}
-	checks := map[string]storage.Check{"a": {Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)}}
-	text := RenderStatusPanel(models, checks, mskTime(t, 16, 15, 3), mskTime(t, 16, 30, 0), 15*time.Minute)
-	if !strings.Contains(text, "Обновлено: 16.11.2026 16:15:03 MSK") {
-		t.Fatalf("date missing:\n%s", text)
-	}
-	if !strings.Contains(text, "Следующая проверка: 16:30:00 MSK (интервал 15 мин)") {
-		t.Fatalf("interval missing:\n%s", text)
-	}
-	text = RenderStatusPanel(models, checks, time.Now(), time.Now(), 90*time.Minute)
-	if !strings.Contains(text, "(интервал 1ч 30м)") {
-		t.Fatalf("interval 90m formatting:\n%s", text)
-	}
-}
-
-// Полный список из config.example.yaml: все 25 моделей, ≤ 4096 символов (AC-10/22).
-func TestPanelFullExampleConfigFitsTelegram(t *testing.T) {
-	raw, err := os.ReadFile("../../config.example.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cfg struct {
-		Models []struct {
-			Family string   `yaml:"family"`
-			IDs    []string `yaml:"ids"`
-		} `yaml:"models"`
-	}
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		t.Fatal(err)
-	}
-	var models []storage.Model
-	for _, fam := range cfg.Models {
-		for _, id := range fam.IDs {
-			models = append(models, storage.Model{ID: id, Family: fam.Family})
-		}
-	}
-	if len(models) != 25 {
-		t.Fatalf("example config must hold 25 models, got %d", len(models))
-	}
-	checks := map[string]storage.Check{}
-	for i, m := range models {
-		c := storage.Check{Status: status.Operational, HTTPStatus: 200,
-			LatencyUS: ptr1(int64(2_000_000 + i*100_000)), TPS: ptrF(40.0 + float64(i))}
-		if i%7 == 0 {
-			c = storage.Check{Status: status.Down, HTTPStatus: 503, ErrorType: "http", ErrorMessage: "No available accounts. Please retry."}
-		}
-		checks[m.ID] = c
-	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
-	if l := len([]rune(text)); l > 4096 {
-		t.Fatalf("panel too long: %d runes", l)
-	}
-	for _, m := range models {
-		if !strings.Contains(text, "<code>"+m.ID+"</code>") {
-			t.Fatalf("model %s missing from panel", m.ID)
-		}
-	}
-}
-
-// Флэппинг-наблюдаемость: переключения за 24ч и последнее переключение (§5.1).
-func TestModelDetailFlapping(t *testing.T) {
-	base := time.Now().Add(-2 * time.Hour)
-	checks := make([]storage.Check, 0, 4)
-	for i, st := range []status.Status{status.Operational, status.Down, status.Operational, status.Down} {
-		checks = append(checks, storage.Check{
-			ModelID: "m", At: base.Add(time.Duration(i) * 15 * time.Minute),
-			Status: st, HTTPStatus: 200,
-		})
-	}
-	text := RenderModelDetail("m", status.Down, checks[len(checks)-1], checks)
-	if !strings.Contains(text, "Переключений состояния: 3") {
-		t.Fatalf("switch count missing:\n%s", text)
-	}
-	if !strings.Contains(text, "Последнее переключение: "+fmtDateClockMSK(base.Add(45*time.Minute))+" MSK") {
-		t.Fatalf("last switch time missing:\n%s", text)
-	}
-	if !strings.Contains(text, "Среднее пребывание в статусе: 15 мин") {
-		t.Fatalf("mean dwell missing:\n%s", text)
-	}
-}
-
-// Uptime не считает ⚪ за аптайм; количество без данных названо (D11).
-func TestUptimeExcludesUnknown(t *testing.T) {
-	base := time.Now().Add(-2 * time.Hour)
-	var checks []storage.Check
-	for i, st := range []status.Status{
-		status.Operational, status.Operational, status.Operational, status.Operational,
-		status.Operational, status.Operational, status.Operational,
-		status.Down, status.Down, status.Unknown,
-	} {
-		checks = append(checks, storage.Check{ModelID: "m", At: base.Add(time.Duration(i) * 15 * time.Minute), Status: st})
-	}
-	text := RenderModelDetail("m", status.Operational, checks[len(checks)-1], checks)
-	if !strings.Contains(text, "Uptime: 77.78%") {
-		t.Fatalf("uptime must be 7/9 without unknown:\n%s", text)
-	}
-	if !strings.Contains(text, "Без данных (монитор): 1") {
-		t.Fatalf("unknown count line missing:\n%s", text)
-	}
-}
-
-// /help: легенда, смысл метрик, путь отключения надоевшей модели (AC-20).
+// /help: новая легенда трёх статусов и настраиваемый интервал.
 func TestHelpContent(t *testing.T) {
 	text := RenderHelp(15 * time.Minute)
 	for _, want := range []string{
-		"🟢 работает · 🟡 нестабильно · 🔴 недоступна · ⚪ нет данных",
-		"одного проверочного запроса",
+		"🟢 Работает · 🔴 Недоступна · ⚪ Нет данных",
+		"каждые 15 мин",
 		"Отключить надоевшую модель",
-		"/status model-id",
+		"Нажатие на ошибку в панели или уведомлении открывает карточку модели",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("help missing %q:\n%s", want, text)
 		}
 	}
-	for _, bad := range []string{"/models", "/errors", "/digest"} {
-		if strings.Contains(text, bad) {
-			t.Errorf("help must not advertise %q", bad)
-		}
-	}
-}
-
-// D13: текст ошибки шлюза в 200-ответе виден и в строке панели (Rev-6).
-func TestPanelEmptyWithGatewayError(t *testing.T) {
-	models := []storage.Model{{ID: "m", Family: "M"}}
-	checks := map[string]storage.Check{
-		"m": {Status: status.Degraded, HTTPStatus: 200, ErrorType: "empty",
-			ErrorMessage: "No available accounts. Please retry later."},
-	}
-	text := RenderStatusPanel(models, checks, time.Now(), time.Now(), 15*time.Minute)
-	if !strings.Contains(text, "🟡 <code>m</code> - HTTP 200 · No available account...") {
-		t.Fatalf("gateway error must surface in the panel line:\n%s", text)
-	}
-	if strings.Contains(text, "пустая генерация") {
-		t.Fatalf("misleading empty-generation label when a real error exists:\n%s", text)
-	}
-}
-
-// --- Этап 7 ---
-
-// 7.1: длинная ошибка провайдера не раздувает детальную страницу за лимит
-// Telegram 4096 — ответ пользователю гарантирован.
-func TestModelDetailErrorTextCapped(t *testing.T) {
-	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
-		HTTPStatus: 503, ErrorType: "http",
-		ErrorMessage: strings.Repeat("но<bws&>amp; ", 4000)} // 40к рун с HTML-символами
-	text := RenderModelDetail("m", status.Down, last, nil)
-	if l := len([]rune(text)); l > 4096 {
-		t.Fatalf("detail must fit Telegram limit, %d runes:\n%.300s…", l, text)
-	}
-	if !strings.Contains(text, "HTTP 503") {
-		t.Fatalf("error head must survive capping:\n%s", text)
-	}
-	if !utf8.ValidString(text) {
-		t.Fatal("capping must not produce invalid UTF-8")
-	}
-	if strings.HasSuffix(strings.TrimSpace(text), "&") || entityTail.MatchString(strings.TrimSpace(text)) {
-		t.Fatal("capping must not cut an HTML entity in half (Telegram 400)")
-	}
-}
-
-// entityTail — оборванная entity на конце строки (&am без «;»).
-var entityTail = regexp.MustCompile(`&[a-zA-Z0-9#]{1,7}$`)
-
-// 7.3: детальные отметки времени несут дату — 24-часовое окно пересекает
-// полночь, одно время суток вводит в заблуждение.
-func TestModelDetailTimestampsHaveDate(t *testing.T) {
-	last := storage.Check{ModelID: "m", At: mskTime(t, 16, 15, 3), Status: status.Down,
-		HTTPStatus: 503, ErrorType: "http", ErrorMessage: "Service Unavailable"}
-	checks := []storage.Check{
-		{ModelID: "m", At: mskTime(t, 14, 0, 0), Status: status.Operational, HTTPStatus: 200},
-		last,
-	}
-	text := RenderModelDetail("m", status.Down, last, checks)
-	for _, want := range []string{
-		"Последняя проверка: 16.11.2026 16:15:03 MSK",
-		"Последнее переключение: 16.11.2026 16:15:03 MSK",
-		"Последняя ошибка\n16.11.2026 16:15:03 MSK · HTTP 503 · Service Unavailable",
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("date missing in %q:\n%s", want, text)
-		}
-	}
-}
-
-// 7.3: Degraded виден в статистике 24ч отдельной строкой, а не проваливается
-// между «успешными» и «неудачными».
-func TestStatsCountDegraded(t *testing.T) {
-	base := time.Now().Add(-2 * time.Hour)
-	var checks []storage.Check
-	for i, st := range []status.Status{
-		status.Operational, status.Degraded, status.Degraded, status.Down,
-	} {
-		checks = append(checks, storage.Check{ModelID: "m", At: base.Add(time.Duration(i) * 15 * time.Minute), Status: st, HTTPStatus: 200})
-	}
-	text := RenderModelDetail("m", status.Down, checks[len(checks)-1], checks)
-	if !strings.Contains(text, "Нестабильных: 2") {
-		t.Fatalf("degraded count missing:\n%s", text)
-	}
-	if !strings.Contains(text, "	Uptime: 25.00%") && !strings.Contains(text, "Uptime: 25.00%") {
-		t.Fatalf("uptime must stay (1 op)/(4-0 known) = 25%%:\n%s", text)
-	}
-}
-
-// 7.3: переключения состояния не считают ⚪ — это слепота монитора,
-// а не смена состояния модели.
-func TestFlappingIgnoresUnknown(t *testing.T) {
-	base := time.Now().Add(-2 * time.Hour)
-	var checks []storage.Check
-	for i, st := range []status.Status{
-		status.Operational, status.Unknown, status.Operational,
-		status.Down, status.Unknown, status.Down,
-	} {
-		checks = append(checks, storage.Check{ModelID: "m", At: base.Add(time.Duration(i) * 15 * time.Minute), Status: st, HTTPStatus: 200})
-	}
-	n, lastAt, _ := flappingStats(checks)
-	if n != 1 {
-		t.Fatalf("only the real 🟢→🔴 switch must count, got %d", n)
-	}
-	want := checks[3].At
-	if !lastAt.Equal(want) {
-		t.Fatalf("last switch = %v, want %v", lastAt, want)
-	}
-}
-
-// 7.3: единое форматирование длительностей — один словарь на все поверхности.
-func TestDurationHuman(t *testing.T) {
-	for _, tc := range []struct {
-		d    time.Duration
-		want string
-	}{
-		{0, "0с"},
-		{45 * time.Second, "45с"},
-		{30 * time.Minute, "30м"},
-		{90 * time.Minute, "1ч 30м"},
-		{26 * time.Hour, "26ч 00м"},
-	} {
-		if got := durationHuman(tc.d); got != tc.want {
-			t.Errorf("durationHuman(%v) = %q, want %q", tc.d, got, tc.want)
-		}
-	}
-}
-
-// 7.3: единый форматтер заголовков ошибок — одна подпись на тип ошибки для
-// панели, сводок, дайджеста и деталей.
-func TestErrorHeadSingle(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		c    storage.Check
-		want string
-	}{
-		{"http", storage.Check{ErrorType: "http", HTTPStatus: 429, ErrorMessage: "Upstream rate limit"}, "HTTP 429 · Upstream rate limit"},
-		{"http-empty-body", storage.Check{ErrorType: "http", HTTPStatus: 502}, "HTTP 502"},
-		{"timeout", storage.Check{ErrorType: "timeout"}, "Timeout"},
-		{"connrefused", storage.Check{ErrorType: "connrefused"}, "Connection refused"},
-		{"empty-gen", storage.Check{ErrorType: "empty", ErrorMessage: "empty generation"}, "HTTP 200 · пустая генерация"},
-		{"empty-gateway", storage.Check{ErrorType: "empty", HTTPStatus: 200, ErrorMessage: "No available accounts"}, "HTTP 200 · No available account..."},
-		{"invalid", storage.Check{ErrorType: "invalid"}, "Некорректный ответ API"},
-		{"perf", storage.Check{ErrorType: "perf"}, "деградация производительности"},
-	} {
-		if got := errorHead(tc.c); got != tc.want {
-			t.Errorf("%s: errorHead = %q, want %q", tc.name, got, tc.want)
-		}
-	}
-	if got := detailErrorLine(storage.Check{ErrorType: "invalid"}); got != "Некорректный ответ API" {
-		t.Errorf("detailErrorLine(invalid) = %q", got)
-	}
-	if got := detailErrorLine(storage.Check{ErrorType: "empty", ErrorMessage: "empty generation"}); got != "HTTP 200 · пустая генерация" {
-		t.Errorf("detailErrorLine(empty) = %q, want unified ' · ' separator", got)
-	}
-}
-
-// 7.4: /help не обещает «каждые 15 минут» при настраиваемом интервале.
-func TestHelpDynamicInterval(t *testing.T) {
-	text := RenderHelp(15 * time.Minute)
-	if !strings.Contains(text, "каждые 15 мин") {
-		t.Fatalf("help must state the configured interval:\n%s", text)
-	}
-	if strings.Contains(text, "каждые 15 минут") {
-		t.Fatalf("hardcoded interval must be gone:\n%s", text)
-	}
 	text = RenderHelp(0) // интервал неизвестен — нейтральная формулировка
 	if !strings.Contains(text, "каждый цикл проверки") {
 		t.Fatalf("neutral wording expected:\n%s", text)
-	}
-	text = RenderHelp(30 * time.Minute)
-	if !strings.Contains(text, "каждые 30 мин") {
-		t.Fatalf("configured interval must be reflected:\n%s", text)
 	}
 }

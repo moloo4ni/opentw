@@ -5,26 +5,31 @@ import (
 	"context"
 	"database/sql"
 	"embed"
-	"errors"
 	"fmt"
-	"io/fs"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-//go:embed migrations/*.sql
-var migrationsFS embed.FS
+//go:embed schema.sql
+var schemaFS embed.FS
+
+// schemaVersion — маркер актуальности схемы (PRAGMA user_version в заголовке
+// файла). Отделяет корректную базу от старой/чужой без системы версионирования:
+// миграций нет, схема одна, при изменении schema.sql число меняется.
+const schemaVersion = 1
 
 // Store wraps the SQLite database.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
 }
 
-// Open opens (and migrates) the database at path.
+// Open opens the database at path. Пустая (несуществующая) база создаётся с
+// единственной актуальной схемой; корректная существующая используется как
+// есть; старая несовместимая отвергается ошибкой — без удаления и без
+// попытки тихо «долечить» (решение о чистой базе остаётся за оператором).
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(1)")
 	if err != nil {
@@ -32,12 +37,8 @@ func Open(path string) (*Store, error) {
 	}
 	// Один процесс, один писатель: сериализация соединений убирает SQLITE_BUSY.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := s.assertSchema(); err != nil {
+	s := &Store{db: db, path: path}
+	if err := s.initSchema(); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -47,71 +48,46 @@ func Open(path string) (*Store, error) {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) migrate() error {
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
-		return fmt.Errorf("storage: migrate: %w", err)
+// initSchema применяет schema.sql к пустой базе и ставит маркер user_version
+// в той же транзакции. База с маркером текущей версии не трогается вовсе
+// (повторный запуск ничего не пересоздаёт); база с таблицами, но без маркера
+// — историческая, честно отвергается.
+func (s *Store) initSchema() error {
+	var v int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return fmt.Errorf("storage: open database %s: %w", s.path, err)
 	}
-	var current int
-	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
-		return fmt.Errorf("storage: migrate: %w", err)
+	if v == schemaVersion {
+		return nil
 	}
-	names, err := fs.Glob(migrationsFS, "migrations/*.sql")
+	if v > schemaVersion {
+		return fmt.Errorf("storage: database schema version %d is newer than this binary supports (%d): use a matching opentw binary", v, schemaVersion)
+	}
+	var tables int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`).Scan(&tables); err != nil {
+		return fmt.Errorf("storage: schema: %w", err)
+	}
+	if tables > 0 {
+		return fmt.Errorf("storage: database at %q is not compatible with this opentw version (legacy or unknown schema): start with a clean database - remove the file together with its -wal/-shm sidecars after stopping the instance, or point sqlite_path to a new location", s.path)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
 	if err != nil {
-		return fmt.Errorf("storage: migrate: %w", err)
+		return fmt.Errorf("storage: schema: %w", err)
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		// Версия — из числового префикса имени, а не позиции в списке:
-		// вставка/удаление файла не должна сдвигать версии чужих миграций (I6).
-		base := strings.TrimPrefix(name, "migrations/")
-		cut := strings.IndexByte(base, '_')
-		if cut <= 0 {
-			return fmt.Errorf("storage: migrate: bad migration name %q (want NNN_desc.sql)", name)
-		}
-		version, err := strconv.Atoi(base[:cut])
-		if err != nil {
-			return fmt.Errorf("storage: migrate: bad migration name %q (want NNN_desc.sql)", name)
-		}
-		if version <= current {
-			continue
-		}
-		body, err := migrationsFS.ReadFile(name)
-		if err != nil {
-			return fmt.Errorf("storage: migrate: %w", err)
-		}
-		tx, err := s.db.Begin()
-		if err != nil {
-			return fmt.Errorf("storage: migrate: %w", err)
-		}
-		if _, err := tx.Exec(string(body)); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("storage: migrate %s: %w", name, err)
-		}
-		if _, err := tx.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("storage: migrate %s: %w", name, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("storage: migrate %s: %w", name, err)
-		}
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("storage: schema: %w", err)
 	}
-	return nil
-}
-
-// assertSchema защищает от баз интерим-сборок: CREATE TABLE IF NOT EXISTS
-// пропускает чужую форму таблицы, а рантайм упал бы «no such column» позже.
-func (s *Store) assertSchema() error {
-	for _, col := range []string{"chat_id", "sent_at", "attempts", "next_attempt_at"} {
-		var one int
-		err := s.db.QueryRow(`SELECT 1 FROM pragma_table_info('notification_outbox') WHERE name = ?`, col).Scan(&one)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("storage: notification_outbox lacks column %q (legacy interim database? restore from a consistent backup)", col)
-		}
-		if err != nil {
-			return fmt.Errorf("storage: schema check: %w", err)
-		}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+		return fmt.Errorf("storage: schema: %w", err)
 	}
-	return nil
+	// параметризовать PRAGMA нельзя — но schemaVersion это int-константа
+	if _, err := tx.ExecContext(ctx, `PRAGMA user_version = `+strconv.Itoa(schemaVersion)); err != nil {
+		return fmt.Errorf("storage: schema: %w", err)
+	}
+	return tx.Commit()
 }
 
 // BackupTo writes a consistent snapshot of the (possibly live WAL) database

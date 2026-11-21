@@ -2,6 +2,8 @@ package storage
 
 import (
 	"database/sql"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -34,9 +36,157 @@ func TestOpenIdempotent(t *testing.T) {
 	s1.Close()
 	s2, err := Open(path)
 	if err != nil {
-		t.Fatalf("reopen + migrate: %v", err)
+		t.Fatalf("reopen: %v", err)
 	}
 	s2.Close()
+}
+
+// Свежая (несуществующая) база создаётся целиком из schema.sql: все таблицы,
+// индексы и колонки, которые реально читает код, плюс маркер user_version.
+func TestOpenCreatesFreshSchema(t *testing.T) {
+	s := openTest(t)
+	tables, indexes := map[string]bool{}, map[string]bool{}
+	rows, err := s.db.Query(`SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var typ, name string
+		if err := rows.Scan(&typ, &name); err != nil {
+			t.Fatal(err)
+		}
+		switch typ {
+		case "table":
+			tables[name] = true
+		case "index":
+			indexes[name] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	wantTables := []string{"models", "checks", "incidents", "subscriptions",
+		"status_messages", "notification_outbox", "bot_state", "chat_notified"}
+	for _, want := range wantTables {
+		if !tables[want] {
+			t.Errorf("table %s missing (have %v)", want, tables)
+		}
+	}
+	for _, want := range []string{"idx_checks_model_ts", "idx_incidents_model", "idx_subscriptions_model", "idx_outbox_pending"} {
+		if !indexes[want] {
+			t.Errorf("index %s missing (have %v)", want, indexes)
+		}
+	}
+	cols := func(table string) map[string]bool {
+		t.Helper()
+		out := map[string]bool{}
+		rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			out[name] = true
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	for _, want := range []string{"response", "status", "error_type", "http_status"} {
+		if !cols("checks")[want] {
+			t.Errorf("checks.%s missing", want)
+		}
+	}
+	for _, want := range []string{"sent_at", "attempts", "next_attempt_at", "dedupe_key"} {
+		if !cols("notification_outbox")[want] {
+			t.Errorf("notification_outbox.%s missing", want)
+		}
+	}
+	var v int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != schemaVersion {
+		t.Fatalf("user_version = %d, %v (want %d)", v, err, schemaVersion)
+	}
+}
+
+// База от старой версии OpenTW (таблицы исторических миграций без маркера
+// актуальной схемы) блокирует запуск понятной ошибкой: никакой тихой
+// конверсии и никакого удаления данных.
+func TestOpenRejectsLegacyDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE models (
+		model_id TEXT PRIMARY KEY, family TEXT NOT NULL, last_status TEXT,
+		error_type TEXT, error_message TEXT, last_check_at TEXT);
+		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+		INSERT INTO models VALUES ('glm-5.3', 'GLM', 'degraded', 'perf', '', '2026-11-01T00:00:00Z');
+		INSERT INTO schema_migrations VALUES (4, '2026-11-01T00:00:00Z');`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err == nil {
+		s.Close()
+		t.Fatal("legacy database must be rejected")
+	}
+	if !strings.Contains(err.Error(), "not compatible") || !strings.Contains(err.Error(), "clean database") {
+		t.Fatalf("rejection must explain the fix: %v", err)
+	}
+	// база не тронута: данные и отсутствие маркера — как были
+	raw2, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw2.Close()
+	var n int
+	if err := raw2.QueryRow(`SELECT COUNT(*) FROM models WHERE last_status = 'degraded'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("legacy data must stay untouched: %d, %v", n, err)
+	}
+	var v int
+	if err := raw2.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != 0 {
+		t.Fatalf("user_version must stay 0, got %d %v", v, err)
+	}
+}
+
+// Реальная копия продовой базы (opentw-backup-final.db): отвергается той же
+// понятной ошибкой — миграция исторических данных не выполняется по дизайну.
+func TestOpenRejectsRealSnapshot(t *testing.T) {
+	src := filepath.Join("..", "..", "opentw-backup-final.db")
+	if _, err := os.Stat(src); err != nil {
+		t.Skip("opentw-backup-final.db отсутствует")
+	}
+	dst := filepath.Join(t.TempDir(), "backup.db")
+	in, err := os.Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		t.Fatal(err)
+	}
+	out.Close()
+
+	s, err := Open(dst)
+	if err == nil {
+		s.Close()
+		t.Fatal("real legacy snapshot must be rejected")
+	}
+	if !strings.Contains(err.Error(), "not compatible") || !strings.Contains(err.Error(), "clean database") {
+		t.Fatalf("rejection must explain the fix: %v", err)
+	}
 }
 
 func TestSyncModels(t *testing.T) {
@@ -72,6 +222,31 @@ func TestSyncModels(t *testing.T) {
 	}
 }
 
+// Модель ушла из конфигурации: вместе со строкой состояния и подписками
+// уходит и уведомлённое состояние чатов — возвратившаяся модель не глухнет
+// к первому повторному инциденту по stale chat_notified.
+func TestSyncModelsDropsNotifiedStateOfRemovedModels(t *testing.T) {
+	s := openTest(t)
+	if err := s.SyncModels([]Model{{ID: "a", Family: "A"}, {ID: "gone", Family: "G"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetChatNotifiedState(100, "gone", status.Down); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetChatNotifiedState(100, "a", status.Operational); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncModels([]Model{{ID: "a", Family: "A"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.ChatNotifiedState(100, "gone"); err != nil || ok {
+		t.Fatalf("notified state of removed model must be gone: ok=%v err=%v", ok, err)
+	}
+	if st, ok, _ := s.ChatNotifiedState(100, "a"); !ok || st != status.Operational {
+		t.Fatalf("notified state of kept model must survive: %q %v", st, ok)
+	}
+}
+
 func TestModelStateRoundtrip(t *testing.T) {
 	s := openTest(t)
 	if err := s.SyncModels([]Model{{ID: "glm-5.3", Family: "GLM"}}); err != nil {
@@ -91,7 +266,7 @@ func TestModelStateRoundtrip(t *testing.T) {
 	if m.LastCheckAt == nil || !m.LastCheckAt.Equal(at) {
 		t.Fatalf("last check at = %v", m.LastCheckAt)
 	}
-	if m, err := s.Model("nope"); err != nil || m != nil {
+	if m, err = s.Model("nope"); err != nil || m != nil {
 		t.Fatalf("want (nil,nil) for unknown model, got (%v, %v)", m, err)
 	}
 }
@@ -107,6 +282,7 @@ func TestChecksRoundtrip(t *testing.T) {
 	newer := Check{
 		ModelID: "glm-5.3", At: base, HTTPStatus: 503,
 		Status: status.Down, ErrorType: "http", ErrorMessage: "Service Unavailable",
+		Response: "429 Too Many Requests — «квота исчерпана», повторите позже",
 	}
 	other := Check{ModelID: "kimi-k3", At: base, HTTPStatus: 200, Status: status.Operational}
 	for _, c := range []Check{older, newer, other} {
@@ -127,6 +303,12 @@ func TestChecksRoundtrip(t *testing.T) {
 	if last["glm-5.3"].LatencyUS != nil {
 		t.Fatalf("error check must have nil latency: %+v", last["glm-5.3"])
 	}
+	if last["glm-5.3"].Response != newer.Response {
+		t.Fatalf("response roundtrip broken: %q", last["glm-5.3"].Response)
+	}
+	if last["kimi-k3"].Response != "" {
+		t.Fatalf("empty response must read as '' (two quotes), got %q", last["kimi-k3"].Response)
+	}
 
 	recent, err := s.RecentChecks("glm-5.3", base.Add(-time.Hour))
 	if err != nil {
@@ -134,6 +316,13 @@ func TestChecksRoundtrip(t *testing.T) {
 	}
 	if len(recent) != 1 {
 		t.Fatalf("recent within window = %d, want 1", len(recent))
+	}
+	all, err := s.RecentChecks("glm-5.3", base.Add(-3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[0].Response != "" || all[1].Response != newer.Response {
+		t.Fatalf("recent response roundtrip broken: %+v", all)
 	}
 }
 
@@ -219,7 +408,7 @@ func TestStatusMessages(t *testing.T) {
 	if err := s.DeleteStatusMessage(100); err != nil {
 		t.Fatal(err)
 	}
-	if sm, err := s.StatusMessage(100); err != nil || sm != nil {
+	if sm, err = s.StatusMessage(100); err != nil || sm != nil {
 		t.Fatalf("expected nil after delete, got %v %v", sm, err)
 	}
 }
@@ -258,10 +447,10 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	if err := s.SyncModels([]Model{{ID: "glm-5.3", Family: "GLM"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetModelState("glm-5.3", status.Degraded, "http", "Rate limited", time.Now()); err != nil {
+	if err := s.SetModelState("glm-5.3", status.Down, "http", "Rate limited", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertCheck(Check{ModelID: "glm-5.3", At: time.Now(), Status: status.Degraded}); err != nil {
+	if err := s.InsertCheck(Check{ModelID: "glm-5.3", At: time.Now(), Status: status.Down}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetSubscription(300, "glm-5.3", true); err != nil {
@@ -281,7 +470,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	}
 	defer s2.Close()
 	m, _ := s2.Model("glm-5.3")
-	if m == nil || m.LastStatus != status.Degraded {
+	if m == nil || m.LastStatus != status.Down {
 		t.Fatalf("model state lost: %+v", m)
 	}
 	if subs, _ := s2.Subscriptions(300); len(subs) != 1 || subs[0] != "glm-5.3" {
@@ -290,7 +479,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	if sm, _ := s2.StatusMessage(300); sm == nil || sm.MessageID != 999 {
 		t.Fatalf("status message lost: %+v", sm)
 	}
-	if last, _ := s2.LastChecks(); last["glm-5.3"].Status != status.Degraded {
+	if last, _ := s2.LastChecks(); last["glm-5.3"].Status != status.Down {
 		t.Fatalf("checks lost: %+v", last)
 	}
 	if open, _ := s2.HasOpenIncident("glm-5.3"); open != true {
@@ -298,71 +487,8 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	}
 }
 
-// Апгрейд базы, созданной до появления миграций (таблицы v1 без журнала
-// schema_migrations): Open применяет недостающие версии, данные не теряются.
-func TestMigrateLegacyBaseWithoutJournal(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy.db")
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.Exec(`CREATE TABLE models (
-		model_id TEXT PRIMARY KEY, family TEXT NOT NULL, last_status TEXT,
-		error_type TEXT, error_message TEXT, last_check_at TEXT);
-		INSERT INTO models VALUES ('glm-5.3', 'GLM', 'ok', '', '', '2026-11-01T00:00:00Z');`); err != nil {
-		t.Fatal(err)
-	}
-	raw.Close()
-
-	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("upgrade legacy base: %v", err)
-	}
-	defer s.Close()
-	m, err := s.Model("glm-5.3")
-	if err != nil || m == nil || m.LastStatus != "ok" {
-		t.Fatalf("legacy data lost: %v %+v", err, m)
-	}
-	if err := s.EnqueueOutbox(100, "single", "k", []byte(`{}`)); err != nil {
-		t.Fatal(err)
-	}
-	var version int
-	if err := s.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 3 {
-		t.Fatalf("migrated to = %d, %v (want 3)", version, err)
-	}
-}
-
-// База с «чужой» формой notification_outbox (интерим-сборка без новых колонок)
-// должна блокировать запуск понятной ошибкой, а не падать в рантайме.
-func TestOpenDetectsSchemaDrift(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "drift.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-	// пересоздаём outbox в форме без next_attempt_at, журнал не трогаем
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.Exec(`DROP TABLE notification_outbox;
-		CREATE TABLE notification_outbox (
-			id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
-			kind TEXT NOT NULL, payload TEXT NOT NULL, dedupe_key TEXT NOT NULL,
-			created_at TEXT NOT NULL, sent_at TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-			UNIQUE (chat_id, dedupe_key));`); err != nil {
-		t.Fatal(err)
-	}
-	raw.Close()
-	if _, err := Open(path); err == nil {
-		t.Fatal("schema drift must be detected")
-	} else if !strings.Contains(err.Error(), "next_attempt_at") {
-		t.Fatalf("drift error must name the column: %v", err)
-	}
-}
-
-// BackupTo: согласованный снапшот живой WAL-базы, повтор в тот же файл — ошибка.
+// BackupTo: согласованный снапшот живой WAL-базы (маркер схемы сохраняется),
+// повтор в тот же файл — ошибка.
 func TestBackupTo(t *testing.T) {
 	s := openTest(t)
 	if err := s.SyncModels([]Model{{ID: "glm-5.3", Family: "GLM"}}); err != nil {
@@ -388,48 +514,5 @@ func TestBackupTo(t *testing.T) {
 	}
 	if err := s.BackupTo(dst); err == nil {
 		t.Fatal("backup must refuse to overwrite an existing file")
-	}
-}
-
-// Реальный путь обновления существующих пользователей: база на версии 2
-// получает 003 (ALTER ADD COLUMN) без потери данных.
-func TestMigrateUpgradeFromV2(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "v2.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetSubscription(300, "glm-5.3", true); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-	// откатываем журнал к версии 2 и убираем колонку 003 — база «до обновления»
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, q := range []string{
-		`DELETE FROM schema_migrations WHERE version > 2`,
-		`CREATE TABLE notification_outbox_v2 AS SELECT id, chat_id, kind, payload, dedupe_key, created_at, sent_at, attempts FROM notification_outbox`,
-		`DROP TABLE notification_outbox`,
-		`ALTER TABLE notification_outbox_v2 RENAME TO notification_outbox`,
-	} {
-		if _, err := raw.Exec(q); err != nil {
-			t.Fatal(q, err)
-		}
-	}
-	raw.Close()
-
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatalf("upgrade v2 -> v3: %v", err)
-	}
-	defer s2.Close()
-	subs, err := s2.Subscriptions(300)
-	if err != nil || len(subs) != 1 {
-		t.Fatalf("data must survive upgrade: %v %v", subs, err)
-	}
-	if err := s2.DeferOutboxAttempt(1, time.Minute); err != nil {
-		t.Fatalf("new column must be usable: %v", err)
 	}
 }
