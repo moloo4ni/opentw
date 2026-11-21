@@ -13,7 +13,7 @@ import (
 	"unicode/utf8"
 )
 
-const testPrompt = "Reply with exactly OK."
+const testPrompt = "Reply with exactly \"OK\""
 
 func newTestClient(baseURL string, timeout time.Duration, stream bool) *Client {
 	return &Client{
@@ -94,6 +94,9 @@ func TestGenerateStreamSuccess(t *testing.T) {
 	if res.TPS == nil {
 		t.Fatal("TPS must be computed from usage")
 	}
+	if got, want := res.Content, "OK"; got != want || res.Response != want {
+		t.Fatalf("content/response = %q/%q, want %q/%q", got, res.Response, want, want)
+	}
 	wantTPS := float64(4) / (float64(*res.GenUS) / 1e6)
 	if *res.TPS < wantTPS*0.98 || *res.TPS > wantTPS*1.02 {
 		t.Fatalf("TPS = %f, want ~%f", *res.TPS, wantTPS)
@@ -171,6 +174,9 @@ func TestGenerateNoStreamSuccess(t *testing.T) {
 	if res.InputTokens == nil || *res.InputTokens != 7 || res.OutputTokens == nil || *res.OutputTokens != 2 {
 		t.Fatalf("tokens in=%v out=%v", res.InputTokens, res.OutputTokens)
 	}
+	if res.Content != "OK" || res.Response != "OK" {
+		t.Fatalf("content=%q response=%q, want OK/OK", res.Content, res.Response)
+	}
 }
 
 func TestGenerateStreamRequestShape(t *testing.T) {
@@ -182,6 +188,7 @@ func TestGenerateStreamRequestShape(t *testing.T) {
 			t.Errorf("accept = %q", r.Header.Get("Accept"))
 		}
 		var req struct {
+			MaxTok     int            `json:"max_tokens"`
 			Stream     bool           `json:"stream"`
 			StreamOpts map[string]any `json:"stream_options"`
 			Messages   []struct {
@@ -191,6 +198,9 @@ func TestGenerateStreamRequestShape(t *testing.T) {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode: %v", err)
+		}
+		if req.MaxTok != 256 {
+			t.Errorf("max_tokens = %d, want 256", req.MaxTok)
 		}
 		if !req.Stream {
 			t.Error("stream=true expected")
@@ -207,7 +217,7 @@ func TestGenerateStreamRequestShape(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv.URL, 5*time.Second, true)
-	if res := c.Generate(context.Background(), "glm-5.3", 8); res.ErrorKind != "" {
+	if res := c.Generate(context.Background(), "glm-5.3", 256); res.ErrorKind != "" {
 		t.Fatalf("kind=%q msg=%q", res.ErrorKind, res.ErrorMessage)
 	}
 }
@@ -228,6 +238,12 @@ func TestGenerateHTTP429(t *testing.T) {
 	}
 	if res.ErrorMessage != "Upstream rate limit" {
 		t.Fatalf("message = %q", res.ErrorMessage)
+	}
+	if res.Response != "Upstream rate limit" {
+		t.Fatalf("response = %q, want the verbatim provider text", res.Response)
+	}
+	if res.Content != "" {
+		t.Fatalf("failed HTTP request has no generated content, got %q", res.Content)
 	}
 	if res.LatencyUS <= 0 {
 		t.Fatal("latency of failed request must be recorded")
@@ -250,6 +266,12 @@ func TestGenerateHTTP5xx(t *testing.T) {
 		if res.ErrorMessage == "" {
 			t.Fatalf("provider message must be preserved for %d", tc.code)
 		}
+		if res.Response != res.ErrorMessage {
+			t.Fatalf("response = %q, want the verbatim provider message %q", res.Response, res.ErrorMessage)
+		}
+		if res.Content != "" {
+			t.Fatalf("no content on HTTP %d, got %q", tc.code, res.Content)
+		}
 		srv.Close()
 	}
 }
@@ -265,6 +287,9 @@ func TestGenerateHTTP5xxNoBody(t *testing.T) {
 	}
 	if res.ErrorMessage != "HTTP 502" {
 		t.Fatalf("message = %q", res.ErrorMessage)
+	}
+	if res.Response != "HTTP 502" {
+		t.Fatalf("response = %q, want the HTTP fallback", res.Response)
 	}
 }
 
@@ -287,6 +312,9 @@ func TestGenerateTimeout(t *testing.T) {
 	if res.LatencyUS < 250_000 {
 		t.Fatalf("latency = %d", res.LatencyUS)
 	}
+	if res.Content != "" || res.Response != "" {
+		t.Fatalf("transport error has nothing to quote: content=%q response=%q", res.Content, res.Response)
+	}
 }
 
 func TestGenerateConnRefused(t *testing.T) {
@@ -296,6 +324,9 @@ func TestGenerateConnRefused(t *testing.T) {
 	res := newTestClient(srv.URL, 2*time.Second, true).Generate(context.Background(), "glm-5.3", 8)
 	if res.ErrorKind != "connrefused" {
 		t.Fatalf("kind = %q, msg = %q", res.ErrorKind, res.ErrorMessage)
+	}
+	if res.Content != "" || res.Response != "" {
+		t.Fatalf("transport error has nothing to quote: content=%q response=%q", res.Content, res.Response)
 	}
 }
 
@@ -313,6 +344,12 @@ func TestGenerateModelNotFound(t *testing.T) {
 	if !strings.Contains(res.ErrorMessage, "model not found") {
 		t.Fatalf("message = %q", res.ErrorMessage)
 	}
+	if res.Response != res.ErrorMessage {
+		t.Fatalf("response = %q, want the verbatim 404 text", res.Response)
+	}
+	if res.Content != "" {
+		t.Fatalf("404 has no generated content, got %q", res.Content)
+	}
 }
 
 func TestGenerateAuthError(t *testing.T) {
@@ -329,6 +366,9 @@ func TestGenerateAuthError(t *testing.T) {
 	if res.ErrorMessage != "Invalid API key" {
 		t.Fatalf("message = %q", res.ErrorMessage)
 	}
+	if res.Response != "Invalid API key" {
+		t.Fatalf("response = %q, want the verbatim 401 text", res.Response)
+	}
 }
 
 func TestGenerateInvalidResponse(t *testing.T) {
@@ -344,6 +384,12 @@ func TestGenerateInvalidResponse(t *testing.T) {
 		res := newTestClient(srv.URL, 5*time.Second, stream).Generate(context.Background(), "glm-5.3", 8)
 		if res.ErrorKind != "invalid" {
 			t.Fatalf("stream=%v kind = %q, msg = %q", stream, res.ErrorKind, res.ErrorMessage)
+		}
+		if res.Response != "wow" {
+			t.Fatalf("stream=%v response = %q, want the sanitized raw body %q", stream, res.Response, "wow")
+		}
+		if res.Content != "" {
+			t.Fatalf("stream=%v unparseable body has no content, got %q", stream, res.Content)
 		}
 		srv.Close()
 	}
@@ -377,7 +423,10 @@ func TestGenerateEmptyNoStream(t *testing.T) {
 
 	res := newTestClient(srv.URL, 5*time.Second, false).Generate(context.Background(), "glm-5.3", 8)
 	if res.ErrorKind != "empty" {
-		t.Fatalf("kind = %q", res.ErrorKind)
+		t.Fatalf("kind = %q, want empty", res.ErrorKind)
+	}
+	if res.Content != "" || res.Response != "" {
+		t.Fatalf("empty generation: content=%q response=%q", res.Content, res.Response)
 	}
 }
 
@@ -437,6 +486,12 @@ func TestNonStreamGatewayErrorInBody(t *testing.T) {
 	if !strings.Contains(res.ErrorMessage, "No available accounts") {
 		t.Fatalf("gateway error text lost: %q", res.ErrorMessage)
 	}
+	if res.Response != res.ErrorMessage {
+		t.Fatalf("response = %q, want the verbatim gateway message %q", res.Response, res.ErrorMessage)
+	}
+	if res.Content != "" {
+		t.Fatalf("gateway error body carries no content, got %q", res.Content)
+	}
 }
 
 // --- 1.2: ошибки чтения тела после заголовков классифицируются той же
@@ -476,6 +531,9 @@ func TestStreamReadCancelled(t *testing.T) {
 	if res.ErrorKind != "cancelled" {
 		t.Fatalf("kind = %q, want cancelled (msg = %q)", res.ErrorKind, res.ErrorMessage)
 	}
+	if res.Content != "" || res.Response != "" {
+		t.Fatalf("cancelled stream has nothing to quote: content=%q response=%q", res.Content, res.Response)
+	}
 }
 
 // Обрыв соединения во время чтения полного (не-SSE) ответа.
@@ -497,6 +555,9 @@ func TestFullBodyConnectionBreak(t *testing.T) {
 	if res.ErrorKind != "connrefused" {
 		t.Fatalf("kind = %q, want connrefused (msg = %q)", res.ErrorKind, res.ErrorMessage)
 	}
+	if res.Content != "" || res.Response != "" {
+		t.Fatalf("transport break has nothing to quote: content=%q response=%q", res.Content, res.Response)
+	}
 }
 
 // Обрыв соединения посреди SSE-потока.
@@ -515,6 +576,9 @@ func TestStreamBodyConnectionBreak(t *testing.T) {
 	res := newTestClient(srv.URL, 5*time.Second, true).Generate(context.Background(), "glm-5.3", 8)
 	if res.ErrorKind != "connrefused" {
 		t.Fatalf("kind = %q, want connrefused (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+	if res.Content != "" || res.Response != "" {
+		t.Fatalf("stream break has nothing to quote: content=%q response=%q", res.Content, res.Response)
 	}
 }
 
@@ -536,6 +600,12 @@ func TestStreamGatewayErrorInSSE(t *testing.T) {
 	if !strings.Contains(res.ErrorMessage, "No available accounts") {
 		t.Fatalf("gateway error text lost: %q", res.ErrorMessage)
 	}
+	if res.Response != res.ErrorMessage {
+		t.Fatalf("response = %q, want the verbatim SSE error text", res.Response)
+	}
+	if res.Content != "" {
+		t.Fatalf("no content on SSE gateway error, got %q", res.Content)
+	}
 }
 
 // stream:true, но SSE-данных нет: шлюз отдал обычный JSON с ошибкой —
@@ -554,6 +624,12 @@ func TestStreamGatewayErrorJSONBody(t *testing.T) {
 	if !strings.Contains(res.ErrorMessage, "Insufficient balance") {
 		t.Fatalf("gateway error text lost: %q", res.ErrorMessage)
 	}
+	if res.Response != res.ErrorMessage {
+		t.Fatalf("response = %q, want the verbatim gateway message %q", res.Response, res.ErrorMessage)
+	}
+	if res.Content != "" {
+		t.Fatalf("gateway JSON body carries no content, got %q", res.Content)
+	}
 }
 
 // Контент уже сгенерирован, затем error-чанк: частично успешный стрим
@@ -571,6 +647,9 @@ func TestStreamErrorChunkAfterContentStaysSuccess(t *testing.T) {
 	res := newTestClient(srv.URL, 5*time.Second, true).Generate(context.Background(), "glm-5.3", 8)
 	if res.ErrorKind != "" {
 		t.Fatalf("kind = %q, want success (msg = %q)", res.ErrorKind, res.ErrorMessage)
+	}
+	if res.Content != "OK" || res.Response != "OK" {
+		t.Fatalf("content=%q response=%q, want OK/OK — the error chunk after content must not overwrite the answer", res.Content, res.Response)
 	}
 }
 
@@ -592,11 +671,11 @@ func TestTruncateRunesSafe(t *testing.T) {
 }
 
 func TestErrSummaryRunesSafe(t *testing.T) {
-	got := errSummary(errors.New(strings.Repeat("р", 600)))
+	got := errSummary(errors.New(strings.Repeat("р", maxTextRunes*2)))
 	if !utf8.ValidString(got) {
 		t.Fatal("errSummary produced invalid UTF-8")
 	}
-	if l := len([]rune(got)); l != 512 {
-		t.Fatalf("rune count = %d, want 512", l)
+	if l := len([]rune(got)); l != maxTextRunes {
+		t.Fatalf("rune count = %d, want %d", l, maxTextRunes)
 	}
 }

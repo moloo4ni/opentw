@@ -19,7 +19,25 @@ type RawResult struct {
 	InputTokens  *int64
 	OutputTokens *int64
 
-	// ErrorKind: "" success, "empty" (HTTP 200 without generated content),
+	// Content is the verbatim final answer of the model (message.content /
+	// accumulated content deltas; reasoning never counted).
+	Content string
+
+	// FinishReason is the provider-reported completion reason for the choice
+	// whose Content is used above. Empty when the provider omitted it or sent
+	// null. It is diagnostic only and never participates in status classification.
+	FinishReason string
+
+	// Response is the verbatim diagnostic text of what the API or model
+	// actually returned: the generated content when any, otherwise the
+	// provider/gateway error message, otherwise the raw body of an
+	// unparseable response. Empty when there is nothing to quote (e.g. a
+	// transport failure). Stored as-is; never translated or summarized.
+	Response string
+
+	// ErrorKind: "" success transport-wise (HTTP 200, generated something),
+	// "empty" (HTTP 200 without CONTENT — reasoning alone does not count
+	// for the answer, but still tags the check as generated),
 	// "http" (non-200 response; see HTTPStatus/ErrorMessage),
 	// "timeout", "connrefused", "invalid" (unparseable response),
 	// "cancelled" (monitor shutdown; skip recording).

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -32,6 +33,16 @@ func (c *Client) httpClient() *http.Client {
 // minGenerationUS — минимальная длительность генерации, при которой TPS
 // считается достоверным (буферизованные SSE-потоки дают ~0).
 const minGenerationUS = 100_000
+
+// maxTextRunes — предел для сохраняемого текста ответа/ошибки провайдера.
+// Заметно больше любых реальных тел (max_tokens ограничивает генерацию),
+// но ограничивает патологические страницы ошибок в хранилище. Обрезка
+// видима («…»), сырых данных больше, чем прочитано, всё равно не бывает:
+// тела ограничены maxBodyBytes.
+const maxTextRunes = 16384
+
+// maxBodyBytes — сколько байтов тела ответа читаем и сохраняем.
+const maxBodyBytes = 1 << 16
 
 func readLimited(r io.Reader, limit int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, limit))
@@ -116,10 +127,13 @@ func (c *Client) Generate(ctx context.Context, modelID string, maxTokens int) *R
 	res.HTTPStatus = resp.StatusCode
 
 	if resp.StatusCode != http.StatusOK {
-		errBody, _ := readLimited(resp.Body, 8192)
+		errBody, _ := readLimited(resp.Body, maxBodyBytes)
 		res.LatencyUS = usSince(start)
 		res.ErrorKind = "http"
 		res.ErrorMessage = extractProviderError(errBody, resp.StatusCode)
+		// диагностический ответ API — дословно (провайдерский текст либо
+		// «HTTP <код>», когда тело пусто)
+		res.Response = res.ErrorMessage
 		return res
 	}
 
@@ -166,26 +180,33 @@ func (c *Client) consumeStream(ctx context.Context, body io.Reader, res *RawResu
 			res.OutputTokens = ptr64(*out.usage.CompletionTokens)
 		}
 	}
+	res.FinishReason = out.finishReason
 	if out.dataErr != "" && !out.generated {
 		// Шлюз сообщил об ошибке прямо в SSE-данных: HTTP 200 без генерации —
-		// «empty» (паритет с non-stream, D13), исходный текст провайдера
-		// сохраняется, а не подменяется «пустой генерацией».
-		res.ErrorKind, res.ErrorMessage = "empty", truncate(out.dataErr, 512)
+		// «empty» (паритет с non-stream), исходный текст провайдера
+		// сохраняется дословно.
+		res.ErrorKind, res.ErrorMessage = "empty", out.dataErr
+		res.Response = out.dataErr
 		return
 	}
+	res.Content = out.content
+	res.Response = out.content
 	if !out.sawData || !out.parsedAny {
 		if msg := bodyGatewayError(out.rawPrefix); msg != "" {
 			// stream:true, но SSE-данных не было: шлюз отдал JSON с ошибкой —
 			// это не «ошибка монитора» и не разрыв соединения
 			res.ErrorKind, res.ErrorMessage = "empty", msg
+			res.Response = msg
 			return
 		}
 		res.ErrorKind, res.ErrorMessage = "invalid", "unparseable response body"
+		// исходное тело, как оно есть, — единственный достоверный след
+		res.Response = truncate(strings.TrimSpace(string(bytes.ToValidUTF8(out.rawPrefix, nil))), maxTextRunes)
 		return
 	}
 	if !out.generated {
-		// HTTP 200 with nothing generated — Degraded, not Down. Reasoning
-		// tokens already counted as generation above.
+		// HTTP 200 with nothing generated. Reasoning tokens are counted as
+		// generation above, so this is a truly empty reply from the API.
 		res.ErrorKind, res.ErrorMessage = "empty", "empty generation"
 		return
 	}
@@ -208,7 +229,7 @@ func (c *Client) consumeStream(ctx context.Context, body io.Reader, res *RawResu
 }
 
 func (c *Client) consumeFull(ctx context.Context, body io.Reader, res *RawResult) {
-	raw, err := readLimited(body, 8192)
+	raw, err := readLimited(body, maxBodyBytes)
 	if err != nil {
 		// чтение тела после заголовков классифицируется транспортной причиной,
 		// а не «некорректным ответом» (1.2)
@@ -218,6 +239,7 @@ func (c *Client) consumeFull(ctx context.Context, body io.Reader, res *RawResult
 	var parsed nonStreamResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		res.ErrorKind, res.ErrorMessage = "invalid", "unparseable response body"
+		res.Response = truncate(strings.TrimSpace(string(bytes.ToValidUTF8(raw, nil))), maxTextRunes)
 		return
 	}
 	if parsed.Usage != nil {
@@ -228,17 +250,54 @@ func (c *Client) consumeFull(ctx context.Context, body io.Reader, res *RawResult
 			res.OutputTokens = ptr64(*parsed.Usage.CompletionTokens)
 		}
 	}
+	content := ""
 	generated := false
-	if len(parsed.Choices) > 0 {
-		msg := parsed.Choices[0].Message
-		generated = msg.Content != "" || msg.ReasoningContent != ""
+	selected := -1
+	// Несколько choices: классифицируется та же choice, чей content фактически
+	// используется. При отсутствии content выбирается первая содержательная
+	// choice (reasoning-only), чтобы finish_reason относился к ней.
+	for i := range parsed.Choices {
+		msg := parsed.Choices[i].Message
+		if msg.Content != "" {
+			content = msg.Content
+			selected = i
+			generated = true
+			break
+		}
 	}
+	if selected == -1 {
+		for i := range parsed.Choices {
+			if parsed.Choices[i].Message.ReasoningContent != "" {
+				selected = i
+				generated = true
+				break
+			}
+		}
+	}
+	if selected == -1 {
+		// Полностью пустой ответ тоже может сообщать причину завершения
+		// (например, length). Значение не выдумываем, а только переносим его.
+		for i := range parsed.Choices {
+			if parsed.Choices[i].FinishReason != nil && *parsed.Choices[i].FinishReason != "" {
+				selected = i
+				break
+			}
+		}
+	}
+	if selected >= 0 && parsed.Choices[selected].FinishReason != nil {
+		res.FinishReason = *parsed.Choices[selected].FinishReason
+	}
+	// Итоговый ответ — message.content (reasoning им не является);
+	// оригинальный ответ сохраняется дословно.
+	res.Content = content
+	res.Response = content
 	if !generated {
 		res.ErrorKind = "empty"
-		// некоторые шлюзы возвращают 200 с JSON-ошибкой: её текст важнее
-		// бессмысленного «empty generation»
+		// некоторые шлюзы возвращают 200 с JSON-ошибкой: её дословный текст
+		// и есть диагностический ответ; без него quotes не будет вовсе
 		if parsed.Error != nil && parsed.Error.Message != "" {
-			res.ErrorMessage = truncate(parsed.Error.Message, 512)
+			res.ErrorMessage = truncate(parsed.Error.Message, maxTextRunes)
+			res.Response = res.ErrorMessage
 		} else {
 			res.ErrorMessage = "empty generation"
 		}
@@ -269,8 +328,8 @@ func errSummary(err error) string {
 	msg := err.Error()
 	// обрезка по рунам: байтовый срез мог бы ломать многобайтовые символы
 	// и отправлять в Telegram невалидный UTF-8
-	if r := []rune(msg); len(r) > 512 {
-		return string(r[:512])
+	if r := []rune(msg); len(r) > maxTextRunes {
+		return string(r[:maxTextRunes])
 	}
 	return msg
 }

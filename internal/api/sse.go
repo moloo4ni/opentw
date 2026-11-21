@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // streamChunk is one SSE data event of a chat completion stream.
@@ -46,6 +47,26 @@ type streamOutcome struct {
 	sawData   bool
 	parsedAny bool
 	generated bool
+	// content — накопленный итоговый ответ (только delta.content,
+	// reasoning не считается ответом). При патологически длинном потоке
+	// обрезан по maxTextRunes с видимым «…» (contentFull).
+	content     string
+	contentFull bool
+	// finishReason — первый непустой finish_reason терминального чанка той
+	// же choice, из которой накоплен итоговый ответ. Usage-only чанки не могут
+	// его очистить; отсутствующее значение остаётся пустым.
+	finishReason string
+	// finishReasons — непустые finish_reason по index choice. Итог берётся
+	// после чтения потока от той же choice, которая дала content.
+	finishReasons     map[int]string
+	firstFinishChoice int
+	hasFinishChoice   bool
+	// selectedChoice — choice, из которой берётся content (или первая
+	// содержательная choice при его отсутствии); нужно для корректного
+	// finish_reason в ответах с несколькими choices.
+	selectedChoice   int
+	hasChoice        bool
+	hasContentChoice bool
 	// dataErr — текст поля error из SSE-данных (первое непустое сообщение).
 	dataErr string
 	// rawPrefix — прочитанное до первого data: (≤ 8КБ): при stream:true
@@ -89,10 +110,56 @@ func readStream(r io.Reader, onFirstContent func()) streamOutcome {
 					out.usage = chunk.Usage
 				}
 				for _, ch := range chunk.Choices {
-					if !out.generated && (ch.Delta.Content != "" || ch.Delta.ReasoningContent != "") {
-						out.generated = true
-						if onFirstContent != nil {
-							onFirstContent()
+					// Сначала сохраняем reason по index choice. Источник итогового
+					// ответа может быть выбран позже, поэтому глобально присваивать
+					// reason до конца потока нельзя.
+					if ch.FinishReason != nil && *ch.FinishReason != "" {
+						if out.finishReasons == nil {
+							out.finishReasons = make(map[int]string)
+						}
+						if _, exists := out.finishReasons[ch.Index]; !exists {
+							out.finishReasons[ch.Index] = *ch.FinishReason
+						}
+						if !out.hasFinishChoice {
+							out.firstFinishChoice = ch.Index
+							out.hasFinishChoice = true
+						}
+					}
+					if ch.Delta.Content != "" {
+						// Первый непустой content — источник итогового ответа.
+						if !out.hasContentChoice {
+							out.hasContentChoice = true
+							out.selectedChoice = ch.Index
+							out.hasChoice = true
+							out.content = ""
+						}
+						if out.selectedChoice != ch.Index {
+							continue
+						}
+						if !out.generated {
+							out.generated = true
+							if onFirstContent != nil {
+								onFirstContent()
+							}
+						}
+						if !out.contentFull {
+							out.content, out.contentFull = appendCapped(out.content, ch.Delta.Content)
+						}
+						continue
+					}
+					if ch.Delta.ReasoningContent != "" {
+						if !out.hasChoice && !out.hasContentChoice {
+							out.selectedChoice = ch.Index
+							out.hasChoice = true
+						}
+						if out.selectedChoice != ch.Index {
+							continue
+						}
+						if !out.generated {
+							out.generated = true
+							if onFirstContent != nil {
+								onFirstContent()
+							}
 						}
 					}
 				}
@@ -108,6 +175,14 @@ func readStream(r io.Reader, onFirstContent func()) streamOutcome {
 			}
 			break
 		}
+	}
+	if out.hasChoice {
+		if reason, ok := out.finishReasons[out.selectedChoice]; ok {
+			out.finishReason = reason
+		}
+	} else if out.hasFinishChoice {
+		// Нет ни content, ни reasoning: берём первый фактический finish_reason.
+		out.finishReason = out.finishReasons[out.firstFinishChoice]
 	}
 	out.rawPrefix = raw.Bytes()
 	return out
@@ -142,17 +217,17 @@ func extractProviderError(body []byte, code int) string {
 	}
 	if json.Unmarshal(body, &v) == nil {
 		if v.Error != nil && v.Error.Message != "" {
-			return v.Error.Message
+			return truncate(v.Error.Message, maxTextRunes)
 		}
 		if v.Message != "" {
-			return v.Message
+			return truncate(v.Message, maxTextRunes)
 		}
 	}
 	trimmed := strings.TrimSpace(string(bytes.ToValidUTF8(body, nil)))
 	if trimmed == "" {
 		return "HTTP " + strconv.Itoa(code)
 	}
-	return truncate(trimmed, 512)
+	return truncate(trimmed, maxTextRunes)
 }
 
 // bodyGatewayError извлекает текст ошибки шлюза из не-SSE тела ответа при
@@ -166,7 +241,7 @@ func bodyGatewayError(raw []byte) string {
 		return ""
 	}
 	if parsed.Error != nil && parsed.Error.Message != "" {
-		return truncate(parsed.Error.Message, 512)
+		return truncate(parsed.Error.Message, maxTextRunes)
 	}
 	return ""
 }
@@ -178,4 +253,19 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// appendCapped дописывает s к dst с пределом maxTextRunes рун: безграничный
+// поток не раздувает память и хранилище; обрезка видима («…»). Возвращает
+// накопленный текст и признак достижения предела.
+func appendCapped(dst, s string) (string, bool) {
+	dstRunes := utf8.RuneCountInString(dst)
+	if dstRunes+utf8.RuneCountInString(s) <= maxTextRunes {
+		return dst + s, false
+	}
+	room := maxTextRunes - dstRunes
+	if room > 0 {
+		return truncate(dst+string([]rune(s)[:room]), maxTextRunes), true
+	}
+	return truncate(dst, maxTextRunes), true
 }
