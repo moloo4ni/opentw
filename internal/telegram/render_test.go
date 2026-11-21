@@ -315,8 +315,10 @@ func TestModelDetailOperational(t *testing.T) {
 	}
 }
 
-// Статистика 24 часов: два полноценных вертикальных промежутка между тремя
-// строками, но ни одного горизонтального отступа. Проверяем итоговый rich-HTML
+// Статистика 24 часов: три самостоятельных соседних rich-абзаца <p> —
+// вертикальные интервалы между абзацами задаёт сам Telegram (как между
+// остальными секциями карточки), а не <br/>; общий левый край — без
+// начальных пробелов и пробельных сущностей. Проверяем итоговый rich-HTML
 // целиком, чтобы изменения не затронули остальные блоки карточки.
 func TestModelCard24HourStatsVerticalSpacingWithoutIndent(t *testing.T) {
 	last := storage.Check{
@@ -343,10 +345,19 @@ func TestModelCard24HourStatsVerticalSpacingWithoutIndent(t *testing.T) {
 		"<p><b>Последний запрос</b></p><p>HTTP 200 · Latency 36.7s</p>" +
 		"<p><b>Ответ модели</b></p><p>OK</p>" +
 		"<p><b>За последние 24 часа</b></p>" +
-		"<p>Uptime: 59.14%<br/><br/>Проверок: 97<br/><br/>" +
-		"🟢 Успешных: 55 · 🔴 Неудачных: 38 · ⚪ Нет данных: 4</p>"
+		"<p>Uptime: 59.14%</p>" +
+		"<p>Проверок: 97</p>" +
+		"<p>🟢 Успешных: 55 · 🔴 Неудачных: 38 · ⚪ Нет данных: 4</p>"
 	if got != want {
 		t.Fatalf("model card HTML mismatch\nwant:\n%s\ngot:\n%s", want, got)
+	}
+	// статистика — самостоятельные абзацы без искусственных отступов:
+	// ни переносов <br/>, ни пробелов и пробельных сущностей после <p>,
+	// ни вложенных абзацев
+	for _, bad := range []string{"<br/>", "&#x20;", "&nbsp;", "<p> ", "<p>\t", "<p><p>"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("model card must not contain %q:\n%s", bad, got)
+		}
 	}
 }
 

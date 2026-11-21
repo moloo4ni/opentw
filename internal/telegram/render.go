@@ -313,7 +313,10 @@ func finishReason(message string) string {
 }
 
 // last24Block — статистика 24 часов: Uptime = ok/(ok+down), Unknown не
-// входит в знаменатель; блок целиком опускается без истории.
+// входит в знаменатель; блок целиком опускается без истории. Каждая строка —
+// самостоятельный абзац <p>: вертикальные интервалы между абзацами задаёт
+// Telegram, как и между остальными секциями карточки, поэтому вызывающий
+// код вставляет результат без дополнительной обёртки.
 func last24Block(checks []storage.Check) string {
 	if len(checks) == 0 {
 		return ""
@@ -337,7 +340,9 @@ func last24Block(checks []storage.Check) string {
 	lines = append(lines, fmt.Sprintf("Проверок: %d", len(checks)))
 	// статусные эмодзи — только в строке категорий; слово Unknown — из словаря
 	lines = append(lines, fmt.Sprintf("🟢 Успешных: %d · 🔴 Неудачных: %d · ⚪ %s: %d", okCount, downCount, statusWordRu(status.Unknown), unknownCount))
-	return "<p>" + strings.Join(lines, "<br/><br/>") + "</p>"
+	// каждая строка — отдельный rich-абзац: без <br/> и начальных пробелов,
+	// все строки начинаются от одного левого края
+	return "<p>" + strings.Join(lines, "</p><p>") + "</p>"
 }
 
 func pluralModels(n int) string {
