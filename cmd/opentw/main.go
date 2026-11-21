@@ -138,7 +138,7 @@ func run() error {
 
 // worstCycleTime — подтверждённый максимум длительности одного цикла:
 // запрос каталога + волны проверок по ceil(N/concurrency), каждая волна
-// ограничена http_timeout. Формула согласована с HEALTHCHECK Dockerfile
+// ограничена http_timeout. Формула согласована с HEALTHCHECK Containerfile
 // (start-period покрывает худший первый цикл) и с файлом maxage.
 func worstCycleTime(models, concurrency int, httpTimeout time.Duration) time.Duration {
 	waves := (models + concurrency - 1) / concurrency

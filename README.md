@@ -34,7 +34,7 @@ Telegram-бот для мониторинга доступности и прои
 
 ## Требования
 
-- Go 1.27.4+ (локальная сборка) или Docker 24+ с Docker Compose.
+- Go 1.27.4+ (локальная сборка) или Podman (сборка образа и запуск контейнера).
 - Telegram-бот, созданный через [@BotFather](https://t.me/BotFather).
 - Пользовательский API-ключ с доступом к `/v1/models` и `/v1/chat/completions`.
 - Серверная поддержка Telegram Bot API 10.3+ и клиент Telegram с поддержкой
@@ -75,7 +75,7 @@ cp .env.example .env
 
 ```bash
 cp config.example.yaml config.yaml
-# sqlite_path из примера — /data/opentw.db: это путь внутри контейнера Docker.
+# sqlite_path из примера — /data/opentw.db: это путь внутри контейнера.
 # Для локального запуска замените его на доступный локальный путь,
 # например ./opentw.db; при желании поправьте список моделей и интервалы.
 set -a && . ./.env && set +a
@@ -84,17 +84,28 @@ go run ./cmd/opentw -config config.yaml
 
 Первый цикл мониторинга стартует сразу после запуска, дальше — по интервалу.
 
-## Запуск через Docker Compose
+## Сборка и запуск контейнера
+
+Podman — единственный поддерживаемый проектом container engine. Сборка образа
+из `Containerfile`:
 
 ```bash
 cp .env.example .env          # заполните BOT_TOKEN, API_KEY, API_BASE_URL
 cp config.example.yaml config.yaml
-docker compose up -d --build
-docker compose logs -f
+# --format docker: OCI-формат (по умолчанию) отбрасывает HEALTHCHECK из образа
+podman build --format docker -t localhost/opentw:latest .
 ```
 
-SQLite лежит на томе `opentw-data` (`sqlite_path: /data/opentw.db`).
-`config.yaml` монтируется в контейнер только на чтение.
+При сбоях сети на этапе `go mod download` в некоторых средах сборки
+Podman/netavark помогает `--network=host` (особенность конкретной среды,
+не обязательный флаг).
+
+Развёртывание — через Quadlet: декларативный unit `.container` генерирует
+systemd-сервис, который управляет контейнером (named volume для SQLite под
+`/data`, перезапуск и логи — systemd/journald). Пример публичного
+Quadlet-юнита в репозиторий не входит; параметры — в `podman-container.unit(5)`.
+
+`config.yaml` подключается в контейнер только на чтение.
 
 ## Валидация конфигурации
 
@@ -237,31 +248,34 @@ single-flight, но тики тогда пропускаются).
 ## Бэкап и восстановление
 
 Вся история, инциденты, подписки и привязки панелей живут в одном файле
-SQLite на томе `opentw-data`. Горячий бэкап без остановки:
+SQLite на named volume (`sqlite_path: /data/opentw.db`). Горячий бэкап без
+остановки (opentw — имя контейнера из вашего Quadlet-юнита):
 
 ```bash
-docker compose exec opentw /app/opentw -config /app/config.yaml -backup /data/backup.db
-docker cp opentw:/data/backup.db ./opentw-$(date +%F).db   # забрать на хост
+podman exec opentw /app/opentw -config /app/config.yaml -backup /data/backup.db
+podman cp opentw:/data/backup.db ./opentw-$(date +%F).db   # забрать на хост
 ```
 
 Снапшот создаётся `VACUUM INTO` — консистентен и на живой WAL-базе; в
 существующий файл запись откажется (уникальное имя — суффикс даты).
 Обновление файла на хосте — по cron на ваше усмотрение. Холодный вариант —
-`docker compose stop`, копия `/data/opentw.db` (после graceful-остановки WAL
-влит в файл), `docker compose start`.
+остановка контейнера (для Quadlet — `systemctl stop opentw`), копия
+`/data/opentw.db` (после graceful-остановки WAL влит в файл), запуск
+(`systemctl start opentw`).
 
-Восстановление в named volume `opentw-data` (старые `-wal`/`-shm` не копируем):
+Восстановление в named volume (старые `-wal`/`-shm` не копируем):
 
 ```bash
-docker compose stop opentw
-docker run --rm -v opentw-data:/data -v "$PWD:/host" alpine \
+systemctl stop opentw
+podman run --rm -v opentw-data:/data -v "$PWD:/host" alpine \
     sh -c 'rm -f /data/opentw.db-* && cp /host/opentw-restore.db /data/opentw.db'
-docker compose start opentw
+systemctl start opentw
 ```
 
 Вместо `opentw-restore.db` подставьте имя вашей резервной копии (созданной
-этой же версией opentw). Проверка после рестарта: `/status` показывает
-историю, `docker compose logs` — без ошибок.
+этой же версией opentw); `opentw-data` замените на имя вашего тома.
+Проверка после рестарта: `/status` показывает историю, `podman logs` — без
+ошибок.
 
 Схема БД — один файл `internal/storage/schema.sql`: новая база создаётся из
 него целиком при первом запуске, маркируется `PRAGMA user_version` и при
@@ -273,7 +287,7 @@ compatible ... start with a clean database` и ничего не удаляет 
 остановки) остаётся за оператором.
 
 **Нельзя:** копировать живой `opentw.db` без `-wal` (потеря последних часов
-записей); `docker compose down -v` и `docker volume prune` — они уничтожают
+записей); `podman volume rm` и `podman volume prune` — они уничтожают
 том со всеми данными. Один инстанс на базу: два процесса на одном файле
 доставят каждое уведомление дважды.
 
@@ -287,7 +301,7 @@ compatible ... start with a clean database` и ничего не удаляет 
 | Все модели 🔴 с ошибкой провайдера | ID в конфиге не совпадают с API — сверьте с `GET /v1/models`; клик по `HTTP 400` открывает карточку с дословным ответом (например `unknown provider for model`) |
 | Панель не закреплена | Бот не администратор или нет права закрепления |
 | `HTTP 429` в панели | Лимит upstream-провайдера, не ошибка ключа мониторинга |
-| `docker ps` показывает `unhealthy` | Heartbeat (`/data/opentw.heartbeat`) не обновлялся дольше порога из `/data/opentw.heartbeat.maxage` (приложение пишет его из фактического `interval`, фолбэк 2820с — формула для конфигурации из примера: 2×15м + худший цикл 16м + минута). Проваленные циклы heartbeat не продлевают: смотрите `docker compose logs opentw` |
+| `podman ps` показывает `unhealthy` | Heartbeat (`/data/opentw.heartbeat`) не обновлялся дольше порога из `/data/opentw.heartbeat.maxage` (приложение пишет его из фактического `interval`, фолбэк 2820с — формула для конфигурации из примера: 2×15м + худший цикл 16м + минута). Проваленные циклы heartbeat не продлевают: смотрите `podman logs opentw` |
 | `storage: database ... is not compatible` | База от старой/чужой версии — начните с чистой базы: остановите инстанс и удалите `opentw.db` вместе с `-wal`/`-shm` (только если история не нужна) |
 | `monitor: cycle failed` в логах, всё остальное работает | Сбой фиксации цикла (обычно диск/БД): циклы продолжаются, состояния не фиксируются до восстановления; события не теряются |
 | Все модели ⚪ `Нет данных` | Совпавший сбой каталога и моделей (ключ/транспорт) — событие не «все упали», а «монитор слеп»; панели вернутся сами |
@@ -296,7 +310,7 @@ compatible ... start with a clean database` и ничего не удаляет 
 
 ```bash
 curl -s "$API_BASE_URL/v1/models" -H "Authorization: Bearer $API_KEY" | head -c 300
-docker compose logs --tail=100 opentw
+podman logs --tail=100 opentw
 sqlite3 opentw.db 'select model_id,last_status,error_type from models;'
 ```
 

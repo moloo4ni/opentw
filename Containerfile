@@ -27,8 +27,9 @@ USER opentw
 # старте. start-period 1200s = 960s + 25% запаса: проверки до этого
 # момента не считаются провалом, ложного unhealthy нет.
 # ВАЖНО: при существенно большем N/concurrency/http_timeout задайте свой
-# healthcheck.start_period в docker-compose (покрыть ceil(N/K)+1 волн таймаута)
-# — значение в образе не угадает произвольный конфиг автоматически.
+# start-period в конфигурации запуска контейнера (Quadlet: HealthStartPeriod=;
+# покрыть ceil(N/K)+1 волн таймаута) — значение в образе не угадает
+# произвольный конфиг автоматически.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=1200s --retries=3 \
   CMD test $(( $(date +%s) - $(stat -c %Y /data/opentw.heartbeat) )) -lt $(cat /data/opentw.heartbeat.maxage 2>/dev/null || echo 2820)
 ENV TZ=Europe/Moscow
