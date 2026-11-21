@@ -48,7 +48,6 @@ type RunnerCfg struct {
 	Concurrency   int
 	MaxTokens     int
 	Interval      time.Duration
-	Perf          PerfCfg
 	Retention     time.Duration // checks older than this are deleted; default 7d
 	HeartbeatPath string        // НЕ пусто — mtime файла = свежесть мониторинга (HEALTHCHECK)
 	// OnCycle готовит события уведомлений цикла (чтения, без записи в БД):
@@ -153,7 +152,7 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 		}
 	}
 	// Сигнатура сбоя каталога — контрольный зонд «монитор сам не может проверить»:
-	// совпадающая ошибка у моделей превращает 🔴/🟡 в ⚪, а не в ложный вал событий.
+	// совпадающая ошибка у моделей превращает 🔴 в ⚪, а не в ложный вал событий.
 	catIssue := catalogIssue(err)
 
 	prevStates := map[string]storage.Model{}
@@ -209,7 +208,7 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 	}
 	// События готовит колбэк (чтения подписчиков, сериализация), записи —
 	// запрещены: единственная связь уже в руках раннера, и ApplyCycle
-	// фиксирует их вместе с состояниями единым коммитом (P0-1).
+	// фиксирует их вместе с состояниями единым коммитом.
 	var events []storage.OutboxEvent
 	if r.cfg.OnCycle != nil {
 		var err error
@@ -220,11 +219,11 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 	// Атомарный итог: либо новые состояния, события и инциденты вместе, либо
 	// ничего — рестарт/сбой посреди цикла не теряет события: следующий цикл
 	// увидит прежние состояния и переоткроет те же переходы (и те же
-	// инцидентные операции — они идемпотентны, D3).
+	// инцидентные операции — они идемпотентны).
 	if err := r.cfg.Store.ApplyCycle(res.Checks, events, incidents...); err != nil {
 		return nil, fmt.Errorf("commit cycle: %w", err)
 	}
-	// Очистка старых измерений и инцидентов — строго ПОСЛЕ коммита цикла (2.4):
+	// Очистка старых измерений и инцидентов — строго ПОСЛЕ коммита цикла:
 	// до коммита она могла удалить инцидент, прочитанный планровщиком →
 	// ApplyCycle падал бы («уже закрыт») и ломал фиксацию состояния цикла.
 	// Атомарность ApplyCycle не затрагивается: очистка — отдельные транзакции.
@@ -244,13 +243,11 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 // logCycle — единственная строка успешного цикла для оператора (I5): без неё
 // здоровая система «молчит», а деградация видна только постфактум.
 func (r *Runner) logCycle(checks map[string]storage.Check, events []storage.OutboxEvent) {
-	var nOK, nDegr, nDown, nUnknown int
+	var nOK, nDown, nUnknown int
 	for _, c := range checks {
 		switch c.Status {
 		case StatusOperational:
 			nOK++
-		case StatusDegraded:
-			nDegr++
 		case StatusDown:
 			nDown++
 		default:
@@ -262,13 +259,13 @@ func (r *Runner) logCycle(checks map[string]storage.Check, events []storage.Outb
 		r.log.Warn("monitor: outbox count failed", "err", err)
 	}
 	r.log.Info("monitor: cycle done",
-		"checked", len(checks), "ok", nOK, "degraded", nDegr, "down", nDown, "unknown", nUnknown,
+		"checked", len(checks), "ok", nOK, "down", nDown, "unknown", nUnknown,
 		"events", len(events), "outbox_pending", pending)
 
 	// A01-5: циклы успешны (heartbeat жив, контейнер healthy), но осмысленных
 	// вердиктов нет — проблемы ключа/шлюза выдают себя только этим сигналом.
 	// Статусы моделей остаются честными ⚪; ложных падений не создаём.
-	if len(checks) > 0 && nOK+nDegr+nDown == 0 {
+	if len(checks) > 0 && nOK+nDown == 0 {
 		r.allUnknownStreak++
 		if r.allUnknownStreak >= 2 {
 			r.log.Error("monitor: no meaningful checks for consecutive cycles - monitor/API problem (key or gateway), not a model outage",
@@ -323,22 +320,30 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 		OutputTokens: raw.OutputTokens,
 		ErrorType:    raw.ErrorKind,
 		ErrorMessage: raw.ErrorMessage,
+		// Оригинальный текст ответа модели/API — дословно; он же
+		// диагностический ответ в карточке модели.
+		Response: raw.Response,
+	}
+	if st == StatusDown && raw.ErrorKind == "" {
+		// HTTP 200, но модель не ответила ожидаемым «OK»: краткий внутренний
+		// тип ошибки — «response»; дословный текст уже в Response, причина
+		// не выдумывается. Названию краткой ошибки место не в длинном тексте.
+		check.ErrorType = "response"
+		check.ErrorMessage = ""
 	}
 
-	if st == StatusOperational {
-		if degraded, reason := r.perfDegraded(m.ID, raw); degraded {
-			st = StatusDegraded
-			check.Status = StatusDegraded
-			check.ErrorType = "perf"
-			check.ErrorMessage = reason
-		}
+	if st == StatusDown && raw.HTTPStatus == 200 && raw.FinishReason != "" {
+		// finish_reason — диагностический факт терминального чанка, а не ответ
+		// модели и не новый ErrorKind. Существующее поле ErrorMessage позволяет
+		// сохранить его без миграции; содержательный текст провайдера не затирается.
+		check.ErrorMessage = appendFinishReason(check.ErrorMessage, raw.FinishReason)
 	}
 
 	if err := r.cfg.Store.InsertCheck(check); err != nil {
 		return check, nil, nil, fmt.Errorf("insert check: %w", err)
 	}
 	// Состояние и инциденты НЕ пишутся здесь: их фиксирует ApplyCycle в конце
-	// цикла одним коммитом с событиями (P0-1, D3) — иначе ранний рестарт/сбой
+	// цикла одним коммитом с событиями — иначе ранний рестарт/сбой
 	// БД терял бы события и оставлял мусорные инциденты.
 	prevStatus := prev.LastStatus
 	op, closed, blindFall := r.planIncident(m.ID, prevStatus, st, check.At)
@@ -353,7 +358,7 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 			Check:    check,
 			Incident: closed,
 		}
-	case prevStatus == StatusUnknown && (st == StatusOperational || st == StatusDegraded) && closed != nil:
+	case prevStatus == StatusUnknown && st == StatusOperational && closed != nil:
 		// Восстановление из ⚪-периода (проблема монитора): инцидент закрылся —
 		// событие должно дойти, иначе подписчик никогда не узнает о восстановлении.
 		tr = &Transition{
@@ -367,7 +372,7 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 		// Модель упала, пока монитор был слеп (⚪), и падение подтверждено
 		// реальным ответом API: событие обязательно — иначе подписчик узнает о
 		// сбое только по панели. Длительность инцидента неизвестна и не
-		// выдумывается: renderer честно помечает это через From=Unknown (D2).
+		// выдумывается: renderer честно помечает это через From=Unknown.
 		tr = &Transition{
 			ModelID: m.ID,
 			From:    prevStatus,
@@ -378,22 +383,35 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 	return check, tr, op, nil
 }
 
-// planIncident решает изменения инцидентов модели на цикл (D3): записи
+// appendFinishReason сохраняет причину завершения генерации в существующей
+// диагностической строке. Это не классификация и не замена Response.
+func appendFinishReason(message, reason string) string {
+	diag := "finish_reason=" + reason
+	if message == "" {
+		return diag
+	}
+	if strings.Contains(message, diag) {
+		return message
+	}
+	return message + "; " + diag
+}
+
+// planIncident решает изменения инцидентов модели на цикл: записи
 // выполняет только Store.ApplyCycle в общей транзакции цикла. Возвращает
 // операцию (nil — менять нечего), закрываемый инцидент (его длительность —
-// в событии) и признак падения, обнаруженного после слепого окна монитора (D2).
+// в событии) и признак падения, обнаруженного после слепого окна монитора.
 // Rules:
 //   - Unknown check result changes nothing: an open incident stays open
 //     (the monitor cannot judge).
 //   - First-sight non-Operational state opens an incident without an event.
 //   - A notifiable change closes the previous incident and opens a new one.
 //   - Recovery from ⚪ closes the still-open incident (event carries duration).
-//   - ⚪→🔴/⚪→🟡 with a matching open incident: the model was in trouble
+//   - ⚪→🔴 with a matching open incident: the model was in trouble
 //     BEFORE the blindness — the incident lives on from the original fall,
-//     no duplicate, no event (2.2).
-//   - ⚪→🔴/⚪→🟡 with no open incident: the model fell DURING the blindness
+//     no duplicate, no event.
+//   - ⚪→🔴 with no open incident: the model fell DURING the blindness
 //     — an incident opens from this check (true start unknown) and the event
-//     reaches subscribers (2.1, D2).
+//     reaches subscribers.
 func (r *Runner) planIncident(modelID string, prev, cur status.Status, at time.Time) (op *storage.IncidentOp, closed *storage.Incident, blindFall bool) {
 	if cur == StatusUnknown {
 		return nil, nil, false
@@ -418,17 +436,17 @@ func (r *Runner) planIncident(modelID string, prev, cur status.Status, at time.T
 		}
 		if open != nil {
 			// слепое окно не меняет картину: открытый инцидент того же состояния
-			// (🟡→⚪→🟡, 🔴→⚪→🔴) живёт с исходного события — без повторного
-			// события, без второго инцидента и без сброса длительности (2.2).
-			// Ухудшение после ⚪ (🟡→⚪→🔴) тоже молчит: инцидент уже открыт,
-			// непрерывность длительности важнее лишнего события.
+			// (🔴→⚪→🔴) живёт с исходного события — без повторного
+			// события, без второго инцидента и без сброса длительности.
+			// Инцидент при этом мог открыться до ⚪; непрерывность
+			// длительности важнее лишнего события.
 			if open.From == cur || cur == StatusDown {
 				return nil, nil, false
 			}
-			// open.From «хуже» cur (🔴→⚪→🟡): улучшение обязано дойти —
-			// обрабатывается общим путём ниже (закрытие + новый инцидент + событие)
+			// (с тремя статусами иных «улучшений» из ⚪ не существует: неоперациональное
+			// состояние только 🔴, и оно погашено выше; путь ниже — теоретический)
 		} else {
-			// состояние возникло В слепое окно (2.1, D2) — инцидент с момента
+			// состояние возникло В слепое окно — инцидент с момента
 			// обнаружения (истинное начало неизвестно), событие обязательно.
 			return &storage.IncidentOp{ModelID: modelID, Open: true, OpenFrom: cur, OpenAt: at}, nil, true
 		}
@@ -494,32 +512,4 @@ func matchesCatalogIssue(catIssue string, raw *api.RawResult) bool {
 		return raw.ErrorKind == "http" && (raw.HTTPStatus == 401 || raw.HTTPStatus == 403)
 	}
 	return false
-}
-
-// perfDegraded compares the current successful result against the model's own
-// recent successful history; the reason explains the decision with numbers.
-func (r *Runner) perfDegraded(modelID string, raw *api.RawResult) (bool, string) {
-	since := time.Now().Add(-24 * time.Hour)
-	recent, err := r.cfg.Store.RecentChecks(modelID, since)
-	if err != nil {
-		return false, ""
-	}
-	samples := make([]PerfSample, 0, len(recent))
-	for _, c := range recent {
-		if c.Status != StatusOperational || c.LatencyUS == nil || *c.LatencyUS <= 0 {
-			continue
-		}
-		s := PerfSample{LatencyUS: *c.LatencyUS}
-		if c.TPS != nil {
-			s.TPS = *c.TPS
-			s.HasTPS = true
-		}
-		samples = append(samples, s)
-	}
-	cur := PerfSample{LatencyUS: raw.LatencyUS}
-	if raw.TPS != nil {
-		cur.TPS = *raw.TPS
-		cur.HasTPS = true
-	}
-	return DegradedByPerf(r.cfg.Perf, samples, cur)
 }

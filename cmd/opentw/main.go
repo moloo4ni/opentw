@@ -23,7 +23,7 @@ import (
 )
 
 // testPrompt — стандартизированный запрос проверки, одинаковый для всех моделей.
-const testPrompt = "Reply with exactly OK."
+const testPrompt = "Reply with exactly \"OK\""
 
 func main() {
 	if err := run(); err != nil {
@@ -112,19 +112,14 @@ func run() error {
 	}
 
 	runner := monitor.NewRunner(monitor.RunnerCfg{
-		API:         apiClient,
-		Store:       store,
-		Models:      models,
-		Concurrency: cfg.Concurrency,
-		MaxTokens:   cfg.MaxTokens,
-		Interval:    cfg.Interval,
-		Perf: monitor.PerfCfg{
-			MinSamples:    cfg.Degradation.MinSamples,
-			LatencyFactor: cfg.Degradation.LatencyFactor,
-			TPSShare:      cfg.Degradation.TPSShare,
-		},
+		API:           apiClient,
+		Store:         store,
+		Models:        models,
+		Concurrency:   cfg.Concurrency,
+		MaxTokens:     cfg.MaxTokens,
+		Interval:      cfg.Interval,
 		HeartbeatPath: filepath.Join(filepath.Dir(cfg.SQLitePath), "opentw.heartbeat"),
-		// События готовит бот; раннер зафиксирует их атомарно с состояниями (P0-1)
+		// События готовит бот; раннер зафиксирует их атомарно с состояниями
 		OnCycle: func(res monitor.CycleResult) ([]storage.OutboxEvent, error) {
 			return bot.OnCycle(context.Background(), res)
 		},

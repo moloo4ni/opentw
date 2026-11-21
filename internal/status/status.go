@@ -2,12 +2,14 @@
 // and telegram layers (keeps the import graph acyclic).
 package status
 
-// Status is one of the four model states.
+// Status is one of the three model states.
+// Model unavailable for any real reason (HTTP, transport, unexpected
+// content) is Down; only monitor-side problems (own auth, broken gateway
+// correlation) are Unknown.
 type Status string
 
 const (
 	Operational Status = "operational"
-	Degraded    Status = "degraded"
 	Down        Status = "down"
 	Unknown     Status = "unknown"
 )
@@ -17,8 +19,6 @@ func (s Status) Emoji() string {
 	switch s {
 	case Operational:
 		return "🟢"
-	case Degraded:
-		return "🟡"
 	case Down:
 		return "🔴"
 	default:
@@ -27,7 +27,7 @@ func (s Status) Emoji() string {
 }
 
 // Notifiable reports whether the state participates in event notifications
-// (only 🟢/🟡/🔴 transitions are events; ⚪ is a monitoring problem).
+// (only 🟢/🔴 transitions are events; ⚪ is a monitoring problem).
 func (s Status) Notifiable() bool {
-	return s == Operational || s == Degraded || s == Down
+	return s == Operational || s == Down
 }

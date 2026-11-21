@@ -19,13 +19,6 @@ const (
 	minTokens      = 1
 )
 
-// Degradation holds conservative performance-degradation thresholds.
-type Degradation struct {
-	MinSamples    int     `yaml:"min_samples"`
-	LatencyFactor float64 `yaml:"latency_factor"`
-	TPSShare      float64 `yaml:"tps_share"`
-}
-
 // ModelCfg is one model family group with exact model IDs.
 type ModelCfg struct {
 	Family string   `yaml:"family"`
@@ -46,12 +39,7 @@ type Config struct {
 	MaxTokens   int           `yaml:"max_tokens"`
 	Streaming   bool          `yaml:"streaming"`
 	SQLitePath  string        `yaml:"sqlite_path"`
-	Degradation struct {
-		MinSamples    int     `yaml:"min_samples"`
-		LatencyFactor float64 `yaml:"latency_factor"`
-		TPSShare      float64 `yaml:"tps_share"`
-	} `yaml:"degradation"`
-	Models []ModelCfg `yaml:"models"`
+	Models      []ModelCfg    `yaml:"models"`
 
 	modelIDs []string // flattened, unique
 }
@@ -69,13 +57,10 @@ func Load(path string) (*Config, error) {
 		Interval:    15 * time.Minute,
 		HTTPTimeout: 120 * time.Second,
 		Concurrency: 4,
-		MaxTokens:   64,
+		MaxTokens:   256,
 		Streaming:   true,
 		SQLitePath:  "opentw.db",
 	}
-	cfg.Degradation.MinSamples = 12
-	cfg.Degradation.LatencyFactor = 3.0
-	cfg.Degradation.TPSShare = 0.4
 	if err := yaml.Unmarshal(raw, cfg); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
@@ -104,9 +89,6 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.MaxTokens < minTokens {
 		return nil, fmt.Errorf("config: max_tokens must be >= %d", minTokens)
-	}
-	if cfg.Degradation.MinSamples < 2 || cfg.Degradation.LatencyFactor <= 1 || cfg.Degradation.TPSShare <= 0 || cfg.Degradation.TPSShare >= 1 {
-		return nil, fmt.Errorf("config: invalid degradation settings (need min_samples>=2, latency_factor>1, 0<tps_share<1)")
 	}
 	if len(cfg.Models) == 0 {
 		return nil, fmt.Errorf("config: at least one model is required")

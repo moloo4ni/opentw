@@ -19,11 +19,12 @@ import (
 
 // fakeAPI is a scriptable api.Client stand-in.
 type fakeAPI struct {
-	mu       sync.Mutex
-	catalog  []string
-	catErr   error
-	hook     func(modelID string) *api.RawResult
-	genCalls map[string]int
+	mu            sync.Mutex
+	catalog       []string
+	catErr        error
+	hook          func(modelID string) *api.RawResult
+	genCalls      map[string]int
+	lastMaxTokens int
 }
 
 func newFakeAPI(catalog []string) *fakeAPI {
@@ -40,6 +41,7 @@ func (f *fakeAPI) ListModels(ctx context.Context) ([]string, error) {
 func (f *fakeAPI) Generate(ctx context.Context, modelID string, maxTokens int) *api.RawResult {
 	f.mu.Lock()
 	f.genCalls[modelID]++
+	f.lastMaxTokens = maxTokens
 	f.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return &api.RawResult{ModelID: modelID, ErrorKind: "cancelled", ErrorMessage: err.Error()}
@@ -53,21 +55,29 @@ func (f *fakeAPI) calls(modelID string) int {
 	return f.genCalls[modelID]
 }
 
+func (f *fakeAPI) usedMaxTokens() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastMaxTokens
+}
+
 func ptrLat(v int64) *int64 { return &v }
 
-func ptrFloat(v float64) *float64 { return &v }
-
+// okResult — успешная проверка: итоговый ответ ровно «OK» (Content/Response,
+// как их заполняет api.Client).
 func okResult(id string, latUS int64, tps float64) *api.RawResult {
 	return &api.RawResult{
 		ModelID: id, Timestamp: time.Now(), ErrorKind: "", HTTPStatus: 200,
 		LatencyUS: latUS, TTFTUS: ptrLat(latUS / 3), GenUS: ptrLat(latUS * 2 / 3),
 		TPS: &tps, InputTokens: ptrLat(10), OutputTokens: ptrLat(8),
+		Content: "OK", Response: "OK",
 		Streamed: true,
 	}
 }
 
+// errResult — HTTP-ошибка провайдера: Response дословно несёт его текст.
 func errResult(id string, status int, msg string) *api.RawResult {
-	return &api.RawResult{ModelID: id, Timestamp: time.Now(), ErrorKind: "http", HTTPStatus: status, ErrorMessage: msg, LatencyUS: 40_000}
+	return &api.RawResult{ModelID: id, Timestamp: time.Now(), ErrorKind: "http", HTTPStatus: status, ErrorMessage: msg, Response: msg, LatencyUS: 40_000}
 }
 
 func newRunner(t *testing.T, f *fakeAPI, models []storage.Model) (*Runner, *[]CycleResult) {
@@ -88,7 +98,6 @@ func newRunner(t *testing.T, f *fakeAPI, models []storage.Model) (*Runner, *[]Cy
 		Concurrency: 2,
 		MaxTokens:   8,
 		Interval:    time.Minute,
-		Perf:        PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4},
 		OnCycle: func(res CycleResult) ([]storage.OutboxEvent, error) {
 			*results = append(*results, res)
 			return nil, nil
@@ -141,6 +150,20 @@ func basicModels() []storage.Model {
 	return []storage.Model{
 		{ID: "model-a", Family: "A"},
 		{ID: "model-b", Family: "B"},
+	}
+}
+
+// Настроенный лимит доходит до каждой реальной генерации без per-model исключений.
+func TestRunnerUsesConfiguredMaxTokens(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	r.cfg.MaxTokens = 256
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.usedMaxTokens(); got != 256 {
+		t.Fatalf("Generate received max_tokens=%d, want 256", got)
 	}
 }
 
@@ -246,24 +269,152 @@ func TestSameStatusNoRepeatEvents(t *testing.T) {
 	}
 }
 
-func TestDownToDegradedPartialRecovery(t *testing.T) {
+// HTTP 200 с «иностранным» текстом вместо OK: Down, error_type 'response',
+// Response — дословный текст, ErrorMessage пуст.
+func TestForeignTextDownVerbatimResponse(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
-	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
-	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
-	if _, err := r.RunCycle(context.Background()); err != nil {
-		t.Fatal(err)
+	foreign := "抱歉，无法处理该请求。"
+	f.hook = func(id string) *api.RawResult {
+		return &api.RawResult{ModelID: id, Timestamp: time.Now(), ErrorKind: "", HTTPStatus: 200,
+			Content: foreign, Response: foreign, LatencyUS: 500_000}
 	}
-	f.hook = func(id string) *api.RawResult { return errResult(id, 429, "Upstream rate limit") }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
 	res, err := r.RunCycle(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Transitions) != 1 {
-		t.Fatalf("transitions = %+v", res.Transitions)
+	c := res.Checks["model-a"]
+	if c.Status != StatusDown {
+		t.Fatalf("status = %q, want down", c.Status)
 	}
-	tr := res.Transitions[0]
-	if tr.From != StatusDown || tr.To != StatusDegraded {
-		t.Fatalf("transition = %+v", tr)
+	if c.ErrorType != "response" {
+		t.Fatalf("error type = %q, want response", c.ErrorType)
+	}
+	if c.ErrorMessage != "" {
+		t.Fatalf("no reason is invented for a bad answer: %q", c.ErrorMessage)
+	}
+	if c.Response != foreign {
+		t.Fatalf("response must keep the verbatim text: %q", c.Response)
+	}
+	m, _ := r.Store().Model("model-a")
+	if m.LastStatus != StatusDown {
+		t.Fatalf("state = %q, want down", m.LastStatus)
+	}
+	last, _ := r.Store().LastChecks()
+	if last["model-a"].Response != foreign || last["model-a"].ErrorType != "response" {
+		t.Fatalf("check row lost the verbatim response: %+v", last["model-a"])
+	}
+}
+
+// Строка проверки переносит дословный Response и краткий ErrorType из
+// RawResult: текст провайдера у http-ошибки, пустой Response у транспортной.
+func TestCheckRowCarriesResponseAndErrorType(t *testing.T) {
+	f := newFakeAPI([]string{"model-a", "model-b", "model-c"})
+	f.hook = func(id string) *api.RawResult {
+		switch id {
+		case "model-a":
+			return errResult(id, 429, "Too Many Requests")
+		case "model-b":
+			return &api.RawResult{ModelID: id, Timestamp: time.Now(), ErrorKind: "timeout",
+				ErrorMessage: "context deadline exceeded", LatencyUS: 9_000_000}
+		default:
+			return okResult(id, 1_000_000, 40)
+		}
+	}
+	r, _ := newRunner(t, f, basicModelsPlusC())
+	if _, err := r.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	last, _ := r.Store().LastChecks()
+	if c := last["model-a"]; c.ErrorType != "http" || c.Response != "Too Many Requests" {
+		t.Fatalf("http check must carry the provider text verbatim: %+v", c)
+	}
+	if c := last["model-b"]; c.ErrorType != "timeout" || c.Response != "" {
+		t.Fatalf("transport error has no quotable response: %+v", c)
+	}
+	if c := last["model-c"]; c.Response != "OK" || c.ErrorType != "" {
+		t.Fatalf("successful check must carry the generated answer: %+v", c)
+	}
+}
+
+// Пустой итоговый ответ с finish_reason=length остаётся Down, но причина
+// завершения сохраняется через существующее диагностическое поле без миграции.
+func TestEmptyResponseFinishReasonPersisted(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult {
+		return &api.RawResult{
+			ModelID: id, Timestamp: time.Now(), ErrorKind: "", HTTPStatus: 200,
+			LatencyUS: 4_100_000, OutputTokens: ptrLat(64), FinishReason: "length",
+		}
+	}
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := res.Checks["model-a"]
+	if c.Status != StatusDown {
+		t.Fatalf("empty final content must stay Down, got %q", c.Status)
+	}
+	if c.Response != "" {
+		t.Fatalf("empty final content must not be replaced: %q", c.Response)
+	}
+	if c.ErrorType != "response" {
+		t.Fatalf("error type = %q, want response", c.ErrorType)
+	}
+	if c.ErrorMessage != "finish_reason=length" {
+		t.Fatalf("finish reason diagnostic = %q, want finish_reason=length", c.ErrorMessage)
+	}
+	last, _ := r.Store().LastChecks()
+	if last["model-a"].ErrorMessage != "finish_reason=length" {
+		t.Fatalf("persisted finish reason = %q, want finish_reason=length", last["model-a"].ErrorMessage)
+	}
+}
+
+// Провайдерское сообщение нельзя затирать диагностикой завершения.
+func TestEmptyResponseFinishReasonPreservesProviderMessage(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult {
+		return &api.RawResult{
+			ModelID: id, Timestamp: time.Now(), ErrorKind: "empty", HTTPStatus: 200,
+			LatencyUS: 4_100_000, ErrorMessage: "No available accounts", Response: "No available accounts",
+			FinishReason: "length",
+		}
+	}
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := res.Checks["model-a"]
+	if c.Status != StatusDown {
+		t.Fatalf("status = %q, want Down", c.Status)
+	}
+	if c.ErrorMessage != "No available accounts; finish_reason=length" {
+		t.Fatalf("provider message was overwritten: %q", c.ErrorMessage)
+	}
+}
+
+func basicModelsPlusC() []storage.Model {
+	return append(basicModels(), storage.Model{ID: "model-c", Family: "C"})
+}
+
+// Очень высокая latency при ответе OK — Operational: никакой
+// «деградации по производительности» больше не существует.
+func TestHighLatencyOKStaysOperational(t *testing.T) {
+	f := newFakeAPI([]string{"model-a"})
+	f.hook = func(id string) *api.RawResult { return okResult(id, 120_000_000, 1) }
+	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
+	res, err := r.RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := res.Checks["model-a"]
+	if c.Status != StatusOperational {
+		t.Fatalf("high latency with OK must stay operational, got %q", c.Status)
+	}
+	if c.LatencyUS == nil || *c.LatencyUS != 120_000_000 {
+		t.Fatalf("latency must still be recorded: %+v", c)
 	}
 }
 
@@ -306,57 +457,6 @@ func TestCatalogFailureStillChecks(t *testing.T) {
 	}
 	if len(res.Checks) != 1 {
 		t.Fatalf("checks = %+v", res.Checks)
-	}
-}
-
-func TestPerfDegradationUsesHistory(t *testing.T) {
-	f := newFakeAPI([]string{"model-a"})
-	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) } // latency 1s
-	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
-	now := time.Now()
-	for i := 0; i < 12; i++ {
-		lat := ptrLat(100_000)
-		tps := 40.0
-		if err := r.Store().InsertCheck(storage.Check{
-			ModelID: "model-a", At: now.Add(-time.Duration(24-i) * time.Minute),
-			HTTPStatus: 200, Status: StatusOperational, LatencyUS: lat, TPS: &tps,
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := r.Store().SetModelState("model-a", StatusOperational, "", "", now.Add(-time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	res, err := r.RunCycle(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, _ := r.Store().Model("model-a")
-	if m.LastStatus != StatusDegraded {
-		t.Fatalf("latency 10x history must degrade, got %q", m.LastStatus)
-	}
-	if m.ErrorType != "perf" {
-		t.Fatalf("error type = %q", m.ErrorType)
-	}
-	if len(res.Transitions) != 1 || res.Transitions[0].To != StatusDegraded {
-		t.Fatalf("transitions = %+v", res.Transitions)
-	}
-}
-
-func TestPerfDegradationInsufficientHistory(t *testing.T) {
-	f := newFakeAPI([]string{"model-a"})
-	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
-	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
-	res, err := r.RunCycle(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, _ := r.Store().Model("model-a")
-	if m.LastStatus != StatusOperational {
-		t.Fatalf("no history must stay operational, got %q", m.LastStatus)
-	}
-	if len(res.Transitions) != 0 {
-		t.Fatal("no transition expected")
 	}
 }
 
@@ -581,7 +681,7 @@ func TestRestartWhileDownNoFalseTransitions(t *testing.T) {
 		}
 		f := newFakeAPI([]string{"model-a", "model-b"})
 		f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
-		return NewRunner(RunnerCfg{API: f, Store: s, Models: basicModels(), Concurrency: 2, MaxTokens: 8, Interval: time.Minute, Perf: PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4}})
+		return NewRunner(RunnerCfg{API: f, Store: s, Models: basicModels(), Concurrency: 2, MaxTokens: 8, Interval: time.Minute})
 	}
 	r1 := mkRunner()
 	if _, err := r1.RunCycle(context.Background()); err != nil {
@@ -597,36 +697,6 @@ func TestRestartWhileDownNoFalseTransitions(t *testing.T) {
 	}
 	if open, _ := r2.Store().HasOpenIncident("model-a"); !open {
 		t.Fatal("incident must continue across restart")
-	}
-}
-
-// Основа perf-деградации видна в данных проверки (числа, не слова).
-func TestPerfReasonInCheck(t *testing.T) {
-	f := newFakeAPI([]string{"model-a"})
-	f.hook = func(id string) *api.RawResult { return okResult(id, 10_000_000, 40) } // latency 10s
-	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
-	now := time.Now()
-	for i := 0; i < 12; i++ {
-		if err := r.Store().InsertCheck(storage.Check{
-			ModelID: "model-a", At: now.Add(-time.Duration(24-i) * time.Minute),
-			HTTPStatus: 200, Status: StatusOperational, LatencyUS: ptrLat(100_000), TPS: ptrFloat(40.0),
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := r.Store().SetModelState("model-a", StatusOperational, "", "", now.Add(-time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	res, err := r.RunCycle(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := res.Checks["model-a"]
-	if c.ErrorType != "perf" {
-		t.Fatalf("check = %+v", c)
-	}
-	if !strings.Contains(c.ErrorMessage, "latency 10.0s") || !strings.Contains(c.ErrorMessage, "P95") {
-		t.Fatalf("perf reason must carry numbers, got %q", c.ErrorMessage)
 	}
 }
 
@@ -1092,8 +1162,8 @@ func newRunnerAt(t *testing.T, f *fakeAPI, models []storage.Model, interval time
 	}
 	r := NewRunner(RunnerCfg{
 		API: f, Store: s, Models: models, Concurrency: 2, MaxTokens: 8,
-		Interval: interval, Perf: PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4},
-		OnCycle: onCycle,
+		Interval: interval,
+		OnCycle:  onCycle,
 	})
 	return r, s
 }
@@ -1208,124 +1278,6 @@ func TestRunCancelDuringCycleWaitsForIt(t *testing.T) {
 
 // --- Этап 2: переходы состояний ---
 
-// 2.1: 🟢 → ⚪ → 🟡 — деградация, обнаруженная после слепого окна,
-// обязана дойти до подписчика: событие From=⚪ (длительность неизвестна —
-// не выдумываем), инцидент открывается.
-func TestDegradationAfterBlindnessNotified(t *testing.T) {
-	f := newFakeAPI([]string{"model-a"})
-	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
-	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
-	if _, err := r.RunCycle(context.Background()); err != nil { // 🟢 базлайн
-		t.Fatal(err)
-	}
-	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
-	if _, err := r.RunCycle(context.Background()); err != nil { // ⚪ слепота
-		t.Fatal(err)
-	}
-	f.hook = func(id string) *api.RawResult { return errResult(id, 429, "rate limit hit") }
-	res, err := r.RunCycle(context.Background()) // зрение вернулось: 🟡
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Transitions) != 1 {
-		t.Fatalf("degradation after blindness must reach subscribers: %+v", res.Transitions)
-	}
-	tr := res.Transitions[0]
-	if tr.From != StatusUnknown || tr.To != StatusDegraded {
-		t.Fatalf("transition = %+v", tr)
-	}
-	if tr.Incident != nil && tr.Incident.Duration > 0 {
-		t.Fatalf("start time unseen by the monitor — duration must not be fabricated: %+v", tr.Incident)
-	}
-	if open, _ := r.Store().HasOpenIncident("model-a"); !open {
-		t.Fatal("incident must open on the discovered degradation")
-	}
-	m, _ := r.Store().Model("model-a")
-	if m.LastStatus != StatusDegraded {
-		t.Fatalf("state must be committed as Degraded: %+v", m)
-	}
-}
-
-// 2.2: 🟡 → ⚪ → 🟡 при живом согласованном инциденте: ни повторного события,
-// ни второго инцидента, ни сброса длительности; история переживает рестарт.
-func TestDegradedBlindDegradedKeepsIncident(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := dir + "/test.db"
-	mkRunner := func() *Runner {
-		s, err := storage.Open(dbPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := s.SyncModels([]storage.Model{{ID: "model-a", Family: "A"}}); err != nil {
-			t.Fatal(err)
-		}
-		f := newFakeAPI([]string{"model-a"})
-		f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
-		return NewRunner(RunnerCfg{API: f, Store: s, Models: []storage.Model{{ID: "model-a", Family: "A"}},
-			Concurrency: 2, MaxTokens: 8, Interval: time.Minute, Perf: PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4}})
-	}
-	r := mkRunner()
-	if _, err := r.RunCycle(context.Background()); err != nil { // 🟢
-		t.Fatal(err)
-	}
-	r.cfg.API.(*fakeAPI).hook = func(id string) *api.RawResult { return errResult(id, 429, "rate limit") }
-	if _, err := r.RunCycle(context.Background()); err != nil { // 🟡: событие + инцидент
-		t.Fatal(err)
-	}
-	inc, err := r.Store().CurrentIncident("model-a")
-	if err != nil || inc == nil {
-		t.Fatalf("degradation must open an incident: %v %v", inc, err)
-	}
-	origID := inc.ID
-	r.cfg.API.(*fakeAPI).hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
-	if _, err := r.RunCycle(context.Background()); err != nil { // ⚪ слепота
-		t.Fatal(err)
-	}
-	// рестарт: раннер на той же базе
-	r2 := mkRunner()
-	r2.cfg.API.(*fakeAPI).hook = func(id string) *api.RawResult { return errResult(id, 429, "rate limit") }
-	res, err := r2.RunCycle(context.Background()) // снова 🟡
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Transitions) != 0 {
-		t.Fatalf("same-state degradation must not produce a repeat event: %+v", res.Transitions)
-	}
-	inc2, err := r2.Store().CurrentIncident("model-a")
-	if err != nil || inc2 == nil {
-		t.Fatalf("incident must stay open: %v %v", inc2, err)
-	}
-	if inc2.ID != origID {
-		t.Fatalf("same continuous degradation must keep the SAME incident: was %d, now %d (duplicated)", origID, inc2.ID)
-	}
-	// восстановление: событие с длительностью от исходной деградации
-	time.Sleep(10 * time.Millisecond)
-	r2.cfg.API.(*fakeAPI).hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
-	res, err = r2.RunCycle(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Transitions) != 1 {
-		t.Fatalf("recovery must emit: %+v", res.Transitions)
-	}
-	rec := res.Transitions[0]
-	if rec.To != StatusOperational {
-		t.Fatalf("recovery transition = %+v", rec)
-	}
-	if rec.Incident == nil || rec.Incident.ID != origID {
-		t.Fatalf("recovery must close the original incident: %+v", rec.Incident)
-	}
-	if !rec.Incident.Started.Equal(inc.Started) {
-		t.Fatalf("incident start must not be reset: was %v, got %v", inc.Started, rec.Incident.Started)
-	}
-	if rec.Incident.Duration <= 0 {
-		t.Fatalf("continuous degradation duration must survive: %+v", rec.Incident)
-	}
-	if open, _ := r2.Store().HasOpenIncident("model-a"); open {
-		t.Fatal("recovery must close the incident")
-	}
-}
-
 // 2.3: инцидент модели, покинувшей конфигурацию, не остаётся открытым
 // навсегда — закрывается при синхронизации, возврат модели ничего не ломает.
 func TestRemovedModelIncidentNotOrphaned(t *testing.T) {
@@ -1341,7 +1293,7 @@ func TestRemovedModelIncidentNotOrphaned(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := NewRunner(RunnerCfg{API: f, Store: s, Models: models, Concurrency: 1, MaxTokens: 8,
-		Interval: time.Minute, Perf: PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4}})
+		Interval: time.Minute})
 	if _, err := r.RunCycle(context.Background()); err != nil { // 🔴 + инцидент
 		t.Fatal(err)
 	}
@@ -1360,7 +1312,7 @@ func TestRemovedModelIncidentNotOrphaned(t *testing.T) {
 		t.Fatal(err)
 	}
 	r2 := NewRunner(RunnerCfg{API: f, Store: s, Models: models, Concurrency: 1, MaxTokens: 8,
-		Interval: time.Minute, Perf: PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4}})
+		Interval: time.Minute})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
 	res, err := r2.RunCycle(context.Background())
 	if err != nil {
@@ -1396,7 +1348,7 @@ func TestRetentionCleanupDoesNotBreakCycleCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := NewRunner(RunnerCfg{API: f, Store: s, Models: models, Concurrency: 1, MaxTokens: 8,
-		Interval: time.Minute, Perf: PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4}})
+		Interval: time.Minute})
 	res, err := r.RunCycle(context.Background()) // восстановление закрывает старый инцидент
 	if err != nil {
 		t.Fatalf("retention cleanup must not break the cycle commit: %v", err)
@@ -1416,7 +1368,8 @@ func TestRetentionCleanupDoesNotBreakCycleCommit(t *testing.T) {
 	}
 }
 
-// Матрица значимых переходов prev × cur: согласованные событие и инциденты.
+// Матрица значимых переходов prev × cur (три статуса): согласованные
+// событие и инциденты. Degraded не существует.
 func TestTransitionMatrix(t *testing.T) {
 	type tcase struct {
 		name       string
@@ -1428,19 +1381,14 @@ func TestTransitionMatrix(t *testing.T) {
 	}
 	cases := []tcase{
 		{"green→green", StatusOperational, StatusOperational, "", 0, false, false},
-		{"yellow→yellow", StatusDegraded, StatusDegraded, StatusDegraded, 0, true, true},
 		{"red→red", StatusDown, StatusDown, StatusDown, 0, true, true},
 		{"unknown→unknown", StatusUnknown, StatusUnknown, "", 0, false, false},
-		{"green→yellow", StatusOperational, StatusDegraded, "", 1, true, false},
 		{"green→red", StatusOperational, StatusDown, "", 1, true, false},
-		{"yellow→green", StatusDegraded, StatusOperational, StatusDegraded, 1, false, false},
 		{"red→green", StatusDown, StatusOperational, StatusDown, 1, false, false},
-		{"yellow→red", StatusDegraded, StatusDown, StatusDegraded, 1, true, false},
-		{"red→yellow", StatusDown, StatusDegraded, StatusDown, 1, true, false},
 		{"green→unknown", StatusOperational, StatusUnknown, "", 0, false, false},
-		{"yellow→unknown", StatusDegraded, StatusUnknown, StatusDegraded, 0, true, true},
-		{"red→unknown", StatusDown, StatusUnknown, StatusDown, 0, true, true},
-		// восстановление из ⚪ без инцидента (был 🟢): события нет
+		// инцидент переживает слепоту монитора: без события и дубля
+		{"red→unknown,inc", StatusDown, StatusUnknown, StatusDown, 0, true, true},
+		// восстановление из ⚪ без инцидента (была 🟢): события нет
 		{"unknown→green,no-inc", StatusUnknown, StatusOperational, "", 0, false, false},
 		// восстановление из ⚪ с открытым инцидентом: событие + закрытие
 		{"unknown→green,inc", StatusUnknown, StatusOperational, StatusDown, 1, false, false},
@@ -1448,10 +1396,6 @@ func TestTransitionMatrix(t *testing.T) {
 		{"unknown→red,no-inc", StatusUnknown, StatusDown, "", 1, true, false},
 		// 🔴 живёт через ⚪: инцидент тот же, события нет (Rev-5)
 		{"unknown→red,inc", StatusUnknown, StatusDown, StatusDown, 0, true, true},
-		// 2.2: 🟡 живёт через ⚪: инцидент тот же, события нет
-		{"unknown→yellow,inc", StatusUnknown, StatusDegraded, StatusDegraded, 0, true, true},
-		// 2.1: 🟡 обнаружена в слепое окно: событие + инцидент
-		{"unknown→yellow,no-inc", StatusUnknown, StatusDegraded, "", 1, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1506,8 +1450,6 @@ func resultHook(st Status) func(string) *api.RawResult {
 	switch st {
 	case StatusOperational:
 		return func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
-	case StatusDegraded:
-		return func(id string) *api.RawResult { return errResult(id, 429, "most likely rate limit") }
 	case StatusDown:
 		return func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
 	default:

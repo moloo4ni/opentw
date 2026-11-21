@@ -1,7 +1,6 @@
 package monitor
 
 import (
-	"strings"
 	"testing"
 
 	"opentw/internal/api"
@@ -11,25 +10,42 @@ func mk(kind string, httpStatus int) api.RawResult {
 	return api.RawResult{ErrorKind: kind, HTTPStatus: httpStatus}
 }
 
+func msg(kind string, httpStatus int, m string) api.RawResult {
+	return api.RawResult{ErrorKind: kind, HTTPStatus: httpStatus, ErrorMessage: m}
+}
+
+func contentOK(kind string, content string) api.RawResult {
+	return api.RawResult{ErrorKind: kind, HTTPStatus: 200, Content: content, Response: content}
+}
+
+// Матрица классификации 15.1: успешна только проверка с итоговым
+// содержимым «OK» (без reasoning); любой иной текст при HTTP 200 — Down;
+// проблемы самого монитора — Unknown.
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		name string
 		res  api.RawResult
 		want Status
 	}{
-		{"success stream", mk("", 200), StatusOperational},
-		{"success no stream", mk("", 200), StatusOperational},
-		{"empty generation", mk("empty", 200), StatusDegraded},
-		{"http 429 upstream rate limit", mk("http", 429), StatusDegraded},
-		{"http 503", mk("http", 503), StatusDown},
+		{"200 + OK", contentOK("", "OK"), StatusOperational},
+		{"200 + OK снаружи-пробелами", contentOK("", " OK\n"), StatusOperational},
+		{"200 + OK, высокая latency", api.RawResult{ErrorKind: "", HTTPStatus: 200, Content: "OK", LatencyUS: 120_000_000}, StatusOperational},
+		{"200 + китайский текст", contentOK("", "抱歉，无法回答这个问题。"), StatusDown},
+		{"200 + английский текст об ошибке", contentOK("", "Sorry, I cannot do that."), StatusDown},
+		{"200 + русский текст", contentOK("", "Извините, я не могу выполнить этот запрос."), StatusDown},
+		{"200 + любой иной текст", contentOK("", "Hello!"), StatusDown},
+		{"200 + lowercase OK", contentOK("", "ok"), StatusDown},
+		{"200 + пустой ответ (empty)", mk("empty", 200), StatusDown},
+		{"200 + только reasoning, без итога", api.RawResult{ErrorKind: "", HTTPStatus: 200, Content: ""}, StatusDown},
+		{"http 429", mk("http", 429), StatusDown},
+		{"http 404", mk("http", 404), StatusDown},
 		{"http 500", mk("http", 500), StatusDown},
-		{"http 502", mk("http", 502), StatusDown},
-		{"http 404 model not found", mk("http", 404), StatusDown},
+		{"http 503", mk("http", 503), StatusDown},
+		{"timeout", mk("timeout", 0), StatusDown},
+		{"connection refused", mk("connrefused", 0), StatusDown},
 		{"http 401 auth", mk("http", 401), StatusUnknown},
 		{"http 403 forbidden", mk("http", 403), StatusUnknown},
 		{"http 400 incompatible request", mk("http", 400), StatusUnknown},
-		{"timeout", mk("timeout", 0), StatusDown},
-		{"connection refused", mk("connrefused", 0), StatusDown},
 		{"invalid response", mk("invalid", 0), StatusUnknown},
 	}
 	for _, tc := range cases {
@@ -39,7 +55,75 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-func TestClassySkipCancelled(t *testing.T) {
+// reasoning не является ответом: «мусор» в reasoning при итоговом «OK» —
+// Operational; «OK» в reasoning при ином итоговом тексте — Down.
+func TestClassifyReasoningIgnoredForVerdict(t *testing.T) {
+	if got := Classify(contentOK("", "OK")); got != StatusOperational {
+		t.Errorf("reasoning мусора не видно: итог OK → %q", got)
+	}
+	if got := Classify(contentOK("", "Не могу ответить")); got != StatusDown {
+		t.Errorf("reasoning OK не спасает: итог не OK → %q", got)
+	}
+	if got := Classify(api.RawResult{ErrorKind: "", HTTPStatus: 200, Content: "OK"}); got != StatusOperational {
+		t.Errorf("без reasoning: итог OK → %q", got)
+	}
+}
+
+// Пользовательский контракт: отдельное служебное reasoning поле не меняет
+// классификацию; итоговый content обязан быть ровно OK после TrimSpace.
+// Reasoning непосредственно в content — это пользовательский текст и Down.
+func TestClassifyStrictUserContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    Status
+	}{
+		{"separate reasoning and OK", "OK", StatusOperational},
+		{"no reasoning and OK", "OK", StatusOperational},
+		{"reasoning text as content", "Let me think through this carefully...", StatusDown},
+		{"reasoning marker and OK as content", "<think>...OK", StatusDown},
+		{"reasoning plus answer", "reasoning + answer", StatusDown},
+		{"OK with outer spaces", " OK ", StatusOperational},
+		{"OK with punctuation", "OK.", StatusDown},
+		{"lowercase ok", "ok", StatusDown},
+		{"empty final content", "", StatusDown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := api.RawResult{
+				ErrorKind:    "",
+				HTTPStatus:   200,
+				Content:      tc.content,
+				Response:     tc.content,
+				FinishReason: "stop",
+			}
+			if got := Classify(res); got != tc.want {
+				t.Fatalf("Classify(%q) = %q, want %q", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestContentOK(t *testing.T) {
+	for _, tc := range []struct {
+		content string
+		want    bool
+	}{
+		{"OK", true},
+		{"  OK  ", true},
+		{"\nOK\r\n", true},
+		{"ok", false},  // регистр важен
+		{"OK.", false}, // ровно «OK»
+		{"", false},
+		{"OK OK", false},
+	} {
+		if got := ContentOK(tc.content); got != tc.want {
+			t.Errorf("ContentOK(%q) = %v, want %v", tc.content, got, tc.want)
+		}
+	}
+}
+
+func TestClassifySkipsCancelled(t *testing.T) {
 	// cancelled — не результат проверки вовсе; отдельного статуса не имеет
 	// (вызывающая сторона обязана отфильтровать его до записи)
 	defer func() {
@@ -48,91 +132,6 @@ func TestClassySkipCancelled(t *testing.T) {
 		}
 	}()
 	Classify(mk("cancelled", 0))
-}
-
-func samples(lat []int64, tps []float64) []PerfSample {
-	out := make([]PerfSample, len(lat))
-	for i, l := range lat {
-		out[i] = PerfSample{LatencyUS: l}
-		if tps != nil && i < len(tps) {
-			out[i].TPS = tps[i]
-			out[i].HasTPS = true
-		}
-	}
-	return out
-}
-
-func TestDegradedByPerf(t *testing.T) {
-	cfg := PerfCfg{MinSamples: 12, LatencyFactor: 3.0, TPSShare: 0.4}
-
-	// 12 стабильных исторических образцов: latency 90–110ms, TPS 95–105
-	histLat := make([]int64, 12)
-	histTPS := make([]float64, 12)
-	for i := range histLat {
-		histLat[i] = 90_000 + int64(i)*2_000 // 90..112ms
-		histTPS[i] = 95 + float64(i)*0.9
-	}
-
-	t.Run("insufficient history", func(t *testing.T) {
-		s := samples(histLat[:11], nil)
-		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 10_000_000}); degraded {
-			t.Fatal("must not degrade with too few samples")
-		}
-	})
-
-	t.Run("latency spike", func(t *testing.T) {
-		s := samples(histLat, nil)
-		degraded, reason := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 1_000_000})
-		if !degraded {
-			t.Fatal("latency 10x history must degrade")
-		}
-		if !strings.Contains(reason, "P95") {
-			t.Fatalf("latency reason must cite P95: %q", reason)
-		}
-	})
-
-	t.Run("small fluctuation", func(t *testing.T) {
-		s := samples(histLat, nil)
-		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 120_000}); degraded {
-			t.Fatal("1.2x fluctuation must not degrade")
-		}
-	})
-
-	t.Run("tps collapse", func(t *testing.T) {
-		s := samples(histLat, histTPS)
-		degraded, reason := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 10, HasTPS: true})
-		if !degraded {
-			t.Fatal("TPS collapse must degrade")
-		}
-		if !strings.Contains(reason, "медианы") {
-			t.Fatalf("tps reason must cite median: %q", reason)
-		}
-	})
-
-	t.Run("tps mild dip", func(t *testing.T) {
-		s := samples(histLat, histTPS)
-		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 80, HasTPS: true}); degraded {
-			t.Fatal("TPS 80 of ~100 must not degrade (share 0.4)")
-		}
-	})
-
-	t.Run("current without tps ignores tps rule", func(t *testing.T) {
-		s := samples(histLat, histTPS)
-		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000}); degraded {
-			t.Fatal("latency fine, no TPS data — must not degrade")
-		}
-	})
-
-	t.Run("history without tps skips tps rule", func(t *testing.T) {
-		s := samples(histLat, nil)
-		if degraded, _ := DegradedByPerf(cfg, s, PerfSample{LatencyUS: 100_000, TPS: 1, HasTPS: true}); degraded {
-			t.Fatal("no TPS history: rule cannot fire")
-		}
-	})
-}
-
-func msg(kind string, httpStatus int, m string) api.RawResult {
-	return api.RawResult{ErrorKind: kind, HTTPStatus: httpStatus, ErrorMessage: m}
 }
 
 // Провайдер сам заявляет недоступность модели — живые формулировки live-аудита

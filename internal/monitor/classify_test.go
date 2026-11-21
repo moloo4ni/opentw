@@ -30,11 +30,11 @@ func TestClassifyModelNotFoundBodies(t *testing.T) {
 	}
 }
 
-// 429 остаётся Degraded независимо от текста.
-func TestClassify429AlwaysDegraded(t *testing.T) {
+// 429 — недоступность конкретной модели (Down), независимо от текста.
+func TestClassify429AlwaysDown(t *testing.T) {
 	for _, msg := range []string{"Upstream rate limit", "unknown provider for model x", ""} {
-		if got := Classify(api.RawResult{ErrorKind: "http", HTTPStatus: 429, ErrorMessage: msg}); got != StatusDegraded {
-			t.Errorf("429 %q → %q", msg, got)
+		if got := Classify(api.RawResult{ErrorKind: "http", HTTPStatus: 429, ErrorMessage: msg}); got != StatusDown {
+			t.Errorf("429 %q → %q, want down", msg, got)
 		}
 	}
 }

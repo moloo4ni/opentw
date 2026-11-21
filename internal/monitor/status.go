@@ -13,25 +13,43 @@ type Status = status.Status
 
 const (
 	StatusOperational = status.Operational
-	StatusDegraded    = status.Degraded
 	StatusDown        = status.Down
 	StatusUnknown     = status.Unknown
 )
 
-// Classify maps one raw check result to a status, per ТЗ §5.
-// Cancelled results are filtered by the caller before recording.
+// expectedReply — единственный ответ, который засчитывается как успешная
+// проверка: ответом на `Reply with exactly "OK"` должно быть ровно «OK».
+// Сравнение регистрозависимое, допускается только обрезка внешних пробелов.
+const expectedReply = "OK"
+
+// ContentOK решает, выполнила ли модель проверочное задание: итоговое
+// содержимое ответа (без reasoning) обязано быть ровно «OK».
+func ContentOK(content string) bool {
+	return strings.TrimSpace(content) == expectedReply
+}
+
+// Classify maps one raw check result to a status.
+// Успешной проверкой считается только ожидаемый итоговый ответ «OK»;
+// HTTP 200 с любым иным (в т.ч. пустым) содержимым — Down: модель не
+// выполнила проверочный запрос. Проблемы самого монитора (его ключ,
+// нечитаемый ответ) — Unknown. Cancelled results are filtered by the
+// caller before recording.
 func Classify(res api.RawResult) Status {
 	switch res.ErrorKind {
 	case "":
-		return StatusOperational
+		// HTTP 200 и генерация была: вердикт — по итоговому содержимому.
+		if ContentOK(res.Content) {
+			return StatusOperational
+		}
+		return StatusDown
 	case "empty":
-		// HTTP 200 with nothing generated.
-		return StatusDegraded
+		// HTTP 200 без генерации: модель не ответила на проверочный запрос.
+		return StatusDown
 	case "http":
 		switch {
 		case res.HTTPStatus == 429:
-			// Rate limit of the upstream provider, passed through by Tonworld.
-			return StatusDegraded
+			// Rate limit провайдера для конкретной модели: модель недоступна.
+			return StatusDown
 		case res.HTTPStatus == 404:
 			// Model not found.
 			return StatusDown
@@ -55,9 +73,8 @@ func Classify(res api.RawResult) Status {
 		}
 	case "timeout", "connrefused":
 		return StatusDown
-	case "invalid":
-		return StatusUnknown
 	default:
+		// "invalid" и прочее: монитор не смог достоверно проверить модель.
 		return StatusUnknown
 	}
 }

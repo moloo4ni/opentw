@@ -57,13 +57,12 @@ func TestLiveCycle(t *testing.T) {
 		BaseURL:    base,
 		APIKey:     key,
 		HTTPClient: &http.Client{Timeout: 60 * time.Second},
-		Prompt:     "Reply with exactly OK.",
+		Prompt:     "Reply with exactly \"OK\"",
 		Stream:     true,
 	}
 	r := NewRunner(RunnerCfg{
 		API: client, Store: store, Models: models,
 		Concurrency: 2, MaxTokens: 64, Interval: 15 * time.Minute,
-		Perf:   PerfCfg{MinSamples: 12, LatencyFactor: 3, TPSShare: 0.4},
 		Logger: slog.Default(),
 	})
 	res, err := r.RunCycle(context.Background())

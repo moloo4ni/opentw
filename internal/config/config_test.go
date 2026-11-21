@@ -36,6 +36,8 @@ degradation:
   min_samples: 20
   latency_factor: 2.5
   tps_share: 0.5
+# блок degradation больше не используется (три статуса без деградации):
+# неизвестные yaml-поля игнорируются — старые конфиги продолжают загружаться
 models:
   - family: GPT
     ids: [gpt-6-astra, gpt-6.1-sol]
@@ -67,9 +69,6 @@ models:
 	if cfg.SQLitePath != "/var/lib/opentw/opentw.db" {
 		t.Fatalf("sqlite_path = %q", cfg.SQLitePath)
 	}
-	if cfg.Degradation.MinSamples != 20 || cfg.Degradation.LatencyFactor != 2.5 || cfg.Degradation.TPSShare != 0.5 {
-		t.Fatalf("degradation = %+v", cfg.Degradation)
-	}
 	if len(cfg.Models) != 2 {
 		t.Fatalf("models families = %d", len(cfg.Models))
 	}
@@ -95,7 +94,7 @@ models:
 	if cfg.HTTPTimeout != 120*time.Second {
 		t.Fatalf("default http_timeout = %v", cfg.HTTPTimeout)
 	}
-	if cfg.Concurrency != 4 || cfg.MaxTokens != 64 {
+	if cfg.Concurrency != 4 || cfg.MaxTokens != 256 {
 		t.Fatalf("default concurrency/max_tokens = %d/%d", cfg.Concurrency, cfg.MaxTokens)
 	}
 	if !cfg.Streaming {
@@ -103,9 +102,6 @@ models:
 	}
 	if cfg.SQLitePath != "opentw.db" {
 		t.Fatalf("default sqlite_path = %q", cfg.SQLitePath)
-	}
-	if cfg.Degradation.MinSamples != 12 || cfg.Degradation.LatencyFactor != 3.0 || cfg.Degradation.TPSShare != 0.4 {
-		t.Fatalf("default degradation = %+v", cfg.Degradation)
 	}
 }
 
