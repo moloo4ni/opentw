@@ -9,8 +9,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 func mskTime(t *testing.T, h, m, s int) time.Time {
@@ -695,19 +695,21 @@ func TestModelCardLatencySingleDecimal(t *testing.T) {
 // README notification examples match the actual line format: the separator
 // after a model ID is ASCII " - ", not "·".
 func TestReadmeNotificationExamples(t *testing.T) {
-	raw, err := os.ReadFile("../../README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(raw)
-	if !strings.Contains(text, "- 🔴 `model-id` - `HTTP 429`") {
-		t.Errorf("down notification example must use the actual ` - ` separator")
-	}
-	if !strings.Contains(text, "- 🟢 `model-id` - Восстановилась") {
-		t.Errorf("recovery notification example must use the actual ` - ` separator")
-	}
-	if strings.Contains(text, "`model-id` · `HTTP 429`") || strings.Contains(text, "`model-id` · Восстановилась") {
-		t.Errorf("notification examples must not use the `·` separator after model ID")
+	for _, path := range []string{"../../README.md", "../../README.ru.md"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(raw)
+		if !strings.Contains(text, "- 🔴 `model-id` - `HTTP 429`") {
+			t.Errorf("%s: down notification example must use the actual ` - ` separator", path)
+		}
+		if !strings.Contains(text, "- 🟢 `model-id` - Восстановилась") {
+			t.Errorf("%s: recovery notification example must use the actual ` - ` separator", path)
+		}
+		if strings.Contains(text, "`model-id` · `HTTP 429`") || strings.Contains(text, "`model-id` · Восстановилась") {
+			t.Errorf("%s: notification examples must not use the `·` separator after model ID", path)
+		}
 	}
 }
 

@@ -1,391 +1,365 @@
 # OpenTW
 
-Telegram-бот для мониторинга доступности и производительности языковых моделей
-через OpenAI-совместимый API.
+A Telegram bot for monitoring model availability and response diagnostics
+through OpenAI-compatible APIs, with Tonworld as its current reference
+provider.
 
-Один процесс: централизованный монитор проверяет модели по расписанию,
-складывает результаты в SQLite, держит закреплённую статусную панель в каждом
-чате и рассылает событийные уведомления подписчикам.
+One process: a centralized monitor probes the models on a schedule, stores the
+results in SQLite, keeps a pinned status panel in every chat, and delivers
+event notifications to subscribers.
 
-## Что делает
+Русская версия: [README.ru.md](README.ru.md).
 
-- Каждые 15 минут (по умолчанию) проверяет каждую модель одним коротким
-  запросом `Reply with exactly "OK"`.
-- Критерий успеха строгий: засчитывается только ответ ровно «OK» (после обрезки
-  пробелов). HTTP 200 с любым иным содержимым — сообщение об ошибке, лимите,
-  пустая генерация, reasoning без итога — означает, что модель недоступна.
-  Полный оригинальный ответ модели/API хранится в истории и показывается в
-  карточке дословно.
-- Держит закреплённое rich-сообщение со статусом всех моделей (группы семейств,
-  легенда) и редактирует его после каждого цикла — без новых сообщений.
-- `/status model-id` — карточка модели: статус, время последней проверки,
-  последний запрос, дословный ответ API/модели, статистика за 24 часа (uptime,
-  счётчики).
-- `/subscribe` — выбор моделей, об изменениях которых чат получает уведомления;
-  есть массовые операции «Выбрать всё»/«Снять всё» на корневом экране и экране
-  семейства.
-- События одного цикла приходят одним сообщением без заголовков и футеров —
-  по одной строке на модель; 🔴-строки кликабельны и открывают карточку модели.
-- Доставка уведомлений переживает сбои Telegram и рестарты: события копятся
-  в SQLite outbox и доезжают после восстановления; доставляются только
-  актуальные изменения, устаревшие отбрасываются.
-- Хранит историю проверок 7 дней, инциденты 30 дней, подписки и панели;
-  переживает рестарт без ложных событий и потери подписок.
+## Features
 
-## Требования
+- Pinned Telegram status panel with all monitored models, refreshed in place
+  after every cycle — no new messages.
+- Per-model cards (`/status model-id`) with the last check, the last request,
+  the verbatim model/API response, and 24-hour statistics (uptime, counters).
+- Model availability monitoring on a schedule (15 minutes by default), one
+  short probe request per model: `Reply with exactly "OK"`.
+- A three-state status model: Operational, Down, Unknown.
+- Strict exact-`OK` verification: only a reply that is exactly `OK` after
+  trimming outer whitespace counts as success; reasoning output never counts.
+- Response diagnostics: the verbatim provider text (content, gateway errors,
+  finish reason) is stored in the check history and shown on the card.
+- Subscription management with bulk select/deselect, admin-gated in groups
+  and channels.
+- Current-state notifications only: stale events are collapsed against the
+  notified state before sending.
+- Per-chat FIFO outbox with a durable SQLite queue.
+- At-least-once delivery that survives Telegram outages and restarts.
+- SQLite persistence with backup support (`-backup` flag, `VACUUM INTO`).
+- A heartbeat file and a container `HEALTHCHECK` wired to monitoring
+  freshness.
 
-- Go 1.27.4+ (локальная сборка) или Podman (сборка образа и запуск контейнера).
-- Telegram-бот, созданный через [@BotFather](https://t.me/BotFather).
-- Пользовательский API-ключ с доступом к `/v1/models` и `/v1/chat/completions`.
-- Серверная поддержка Telegram Bot API 10.3+ и клиент Telegram с поддержкой
-  Rich Messages: панель, уведомления и карточки отправляются через
-  `sendRichMessage` / `editMessageText` с `rich_message`, ошибки — кнопки
-  `<tg-button type="callback_data" style="link">`. Поведение на клиентах без
-  поддержки Rich Messages Telegram не документирует: требуется живая проверка
-  (из этой среды реальный Bot API проверить не удалось).
+## Architecture
 
-## Настройка Telegram-бота
-
-1. Откройте [@BotFather](https://t.me/BotFather) → `/newbot`, задайте имя
-   (интерфейс бота везде показывается как **OpenTW**) и username.
-2. Сохраните токен вида `123456789:AA...` — он идёт в `BOT_TOKEN`.
-3. Команды бот регистрирует сам при старте (`setMyCommands`), отдельная
-   настройка не нужна.
-4. Для работы в группах ничего дополнительно включать не нужно: бот по
-   умолчанию работает в **Privacy Mode** и видит только команды, адресованные
-   ему (`/status@your_bot`). Читать переписку группы он не будет и не должен.
-5. Для каналов добавьте бота **администратором** канала с правами
-   «Публикация сообщений» и «Закрепление сообщений».
-
-## Настройка API
-
-```bash
-cp .env.example .env
+```
+OpenAI-compatible API
+        |
+        v
+     Monitor           (internal/monitor: cycles, concurrency, incidents)
+        |
+        v
+  SQLite storage       (internal/storage: single schema.sql, outbox, chat_notified)
+        |
+        v
+  Telegram bot         (internal/telegram: Bot API client, rendering, delivery worker)
+        |
+        v
+Rich status panel and notifications
 ```
 
-| Переменная | Назначение |
-|---|---|
-| `BOT_TOKEN` | Токен бота из BotFather |
-| `API_KEY` | Пользовательский API-ключ |
-| `API_BASE_URL` | Базовый URL API, например `https://kube943.prod.tonworld.ru` |
+- `internal/api` — the OpenAI-compatible adapter: model catalog, one chat
+  completion (streaming or not), SSE parsing, transport-failure
+  classification.
+- `internal/monitor` — cycle scheduling, bounded-concurrency probing, status
+  classification, incident planning; commits states, events and incidents in
+  one atomic transaction.
+- `internal/storage` — SQLite: the single current schema (`schema.sql`,
+  `PRAGMA user_version`), checks, subscriptions, panels, incidents, the
+  notification outbox, and per-chat notified states.
+- `internal/telegram` — a minimal Bot API client, panel/card/notification
+  rendering, command and callback handlers, and the background delivery
+  worker.
+- `internal/config` — YAML + environment loading and validation.
+- `internal/status` — the shared three-state status type.
 
-Секреты читаются **только** из окружения. В `config.yaml` их быть не должно.
+## Requirements
 
-## Запуск локально
+- Go toolchain (see `go.mod`) for building from source.
+- Podman for building the container image.
+- A Telegram bot token from [@BotFather](https://t.me/BotFather).
+- An API key and an OpenAI-compatible API base URL.
+- Quadlet and systemd for the recommended container deployment on Linux.
+
+## Quick Start
+
+Run locally with Go:
 
 ```bash
+cp .env.example .env                # fill BOT_TOKEN, API_KEY, API_BASE_URL
 cp config.example.yaml config.yaml
-# sqlite_path из примера — /data/opentw.db: это путь внутри контейнера.
-# Для локального запуска замените его на доступный локальный путь,
-# например ./opentw.db; при желании поправьте список моделей и интервалы.
+# The example's sqlite_path is /data/opentw.db — a path inside the container.
+# For a local run point it to a local file, e.g. ./opentw.db.
 set -a && . ./.env && set +a
 go run ./cmd/opentw -config config.yaml
 ```
 
-Первый цикл мониторинга стартует сразу после запуска, дальше — по интервалу.
-
-## Сборка и запуск контейнера
-
-Podman — единственный поддерживаемый проектом container engine. Сборка образа
-из `Containerfile`:
+Build the container image with Podman:
 
 ```bash
-cp .env.example .env          # заполните BOT_TOKEN, API_KEY, API_BASE_URL
-cp config.example.yaml config.yaml
-# --format docker: OCI-формат (по умолчанию) отбрасывает HEALTHCHECK из образа
-podman build --format docker -t localhost/opentw:latest .
+podman build --network=host --format docker -t localhost/opentw:latest .
 ```
 
-При сбоях сети на этапе `go mod download` в некоторых средах сборки
-Podman/netavark помогает `--network=host` (особенность конкретной среды,
-не обязательный флаг).
+- `--format docker` keeps the Docker-compatible `HEALTHCHECK` metadata in the
+  image; Podman discards it when building the default OCI format, and the
+  healthcheck metadata is what Podman consumes at run time.
+- `--network=host` may be needed for the `go mod download` step in some build
+  environments (a Podman/netavark quirk); it is not mandatory everywhere. If
+  your build environment has working networking, a plain
+  `podman build --format docker -t localhost/opentw:latest .` is enough.
 
-Развёртывание — через Quadlet: декларативный unit `.container` генерирует
-systemd-сервис, который управляет контейнером (named volume для SQLite под
-`/data`, перезапуск и логи — systemd/journald). Пример публичного
-Quadlet-юнита в репозиторий не входит; параметры — в `podman-container.unit(5)`.
+There is no second deployment mechanism: the container is meant to run under
+Podman with a Quadlet unit (see [Container deployment](#container-deployment)).
 
-`config.yaml` подключается в контейнер только на чтение.
+## Configuration
 
-## Валидация конфигурации
+Copy `config.example.yaml` and adjust; secrets live only in the environment
+(`.env.example` lists them):
 
-При старте конфигурация проверяется целиком; ошибка — отказ запуска
-(не «молчаливые» деградированные значения):
-
-- `interval` ≥ 5 минут; `http_timeout` ≥ 5 секунд; `concurrency` ≥ 1;
-- `max_tokens` ≥ 1;
-- хотя бы одна модель; ID моделей непустые и уникальные;
-- секреты (`BOT_TOKEN`, `API_KEY`) — только из окружения; `API_BASE_URL`
-  задаётся `api_base_url` в конфиге или ENV `API_BASE_URL` (ENV приоритетнее).
-
-Пороги деградации производительности удалены вместе с жёлтым статусом:
-секции `degradation` в конфиге больше нет. Старые `config.yaml` с ней
-по-прежнему работают — неизвестные ключи игнорируются.
-
-## Команды
-
-| Команда | Поведение |
+| Variable | Purpose |
 |---|---|
-| `/start` | Полный синоним `/status` |
-| `/status` | Общий статус всех моделей, панель создаётся и закрепляется |
-| `/status model-id` | Карточка модели: статус, последний запрос, дословный ответ API, статистика за 24 часа (обычный ответ, не панель); уникальный префикс ID достаивается автоматически, неоднозначный — подсказывает кандидатов |
-| `/subscribe` | Настройка уведомлений (в группах и каналах — только администраторы) |
-| `/help` | Справка |
+| `BOT_TOKEN` | Telegram bot token (required) |
+| `API_KEY` | OpenAI-compatible API key (required) |
+| `API_BASE_URL` | API base URL; overrides `api_base_url` from the YAML |
 
-Повторный `/status` создаёт новую панель, закрепляет её и открепляет прежнюю;
-дальнейшие обновления редактируют новое сообщение.
+Configuration keys (all validated at startup; invalid configuration refuses
+to start rather than degrading silently):
 
-Клик по коду ошибки в панели или уведомлении (например `HTTP 429`) открывает
-карточку модели отдельным сообщением в том же чате; панель при этом не
-редактируется.
-
-## Статусы
-
-| Эмодзи | Статус | Условие |
+| Key | Default | Meaning |
 |---|---|---|
-| 🟢 | Работает | Ответ на проверочный запрос — ровно «OK» (после обрезки пробелов); latency при этом любой |
-| 🔴 | Недоступна | Ответ не «OK»: HTTP 200 с любым иным содержимым (ошибка, лимит, пустая генерация, reasoning без итога), HTTP 429/404/5xx, timeout, connection refused конкретной модели |
-| ⚪ | Нет данных | Монитор не смог достоверно проверить: 401/403 (ключ самого монитора), нечитаемый ответ, прочие ситуации на стороне мониторинга |
+| `api_base_url` | — | API base URL (`API_BASE_URL` env wins when set) |
+| `interval` | `15m` | Monitoring interval; ≥ 5m |
+| `http_timeout` | `120s` | Per-request timeout; ≥ 5s |
+| `concurrency` | `4` | Maximum simultaneous model checks; ≥ 1 |
+| `max_tokens` | `256` | Output token limit of the probe request; ≥ 1 |
+| `streaming` | `true` | Use streaming: measures TTFT/TPS (stored in history); the OK check is unaffected |
+| `sqlite_path` | `opentw.db` | SQLite database path |
+| `models` | — | Model families with exact model IDs |
 
-Критерий успеха — содержимое, а не HTTP-код: HTTP 200 с сообщением об ошибке
-или пустой генерацией — это 🔴, а не «работает». Полный оригинальный ответ
-модели/API хранится в истории и показывается в карточке дословно.
+The success criterion is content-based, so `max_tokens` must be large enough
+for reasoning models to finish and emit the final answer; 256 is the shipped
+default.
 
-TTFT, TPS и токены по-прежнему измеряются (при `streaming: true`) и хранятся
-в истории проверок, но в панели и карточках не показываются: для статуса
-важен только итоговый ответ.
+## Telegram setup
 
-## Уведомления
+1. Create a bot with [@BotFather](https://t.me/BotFather) → `/newbot`; note
+   the token.
+2. The bot registers its command menu itself at startup (`setMyCommands`).
+3. In groups the bot works in the default Privacy Mode and sees only commands
+   addressed to it (`/status@your_bot`); it does not read the conversation.
+4. In channels add the bot as an administrator with the rights to post,
+   pin, and delete messages (the pinned panel needs posting + pinning;
+   menu deletion needs deletion).
 
-Уведомление приходит только чатам, подписанным на конкретную модель, и только
-при смене состояния (🟢/🔴). Первый цикл после запуска формирует начальное
-состояние и уведомлений не рассылает. Периодических сводок подписчикам нет:
-подписка управляет только событиями. Повторяющиеся смены статуса не
-подавляются — подписка на «маяка» означает каждое её изменение.
+## Commands
 
-**Единый формат.** Все изменения одного цикла, адресованные одному чату,
-приходят **одним сообщением** без заголовков и футеров — по одной строке на
-модель в порядке конфигурации:
-
-- 🔴 `model-id` - `HTTP 429` — кликабельная подпись ошибки (HTTP-код, `Timeout`,
-  `Connection refused`, `Unexpected response`) открывает карточку модели;
-- 🟢 `model-id` - Восстановилась.
-
-Переход в ⚪ уведомлений не порождает. В списке — только модели, на которые
-подписан этот чат; глобальная группировка не обходит пользовательские настройки.
-
-**Надёжность доставки.** Итог цикла — новые состояния моделей и события —
-фиксируется в SQLite **одним атомарным коммитом**: рестарт, OOM или сбой
-базы посреди цикла не теряют события — следующий цикл сравнит состояния и
-переоткроет те же переходы (событие придёт с задержкой до одного интервала,
-а не исчезнет). Отправка — фоновым воркером: недоступный Telegram не
-останавливает мониторинг, недоставленное живёт в outbox и доезжает после
-восстановления или рестарта. Доставка — at-least-once: сбой ровно между
-отправкой и отметкой может дать повтор сообщения (без потерь);
-exactly-once невозможен — у Bot API нет ключа идемпотентности для
-`sendRichMessage`. 429 учитывается: строка с исчерпанными ретраями не
-перевзвешивается раньше `retry_after`, а пауза после глобального флуд-лимита
-останавливает весь батч. Временные ошибки доставки дают нарастающий backoff
-(30с → 1м → 2м… → потолок 15м): сообщение не теряется и не «молотит» Telegram;
-удаления по числу попыток нет. Внутри одного чата соблюдается строгий FIFO:
-более новое «восстановилась» не приходит раньше не доехавшего «упала» —
-ни в одном тике, ни после рестарта; разные чаты друг друга не блокируют. Проблемы самого монитора (невалидный ключ,
-транспорт до API) дают ⚪ всем моделям и уведомлений не создают.
-
-**Только актуальные изменения.** При восстановлении Telegram доставка сверяет
-накопившиеся события с текущим состоянием: для каждой модели сравнивается её
-нынешний статус (по данным БД) с последним уведомлённым состоянием чата
-(таблица `chat_notified`). Состояние, которое чат уже знает, не отправляется
-повторно; события, устаревшие за время простоя (модель успела и упасть, и
-восстановиться), отбрасываются — по модели отсылается ровно одна строка по
-её **текущему** состоянию. Текущее состояние ⚪ не уведомляется вообще: все
-накопленные строки этой модели помечаются доставленными без отправки. Если
-чат отписался от модели за время простоя, её события не доставляются.
-Недоставленное старше суток удаляется как предохранитель и обязательно
-логируется (`dropped undeliverable events`).
-
-## Модели в конфигурации
-
-Мониторится явный список моделей из `config.yaml`, сгруппированный по
-семействам. Каталог API содержит тысячи технических записей, поэтому
-автоматический обход всего каталога не используется: панель не помещается в
-лимит rich-сообщения Telegram (32 768 символов), а проверка тысяч моделей
-каждый интервал мониторинга израсходовала бы квоту.
-
-Каталог `/v1/models` опрашивается каждый цикл, но отсутствие модели в каталоге
-само по себе статуса не задаёт: такая модель всё равно проверяется реальным
-генерирующим запросом, и записывается настоящий ответ API (обычно 🔴 с ошибкой
-провайдера вроде «unknown provider for model ...»). Если каталог недоступен,
-цикл продолжается — событие отражается в логах. Новые модели добавляются
-правкой списка.
-
-Актуальные идентификаторы:
-
-```bash
-curl -s "$API_BASE_URL/v1/models" -H "Authorization: Bearer $API_KEY" \
-  | grep -o '"id":"[^"]*"' | head -50
-```
-
-Идентификаторы в конфиге должны совпадать с каталогом посимвольно.
-
-Ресурсы цикла: при `interval: 15m` и `http_timeout: 120s` полный цикл из N
-моделей с параллелизмом `concurrency` длится до
-`N / concurrency × http_timeout` — держите `concurrency ≥ models × http_timeout / interval`,
-чтобы циклы не начинались с опозданием (наложение циклов исключено
-single-flight, но тики тогда пропускаются).
-
-## Права для закрепления
-
-| Чат | Требуется |
+| Command | Behavior |
 |---|---|
-| Личный | Права не нужны |
-| Группа / супергруппа | Бот — администратор с правом «Закреплять сообщения» |
-| Канал | Бот — администратор с правами публикации, закрепления и удаления сообщений |
+| `/start` | Same as `/status` |
+| `/status` | The status panel of all models; created and pinned |
+| `/status <model-id>` | The model card: status, last request, verbatim response, 24-hour stats (a regular message, not the panel); a unique ID prefix completes automatically, an ambiguous one lists candidates |
+| `/subscribe` | Notification setup (admins only in groups and channels) |
+| `/help` | Help |
 
-Если закрепить не удалось, панель всё равно сохраняется и обновляется, а бот
-один раз сообщает об ограничении — повторных попыток и спама нет.
+A repeated `/status` creates a new panel, pins it, and unpins the previous
+one; later updates edit the new message.
 
-## Бэкап и восстановление
+Clicking an error label in the panel or a notification (e.g. `HTTP 429`)
+opens the model card as a separate message in the same chat; the panel itself
+is not edited.
 
-Вся история, инциденты, подписки и привязки панелей живут в одном файле
-SQLite на named volume (`sqlite_path: /data/opentw.db`). Горячий бэкап без
-остановки (opentw — имя контейнера из вашего Quadlet-юнита):
+## Status semantics
 
-```bash
-podman exec opentw /app/opentw -config /app/config.yaml -backup /data/backup.db
-podman cp opentw:/data/backup.db ./opentw-$(date +%F).db   # забрать на хост
-```
+| Emoji | Status | Condition |
+|---|---|---|
+| 🟢 | Operational | The reply to the probe is exactly `OK` after trimming outer whitespace; latency does not matter |
+| 🔴 | Down | Anything else from the model's side: HTTP 200 with other content (an error, a rate limit, an empty generation, reasoning without a final answer), HTTP 429/404/5xx, timeout, connection refused for this model |
+| ⚪ | Unknown | The monitor could not verify definitively: 401/403 (the monitor's own key), an unparseable response, other monitor-side situations |
 
-Снапшот создаётся `VACUUM INTO` — консистентен и на живой WAL-базе; в
-существующий файл запись откажется (уникальное имя — суффикс даты).
-Обновление файла на хосте — по cron на ваше усмотрение. Холодный вариант —
-остановка контейнера (для Quadlet — `systemctl stop opentw`), копия
-`/data/opentw.db` (после graceful-остановки WAL влит в файл), запуск
-(`systemctl start opentw`).
+The verdict follows the content, not the HTTP code: HTTP 200 with an error
+message or an empty generation is Down, not Operational. The verbatim
+original response is stored in the history and shown on the card.
 
-Восстановление в named volume (старые `-wal`/`-shm` не копируем):
+TTFT, TPS, and token counts are still measured (with `streaming: true`) and
+kept in the check history, but are not shown in the panel or cards: only the
+final answer matters for the status.
 
-```bash
-systemctl stop opentw
-podman run --rm -v opentw-data:/data -v "$PWD:/host" alpine \
-    sh -c 'rm -f /data/opentw.db-* && cp /host/opentw-restore.db /data/opentw.db'
-systemctl start opentw
-```
+## Notifications and delivery guarantees
 
-Вместо `opentw-restore.db` подставьте имя вашей резервной копии (созданной
-этой же версией opentw); `opentw-data` замените на имя вашего тома.
-Проверка после рестарта: `/status` показывает историю, `podman logs` — без
-ошибок.
+- Only chats subscribed to a model receive its events, and only on a state
+  change (Operational/Down). The first cycle after startup only establishes
+  the baseline and sends nothing.
+- All of one cycle's events for a chat arrive as **one message**, one line per
+  model in the config order, without headers or footers:
+  - 🔴 `model-id` - `HTTP 429` — a clickable error label (an HTTP code,
+    `Timeout`, `Connection refused`, `Unexpected response`) opens the model
+    card;
+  - 🟢 `model-id` - Восстановилась (recovered).
+- Per-chat FIFO is strict: a newer "recovered" never overtakes an undelivered
+  "down", in any tick and across restarts; chats do not block each other.
+- The cycle's outcome — new model states plus events — is committed to SQLite
+  in **one atomic transaction**: a restart, OOM, or database failure mid-cycle
+  loses nothing; the next cycle reopens the same transitions (the event is
+  delayed by up to one interval, not lost).
+- Delivery runs in a background worker with a growing backoff (30s → 1m →
+  2m … capped at 15m) on temporary errors; there is no drop after N attempts.
+- A global Telegram 429 pauses the whole batch, and a row that exhausted its
+  in-request retries is not retried before `retry_after`.
+- Delivery is at-least-once: a failure exactly between the send and the
+  commit can produce a rare duplicate; exactly-once is impossible (the Bot
+  API has no idempotency key for `sendRichMessage`).
+- Only current changes are sent: on delivery, each model's current status is
+  reconciled against the chat's last notified state (`chat_notified`). A state
+  the chat already knows is not re-sent; events that became stale during a
+  downtime (the model fell and recovered) are collapsed into one line for the
+  model's **current** state. An Unknown current state sends nothing and keeps
+  the evidence rows pending. Rows older than 24h (TTL) are dropped as a
+  safety valve, and every drop is logged. The same reconciliation also arms
+  after a lost/expired row or a restart, so a notification cannot depend on
+  the survival of a single queue row.
 
-Схема БД — один файл `internal/storage/schema.sql`: новая база создаётся из
-него целиком при первом запуске, маркируется `PRAGMA user_version` и при
-повторных запусках не трогается. Исторических миграций нет: старая база
-(версии до схемы-маркера) не обновляется автоматически — приложение
-отвергает её при старте понятной ошибкой `storage: database ... is not
-compatible ... start with a clean database` и ничего не удаляет само.
-Решение о замене базы (удаление `opentw.db` вместе с `-wal`/`-shm` после
-остановки) остаётся за оператором.
+## SQLite and backups
 
-**Нельзя:** копировать живой `opentw.db` без `-wal` (потеря последних часов
-записей); `podman volume rm` и `podman volume prune` — они уничтожают
-том со всеми данными. Один инстанс на базу: два процесса на одном файле
-доставят каждое уведомление дважды.
+All history, incidents, subscriptions and panel bindings live in one SQLite
+file (`sqlite_path`, e.g. `/data/opentw.db` on the named volume).
 
-## Диагностика
+- The schema is a single `internal/storage/schema.sql`. A fresh database is
+  created from it in full and marked with `PRAGMA user_version`; subsequent
+  startups touch nothing.
+- There are **no automatic migrations**. A legacy database (created by older
+  builds) is rejected at startup with a clear error
+  (`storage: database ... is not compatible ... start with a clean database`);
+  the app never deletes or mutates it. Replacing a database (removing
+  `opentw.db` together with its `-wal`/`-shm` sidecars after stopping the
+  instance) is the operator's decision — make a backup first.
+- Hot backup without stopping the bot (`opentw` is the container name from
+  your Quadlet unit):
 
-| Симптом | Причина и действие |
+  ```bash
+  podman exec opentw /app/opentw -config /app/config.yaml -backup /data/backup.db
+  podman cp opentw:/data/backup.db ./opentw-$(date +%F).db   # copy to the host
+  ```
+
+  The snapshot is written with `VACUUM INTO`: consistent even against a live
+  WAL database; writing into an existing file is refused.
+- Cold path: stop the container (`systemctl stop opentw`), copy
+  `/data/opentw.db` (WAL is checkpointed on graceful shutdown), start again.
+- Restoring into the named volume (do not copy old `-wal`/`-shm` files):
+
+  ```bash
+  systemctl stop opentw
+  podman run --rm -v opentw-data:/data -v "$PWD:/host" alpine \
+      sh -c 'rm -f /data/opentw.db-* && cp /host/opentw-restore.db /data/opentw.db'
+  systemctl start opentw
+  ```
+
+  Replace `opentw-restore.db` with your backup (made by the same opentw
+  version) and `opentw-data` with your volume name. After the restart check
+  `/status` and `podman logs`.
+
+Never copy a live `opentw.db` without `-wal` (you would lose the last hours
+of writes), and never `podman volume rm` / `podman volume prune` — they
+destroy the volume with all data. One instance per database: two processes on
+one file deliver every notification twice.
+
+Retention: checks 7 days, incidents 30 days, delivered outbox rows 7 days,
+undelivered rows 24 hours (dropped with a log line).
+
+## Container deployment
+
+1. Build the image (see [Quick Start](#quick-start)).
+2. Prepare the configuration on the host: a `config.yaml` (from
+   `config.example.yaml`) and an environment file with the secrets.
+3. Write a Quadlet `.container` unit. The repository intentionally ships no
+   unit file — the exact values depend on your volume names, paths, and
+   network setup, so the operator authors the unit. The verified principles:
+
+   - run the image with the config mounted read-only at `/app/config.yaml`
+     and the secrets via `EnvironmentFile=`;
+   - attach a **named volume** to `/data` (the SQLite database and heartbeat
+     files live there; the volume inherits the image's `/data` owner on first
+     initialization);
+   - rely on systemd for restart policy and on journald for logs
+     (`journalctl -u opentw.service`);
+   - if your model count / concurrency / timeout is much larger than the
+     shipped example, set your own `HealthStartPeriod=` covering
+     `(N/concurrency + 1) × http_timeout` waves — the image's default covers
+     only the shipped config.
+
+   See `podman-systemd.unit(5)` and `podman-container.unit(5)` for the unit
+   format.
+4. `systemctl --user daemon-reload && systemctl --user start opentw.service`
+   (or the system equivalents).
+
+Updating: rebuild the image with the same tag, then restart the unit —
+systemd starts the new image; the SQLite data survives in the named volume.
+Updating in place must not touch the volume.
+
+## Diagnostics
+
+- Responses are capped at 16 384 runes with a visible `…`; truncation is
+  always visible, never silent.
+- `finish_reason` of the terminal chunk is recorded in the check's
+  diagnostics when the model produced no final text (e.g.
+  `finish_reason=length`).
+- An empty final text with HTTP 200 is shown as "no final text" on the card —
+  a fact, not an interpretation.
+- Latency/TPS limitations: a buffered provider sends chunks almost at once,
+  so TPS is only recorded when the generation time is meaningful; TTFT/TPS
+  are stored but never displayed.
+- Common symptoms:
+
+| Symptom | Cause and action |
 |---|---|
-| `BOT_TOKEN is required` | Не заполнен `.env` или переменные не экспортированы |
-| `telegram: fatal API error 401` | Неверный токен бота — перевыпустите в BotFather |
-| В панели ⚪ `Нет данных` | Проверьте ключ и `API_BASE_URL`; `curl $API_BASE_URL/v1/models` с ключом должен вернуть JSON |
-| Все модели 🔴 с ошибкой провайдера | ID в конфиге не совпадают с API — сверьте с `GET /v1/models`; клик по `HTTP 400` открывает карточку с дословным ответом (например `unknown provider for model`) |
-| Панель не закреплена | Бот не администратор или нет права закрепления |
-| `HTTP 429` в панели | Лимит upstream-провайдера, не ошибка ключа мониторинга |
-| `podman ps` показывает `unhealthy` | Heartbeat (`/data/opentw.heartbeat`) не обновлялся дольше порога из `/data/opentw.heartbeat.maxage` (приложение пишет его из фактического `interval`, фолбэк 2820с — формула для конфигурации из примера: 2×15м + худший цикл 16м + минута). Проваленные циклы heartbeat не продлевают: смотрите `podman logs opentw` |
-| `storage: database ... is not compatible` | База от старой/чужой версии — начните с чистой базы: остановите инстанс и удалите `opentw.db` вместе с `-wal`/`-shm` (только если история не нужна) |
-| `monitor: cycle failed` в логах, всё остальное работает | Сбой фиксации цикла (обычно диск/БД): циклы продолжаются, состояния не фиксируются до восстановления; события не теряются |
-| Все модели ⚪ `Нет данных` | Совпавший сбой каталога и моделей (ключ/транспорт) — событие не «все упали», а «монитор слеп»; панели вернутся сами |
+| `BOT_TOKEN is required` | `.env` missing or variables not exported |
+| `telegram: fatal API error 401` | Wrong bot token — reissue via BotFather |
+| ⚪ Unknown in the panel | Check the API key and `API_BASE_URL`; `curl $API_BASE_URL/v1/models` with the key must return JSON |
+| All models Down with a provider error | Config IDs do not match the catalog — compare with `GET /v1/models`; clicking `HTTP 400` opens the card with the verbatim answer |
+| Panel not pinned | The bot is not an admin or lacks the pin right |
+| `HTTP 429` in the panel | The upstream provider's rate limit, not the monitor's key |
+| `podman ps` shows `unhealthy` | The heartbeat (`/data/opentw.heartbeat`) is older than the threshold in `/data/opentw.heartbeat.maxage` (written by the app from the actual `interval`; the 2820s fallback matches the example config). Failed cycles do not refresh the heartbeat: see `podman logs` |
+| `storage: database ... is not compatible` | A database from an older version — start clean: stop the instance and remove `opentw.db` with its `-wal`/`-shm` (only if the history is not needed) |
+| `monitor: cycle failed` in logs, everything else works | A cycle-commit failure (usually disk/DB): cycles continue, states are not recorded until it recovers; events are not lost |
+| All models ⚪ Unknown | A matching catalog+models failure (key/transport) — the event is "the monitor is blind", not "everything fell"; the panels recover on their own |
 
-Полезные команды:
-
-```bash
-curl -s "$API_BASE_URL/v1/models" -H "Authorization: Bearer $API_KEY" | head -c 300
-podman logs --tail=100 opentw
-sqlite3 opentw.db 'select model_id,last_status,error_type from models;'
-```
-
-## Тесты
+## Development
 
 ```bash
-go test ./...
+gofmt -l .
+go build ./...
+go vet ./...
+go test ./... -count=1
+go test -race ./... -count=1
 ```
 
-Сценарии покрывают классификацию ответов (HTTP 200 с ответом ровно «OK» и
-с любым иным содержимым, streaming и обычным ответом, 429, 404, 5xx, timeout,
-connection refused, ошибку ключа монитора), рендер панели/карточки/уведомлений
-(легенда трёх статусов, порядок конфига, кликабельные ошибки, дословные ответы,
-длинные ответы несколькими сообщениями, HTML-экранирование, uptime и счётчики),
-доставку только актуальных состояний, создание чистой базы и отклонение
-старых баз, смену статусов,
-отсутствие повторов, восстановление (в т.ч. из ⚪-периода монитора), рестарт
-во время инцидента, недоступность Telegram и 429 с доездом из outbox,
-массовые операции подписок, устаревшие колбэки и сохранение подписок/панелей
-после рестарта, повторный `/status`, удаление панели, права администраторов.
-API и Telegram замоканы локальными HTTP-серверами; сетевых вызовов тесты
-не делают.
+The suite covers response classification (exact-`OK` and everything else,
+streaming and non-streaming, 429/404/5xx, timeouts, connection failures, the
+monitor's own key errors), panel/card/notification rendering, delivery of
+only current states, fresh-schema creation and legacy-database rejection,
+incident lifecycle and blind-window transitions, Telegram outages and 429
+recovery from the outbox, subscription bulk operations, stale callbacks, and
+persistence across restarts. API and Telegram are mocked with local HTTP
+servers; the tests make no network calls.
 
-Живой прогон против реального API (по желанию):
+Live tests against the real API are opt-in and require credentials; they are
+never run in CI:
 
 ```bash
 LIVE=1 API_KEY=... API_BASE_URL=https://... go test -tags live ./internal/monitor -run TestLiveCycle -v
 ```
 
-## Что проверено на реальном API, а что нет
+## Limitations
 
-Проверено 15.11.2026 пользовательским ключом:
+- OpenAI-compatible support does not mean compatibility with every
+  non-standard dialect; the reference provider's behavior (SSE framing,
+  gateway errors inside HTTP 200 bodies, reasoning-only replies at small
+  `max_tokens`) is what the implementation and tests are calibrated against.
+- Provider differences in streaming and reasoning handling (buffered chunks,
+  usage-only terminal chunks) are handled defensively, but exotic providers
+  are untested.
+- Telegram Rich Messages (`sendRichMessage`, `editMessageText` with
+  `rich_message`, `tg-button` callbacks) were verified against local Bot API
+  mocks only; behavior on clients without Rich Messages support is not
+  documented by Telegram and needs a live check.
+- No automatic database migrations; a schema change means a fresh database.
+- The monitor probes an explicit model list from the config; it does not walk
+  the whole catalog (thousands of entries would not fit the panel limit and
+  would burn the quota). A model missing from the catalog is still probed for
+  a real verdict.
 
-- `GET /v1/models` — работает, OpenAI-формат, требует `Authorization: Bearer`.
-  Каталог вернул ~3700 записей, включая служебные.
-- `POST /v1/chat/completions` — работает: HTTP 200, SSE-поток, чанки с
-  `delta.content` и `delta.reasoning_content`, финальный чанк `usage`
-  (`prompt_tokens`, `completion_tokens`, `total_tokens`) и `data: [DONE]`.
-- Часть каталога отвечает `400 unknown provider for model ...` или
-  `400 Upstream error: 400`; такие модели показываются 🔴 с подписью `HTTP 400`,
-  полный текст ответа виден в карточке.
+## License
 
-Не подтверждено / ограничения:
-
-- Rich Messages (`sendRichMessage`, `editMessageText` с `rich_message`,
-  кнопки `tg-button`) проверены только против локальных моков Bot API;
-  поведение реального Bot API 10.3+ и клиентов Telegram без поддержки Rich
-  Messages не проверено живым прогоном — требуется проверка на реальном боте.
-- Провайдер часто буферизует поток: чанки приходят почти одновременно, поэтому
-  TTFT практически равен latency, а TPS достоверно не измеряется. На интерфейс
-  это не влияет: TTFT/TPS в панели и карточках не показываются, но хранятся
-  в истории проверок.
-- Отдельной документации Tonworld найти не удалось; контракт восстановлен по
-  фактическим ответам. Другие эндпоинты (административные, статистика
-  провайдеров) не используются сознательно.
-- Время ответа reasoning-моделей доходило до ~55 секунд — поэтому таймаут по
-  умолчанию 120 секунд.
-- Поведение Telegram-каналов и прав закрепления проверено только на моках;
-  нужен реальный бот-администратор канала для финальной приёмки.
-
-## Структура
-
-```text
-cmd/opentw/            точка входа
-internal/api/          OpenAI-совместимый адаптер, SSE-парсер, метрики
-internal/monitor/      циклы, конкурентность, классификация, пороги, инциденты
-internal/storage/      SQLite: единственная схема (schema.sql), проверки,
-                       подписки, панели, инциденты, outbox, chat_notified
-internal/telegram/     Bot API клиент, рендеринг, обработчики, панели,
-                       события + воркер доставки (delivery)
-internal/config/       YAML + ENV, валидация
-internal/status/       общий тип статуса
-```
-
-Хранение: `checks` — 7 дней, `incidents` — 30 дней, `notification_outbox` —
-отправленное 7 дней, недоставленное — сутки с логированием удаления.
-Подписки чата-трупа (бот заблокирован/исключён) удаляются при первой неудачной
-доставке — с Info-логом и удалением его очереди.
+[MPL-2.0](LICENSE).

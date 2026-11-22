@@ -1,7 +1,7 @@
 # OpenTW configuration (no secrets here; secrets live in .env only).
 
 # API base URL; the API_BASE_URL env var takes precedence over this value.
-api_base_url: https://kube943.prod.tonworld.ru
+api_base_url: https://api.example.com
 
 # Monitoring interval (the first cycle starts right after startup).
 interval: 15m
