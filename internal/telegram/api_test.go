@@ -23,9 +23,9 @@ type mockTG struct {
 	token     string
 	url       string
 	msgID     int64
-	sendChats []int64  // chat_id каждого sendMessage, по порядку
-	richChats []int64  // chat_id каждого sendRichMessage, по порядку
-	bodiesLog [][]byte // тело каждого вызова, параллельно calls
+	sendChats []int64  // chat_id of each sendMessage, in order
+	richChats []int64  // chat_id of each sendRichMessage, in order
+	bodiesLog [][]byte // body of each call, parallel to calls
 }
 
 func (m *mockTG) nextMessageID() int64 {
@@ -99,14 +99,14 @@ func (m *mockTG) resetCalls() {
 	m.mu.Unlock()
 }
 
-// callList — копия последовательности вызванных методов (для проверок порядка).
+// callList copies the sequence of called methods (for order checks).
 func (m *mockTG) callList() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]string(nil), m.calls...)
 }
 
-// callBodies — тела всех вызовов метода в порядке следования.
+// callBodies returns the bodies of all calls of a method, in order.
 func (m *mockTG) callBodies(method string) [][]byte {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -119,7 +119,7 @@ func (m *mockTG) callBodies(method string) [][]byte {
 	return out
 }
 
-// sentChatIDs возвращает chat_id всех вызовов sendMessage/sendRichMessage (в порядке).
+// sentChatIDs returns the chat_id of every sendMessage/sendRichMessage call (in order).
 func (m *mockTG) sentChatIDs(method string) []int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -132,7 +132,7 @@ func (m *mockTG) sentChatIDs(method string) []int64 {
 	return nil
 }
 
-// richHTML извлекает html из rich_message полезной нагрузки вызова.
+// richHTML extracts the html from a call's rich_message payload.
 func richHTML(t *testing.T, body map[string]any) string {
 	t.Helper()
 	rm, ok := body["rich_message"].(map[string]any)
@@ -146,7 +146,7 @@ func richHTML(t *testing.T, body map[string]any) string {
 	return h
 }
 
-// lastRichHTML — html последнего вызова sendRichMessage/editMessageText(панель).
+// lastRichHTML is the html of the last sendRichMessage/editMessageText (panel) call.
 func lastRichHTML(t *testing.T, m *mockTG, method string) string {
 	t.Helper()
 	return richHTML(t, m.lastBody(method))
@@ -374,8 +374,8 @@ func TestDeleteMessage(t *testing.T) {
 	}
 }
 
-// §4: панели/уведомления/карточки — rich-сообщения: html + skip_entity_detection,
-// без parse_mode и text.
+// Panels/notifications/cards are rich messages: html + skip_entity_detection,
+// without parse_mode and text.
 func TestSendRichMessagePayload(t *testing.T) {
 	m := newMockTG(t)
 	c := newTestBot(m)
@@ -405,7 +405,7 @@ func TestSendRichMessagePayload(t *testing.T) {
 	}
 }
 
-// §4: редактирование панели — editMessageText с rich_message вместо text.
+// Panel editing is editMessageText with rich_message instead of text.
 func TestEditRichMessageTextPayload(t *testing.T) {
 	m := newMockTG(t)
 	c := newTestBot(m)
@@ -427,13 +427,13 @@ func TestEditRichMessageTextPayload(t *testing.T) {
 	}
 }
 
-// 1.1: транспортные ошибки http-клиента несут URL с BOT_TOKEN
-// (Post "https://api.telegram.org/bot<токен>/метод": ...) — текст
-// возвращаемой ошибки и всех её обёрток не должен его раскрывать.
+// http.Client transport errors carry the URL with the BOT_TOKEN
+// (Post "https://api.telegram.org/bot<token>/method": ...) — the text of
+// the returned error and all its wrappers must not reveal it.
 func TestTransportErrorDoesNotLeakToken(t *testing.T) {
 	const token = "123456:AAE-SECRET-token-XYZ"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	srv.Close() // порт закрыт: соединение отклонено
+	srv.Close() // the port is closed: the connection is refused
 
 	c := &Client{Token: token, BaseURL: srv.URL, HTTP: &http.Client{Timeout: time.Second}}
 	err := c.PinChatMessage(context.Background(), 1, 1)
@@ -445,8 +445,8 @@ func TestTransportErrorDoesNotLeakToken(t *testing.T) {
 
 func TestTransportTimeoutDoesNotLeakToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body) // тело прочитано: разрыв коннекта клиентом отменит ctx
-		<-r.Context().Done()        // зависаем до клиентского таймаута
+		io.Copy(io.Discard, r.Body) // the body is read: a client disconnect cancels ctx
+		<-r.Context().Done()        // hang until the client timeout
 	}))
 	defer srv.Close()
 
@@ -460,7 +460,7 @@ func TestTransportTimeoutDoesNotLeakToken(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout cause must stay diagnosable: %v", err)
 	}
-	srv.CloseClientConnections() // зависший коннект не должен тормозить Close
+	srv.CloseClientConnections() // a hung connection must not slow down Close
 }
 
 func TestTransportCancelledDoesNotLeakToken(t *testing.T) {
@@ -485,7 +485,7 @@ func TestTransportCancelledDoesNotLeakToken(t *testing.T) {
 	srv.CloseClientConnections()
 }
 
-// assertNoTokenInChain проверяет текст ошибки и каждой её обёртки.
+// assertNoTokenInChain checks the error's text and that of every wrapper.
 func assertNoTokenInChain(t *testing.T, err error, token string) {
 	t.Helper()
 	for e := err; e != nil; e = errors.Unwrap(e) {

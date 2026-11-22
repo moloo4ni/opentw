@@ -6,13 +6,14 @@ import (
 	"strings"
 )
 
-// handleSubscribeCommand открывает корневой экран настройки подписок
-// (admin-only в группах; в каналах права проверяются на каждом callback).
+// handleSubscribeCommand opens the subscription setup root screen
+// (admin-only in groups; in channels each callback is permission-checked).
 func (b *Bot) handleSubscribeCommand(ctx context.Context, chat Chat, userID int64) error {
-	// Пост /subscribe в канале пишет администратор канала (только они могут
-	// публиковать); автора Bot API не сообщает. Панель публикуется, а права
-	// каждого нажатия кнопок проверяются отдельным getChatMember по реальному
-	// пользователю из callback. В группах автор известен и проверяется сразу.
+	// A channel /subscribe post is written by a channel admin (only they can
+	// publish); the Bot API does not report the author. The panel is
+	// published, and every button press is checked with a separate
+	// getChatMember against the real user from the callback. In groups the
+	// author is known and checked immediately.
 	anonymousChannel := chat.Type == "channel" && userID == 0
 	if !anonymousChannel {
 		ok, err := b.userIsAdmin(ctx, chat, userID)
@@ -30,7 +31,7 @@ func (b *Bot) handleSubscribeCommand(ctx context.Context, chat Chat, userID int6
 	return err
 }
 
-// draftCopy делает независимую копию черновика (для нового меню дифф = 0).
+// draftCopy makes an independent copy of the draft (a fresh menu has diff 0).
 func draftCopy(d map[string]bool) map[string]bool {
 	c := make(map[string]bool, len(d))
 	for k, v := range d {
@@ -39,7 +40,7 @@ func draftCopy(d map[string]bool) map[string]bool {
 	return c
 }
 
-// loadDraft инициализирует черновик подписок чата из сохранённого состояния.
+// loadDraft initializes the chat's subscription draft from the saved state.
 func (b *Bot) loadDraft(ctx context.Context, chatID int64) map[string]bool {
 	subs, err := b.store.Subscriptions(chatID)
 	if err != nil {
@@ -55,13 +56,13 @@ func (b *Bot) loadDraft(ctx context.Context, chatID int64) map[string]bool {
 	return draft
 }
 
-// draftOf возвращает черновик чата; если меню не открывали в этом процессе
-// (рестарт между открытием и «Сохранить»), черновик гидратируется из
-// сохранённых подписок — иначе пустой черновик стёр бы их.
+// draftOf returns the chat's draft; if the menu was not opened in this
+// process (a restart between opening and "Save"), the draft is hydrated
+// from the saved subscriptions — an empty draft would otherwise wipe them.
 //
-// Инвариант: черновики читаются и пишутся только горутиной bot.Run —
-// колбэки обрабатываются последовательно в цикле polling, — поэтому
-// мутации вне b.mu безопасны.
+// Invariant: drafts are read and written only by the bot.Run goroutine —
+// callbacks are handled sequentially in the polling loop — so mutations
+// outside b.mu are safe.
 func (b *Bot) draftOf(chatID int64) map[string]bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -80,13 +81,13 @@ func (b *Bot) draftOf(chatID int64) map[string]bool {
 	return d
 }
 
-// userIsAdmin: личные чаты — всегда владелец; группы/каналы — getChatMember.
+// userIsAdmin: private chats — always the owner; groups/channels — getChatMember.
 func (b *Bot) userIsAdmin(ctx context.Context, chat Chat, userID int64) (bool, error) {
 	if chat.Type == "private" {
 		return true, nil
 	}
 	if userID == 0 {
-		return false, nil // анонимный пост канала — не доверяем
+		return false, nil // an anonymous channel post — do not trust
 	}
 	member, err := b.api.GetChatMember(ctx, chat.ID, userID)
 	if err != nil {
@@ -96,21 +97,21 @@ func (b *Bot) userIsAdmin(ctx context.Context, chat Chat, userID int64) (bool, e
 	return member.IsAdmin(), nil
 }
 
-// handleCallback обрабатывает нажатия inline-кнопок панели подписок:
-// семейства, возврат, переключение моделей, сохранение и отмена.
-// Кнопки несут идентификаторы моделей/семейств (не индексы): устаревшие
-// клавиатуры после смены конфигурации вежливо отвергаются.
+// handleCallback handles presses of the subscribe menu's inline buttons:
+// families, back, model toggles, save and cancel. Buttons carry
+// model/family identifiers (not indices): stale keyboards after a config
+// change are rejected politely.
 func (b *Bot) handleCallback(ctx context.Context, cb *CallbackQuery) error {
 	if strings.HasPrefix(cb.Data, "st:") {
-		// кнопки-ошибки панелей/уведомлений идут раньше меню подписок:
-		// не пересекаются с f:/fa:/fn:/s:/save/cancel/back/all/none и
-		// всегда отвечают сами
+		// panel/notification error buttons come before the subscribe menu:
+		// they never collide with f:/fa:/fn:/s:/save/cancel/back/all/none and
+		// always answer themselves
 		return b.handleStatusCallback(ctx, cb)
 	}
 	if cb.Message == nil {
-		// колбэк без сообщения (отозванная/старая клавиатура): ни chat_id, ни
-		// message_id — обработка испортила бы данные нулевым chat_id;
-		// отвечаем тостом, чтобы у пользователя не висел спиннер
+		// a callback without a message (revoked/stale keyboard): neither
+		// chat_id nor message_id — handling would corrupt data with a zero
+		// chat_id; answer with a toast so the user is not left with a spinner
 		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Кнопка устарела, откройте /subscribe заново")
 	}
 	chat := cb.Message.Chat
@@ -154,7 +155,7 @@ func (b *Bot) handleCallback(ctx context.Context, cb *CallbackQuery) error {
 	}
 }
 
-// adminGate проверяет права нажавшего; в группах и каналах — только админы.
+// adminGate checks the presser's rights; in groups and channels — admins only.
 func (b *Bot) adminGate(ctx context.Context, chat Chat, cb *CallbackQuery) (bool, error) {
 	admin, err := b.userIsAdmin(ctx, chat, cb.From.ID)
 	if err != nil {
@@ -169,7 +170,7 @@ func (b *Bot) adminGate(ctx context.Context, chat Chat, cb *CallbackQuery) (bool
 	return true, nil
 }
 
-// showRoot редактирует сообщение до корневого экрана.
+// showRoot edits the message back to the root screen.
 func (b *Bot) showRoot(ctx context.Context, chat Chat, cb *CallbackQuery) error {
 	if ok, err := b.adminGate(ctx, chat, cb); err != nil {
 		return err
@@ -182,7 +183,7 @@ func (b *Bot) showRoot(ctx context.Context, chat Chat, cb *CallbackQuery) error 
 	return b.editMenu(ctx, chat, cb, text, kb)
 }
 
-// savedMap — сохранённые подписки чата для диффа черновика.
+// savedMap is the chat's saved subscriptions, for the draft diff.
 func (b *Bot) savedMap(chatID int64) map[string]bool {
 	subs, err := b.store.Subscriptions(chatID)
 	if err != nil {
@@ -195,9 +196,8 @@ func (b *Bot) savedMap(chatID int64) map[string]bool {
 	return saved
 }
 
-// editMenu перерисовывает сообщение меню; «message is not modified» —
-// штатный случай (двойной клик по кнопке), а не ошибка; при настоящей
-// неудаче даёт понятный тост.
+// editMenu redraws the menu message; "message is not modified" is normal
+// (a double click), not an error; a real failure yields a clear toast.
 func (b *Bot) editMenu(ctx context.Context, chat Chat, cb *CallbackQuery, text string, kb *InlineKeyboardMarkup) error {
 	err := b.api.EditMessageText(ctx, chat.ID, cb.Message.MessageID, text, kb)
 	var apiErr *ApiError
@@ -208,7 +208,7 @@ func (b *Bot) editMenu(ctx context.Context, chat Chat, cb *CallbackQuery, text s
 	return b.api.AnswerCallbackQuery(ctx, cb.ID, "Меню недоступно, откройте /subscribe заново")
 }
 
-// showFamily редактирует сообщение до экрана семейства.
+// showFamily edits the message to the family screen.
 func (b *Bot) showFamily(ctx context.Context, chat Chat, cb *CallbackQuery, family string) error {
 	if ok, err := b.adminGate(ctx, chat, cb); err != nil {
 		return err
@@ -221,8 +221,8 @@ func (b *Bot) showFamily(ctx context.Context, chat Chat, cb *CallbackQuery, fami
 	return b.editMenu(ctx, chat, cb, text, kb)
 }
 
-// handleSubscribeToggle переключает модель в черновике и показывает экран
-// её семейства.
+// handleSubscribeToggle flips one model in the draft and shows its family
+// screen.
 func (b *Bot) handleSubscribeToggle(ctx context.Context, chat Chat, cb *CallbackQuery, modelID string) error {
 	if ok, err := b.adminGate(ctx, chat, cb); err != nil {
 		return err
@@ -244,8 +244,8 @@ func (b *Bot) handleSubscribeToggle(ctx context.Context, chat Chat, cb *Callback
 	return b.editMenu(ctx, chat, cb, text, kb)
 }
 
-// handleMassToggle включает/выключает в черновике все модели (family=""
-// означает все семейства) и перерисовывает соответствующий экран.
+// handleMassToggle turns all models on/off in the draft (family="" means
+// every family) and redraws the matching screen.
 func (b *Bot) handleMassToggle(ctx context.Context, chat Chat, cb *CallbackQuery, family string, on bool) error {
 	if ok, err := b.adminGate(ctx, chat, cb); err != nil {
 		return err
@@ -267,9 +267,9 @@ func (b *Bot) handleMassToggle(ctx context.Context, chat Chat, cb *CallbackQuery
 	return b.editMenu(ctx, chat, cb, text, kb)
 }
 
-// handleSubscribeCancel удаляет сообщение с меню; изменения не сохраняются.
-// Если удалить нельзя (например, нет права в канале) — клавиатура убирается
-// с текстовым подтверждением.
+// handleSubscribeCancel deletes the menu message; changes are not saved.
+// When deletion is impossible (e.g. no channel right) the keyboard is
+// removed with a text confirmation.
 func (b *Bot) handleSubscribeCancel(ctx context.Context, chat Chat, cb *CallbackQuery) error {
 	if ok, err := b.adminGate(ctx, chat, cb); err != nil {
 		return err
@@ -296,7 +296,7 @@ func (b *Bot) handleSubscribeSave(ctx context.Context, chat Chat, cb *CallbackQu
 	} else if !ok {
 		return nil
 	}
-	draft := b.draftOf(chat.ID) // гидратированный черновик: save без меню не стирает
+	draft := b.draftOf(chat.ID) // hydrated draft: save without a menu wipes nothing
 	keep := make([]string, 0, len(b.models))
 	for _, m := range b.models {
 		if draft[m.ID] {

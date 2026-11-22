@@ -7,16 +7,16 @@ import (
 	"opentw/internal/status"
 )
 
-// Outbox: постановка → чтение → отметка → пусто; дедуп по (chat_id, dedupe_key).
+// Outbox: enqueue → read → mark → empty; dedupe on (chat_id, dedupe_key).
 func TestOutboxRoundtripAndDedupe(t *testing.T) {
 	s := openTest(t)
 	if err := s.EnqueueOutbox(100, "single", "k1", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.EnqueueOutbox(100, "single", "k1", []byte(`{}`)); err != nil { // дубликат
+	if err := s.EnqueueOutbox(100, "single", "k1", []byte(`{}`)); err != nil { // duplicate
 		t.Fatal(err)
 	}
-	if err := s.EnqueueOutbox(100, "single", "k2", []byte(`{}`)); err != nil { // другой ключ
+	if err := s.EnqueueOutbox(100, "single", "k2", []byte(`{}`)); err != nil { // another key
 		t.Fatal(err)
 	}
 	rows, err := s.PendingOutbox(10)
@@ -44,7 +44,7 @@ func TestOutboxRoundtripAndDedupe(t *testing.T) {
 	}
 }
 
-// chat_notified: set/get, перезапись, отсутствие строки, чистка по чату.
+// chat_notified: set/get, overwrite, missing row, per-chat cleanup.
 func TestChatNotifiedStateLifecycle(t *testing.T) {
 	s := openTest(t)
 	if _, ok, err := s.ChatNotifiedState(100, "m"); err != nil || ok {
@@ -65,14 +65,14 @@ func TestChatNotifiedStateLifecycle(t *testing.T) {
 	if got, ok, err := s.ChatNotifiedState(100, "m"); err != nil || !ok || got != status.Down {
 		t.Fatalf("state(100,m) = %v %v %v, want down", got, ok, err)
 	}
-	// перезапись: последнее состояние важнее предыдущего
+	// overwrite: the last state beats the previous one
 	if err := s.SetChatNotifiedState(100, "m", status.Operational); err != nil {
 		t.Fatal(err)
 	}
 	if got, ok, err := s.ChatNotifiedState(100, "m"); err != nil || !ok || got != status.Operational {
 		t.Fatalf("overwrite = %v %v %v, want operational", got, ok, err)
 	}
-	// удаление — только строки одного чата
+	// deletion removes only the one chat's rows
 	if err := s.DeleteChatNotifiedState(100); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,8 @@ func TestChatNotifiedStateLifecycle(t *testing.T) {
 	}
 }
 
-// Очистка: отправленное старше 7д удаляется; не отправленное старше TTL дропается.
+// Cleanup: delivered rows older than 7d are removed; undelivered rows
+// older than the TTL are dropped.
 func TestOutboxTTLAndCleanup(t *testing.T) {
 	s := openTest(t)
 	if err := s.EnqueueOutbox(1, "single", "old-sent", []byte(`{}`)); err != nil {
@@ -130,8 +131,8 @@ func TestOutboxTTLAndCleanup(t *testing.T) {
 	}
 }
 
-// ApplyCycle: состояния и события фиксируются атомарно — частичный коммит
-// невозможен (P0-1: событие не существует без нового состояния и наоборот).
+// ApplyCycle: states and events commit atomically — a partial commit is
+// impossible (an event cannot exist without its state and vice versa).
 func TestApplyCycleAtomic(t *testing.T) {
 	s := openTest(t)
 	if err := s.SyncModels([]Model{{ID: "m", Family: "A"}}); err != nil {
@@ -155,15 +156,15 @@ func TestApplyCycleAtomic(t *testing.T) {
 	if rows, err := s.PendingOutbox(10); err != nil || len(rows) != 1 {
 		t.Fatalf("event missing: %v %+v", err, rows)
 	}
-	// дедуп: повторный коммит того же цикла ничего не добавляет
+	// dedupe: re-committing the same cycle adds nothing
 	if err := s.ApplyCycle(checks, events); err != nil {
 		t.Fatal(err)
 	}
 	if rows, _ := s.PendingOutbox(10); len(rows) != 1 {
 		t.Fatalf("dedupe broken: %+v", rows)
 	}
-	// провал на записи события откатывает и состояния: следующие циклы
-	// переоткроют переходы от прежнего состояния, ничего не теряется
+	// a failure while writing the event rolls the states back too: the next
+	// cycles reopen the transitions from the previous state, nothing is lost
 	if _, err := s.db.Exec(`DROP TABLE notification_outbox`); err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +182,7 @@ func TestApplyCycleAtomic(t *testing.T) {
 	}
 }
 
-// DeferOutboxAttempt уважает retry_after и считается в attempts.
+// DeferOutboxAttempt honours retry_after and counts in attempts.
 func TestOutboxDeferAttempt(t *testing.T) {
 	s := openTest(t)
 	if err := s.EnqueueOutbox(100, "single", "k", []byte(`{}`)); err != nil {
@@ -210,9 +211,9 @@ func TestOutboxDeferAttempt(t *testing.T) {
 	}
 }
 
-// CommitDelivery: пометки строк и уведомлённые состояния фиксируются одним
-// вызовом (одной транзакцией); D1 — помечаются только заданные ID, поздние
-// строки чата остаются pending и доезжают отдельно.
+// CommitDelivery: row marks and notified states are recorded by one call
+// (one transaction); only the given IDs are marked — the chat's later rows
+// stay pending and are delivered separately.
 func TestCommitDelivery(t *testing.T) {
 	s := openTest(t)
 	for _, k := range []string{"k1", "k2", "k3"} {
@@ -234,16 +235,16 @@ func TestCommitDelivery(t *testing.T) {
 	for i := range rows {
 		ids[i] = rows[i].ID
 	}
-	// коммит без уведомлённых состояний — только пометки строк (частичная
-	// доставка: старые ID отдают свои строки, поздние остаются)
+	// a commit without notified states — only row marks (partial delivery:
+	// the old IDs release their rows, later ones stay)
 	if err := s.CommitDelivery(100, nil, ids[:2]); err != nil {
 		t.Fatal(err)
 	}
 	cnt, _ := s.PendingOutboxCount()
-	if cnt != 2 { // k3 чата 100 и k4 чата 200
+	if cnt != 2 { // chat 100's k3 and chat 200's k4
 		t.Fatalf("one of three rows must stay pending, got %d", cnt)
 	}
-	// D1: поздняя строка чата не помечается старыми ID и доедет отдельно
+	// the chat's late row is not marked by the old IDs and delivers separately
 	if err := s.EnqueueOutbox(100, "single", "k9", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +259,7 @@ func TestCommitDelivery(t *testing.T) {
 	if err != nil || !ok || st != status.Down {
 		t.Fatalf("notified state must be committed: %q %v %v", st, ok, err)
 	}
-	// повторный коммит тех же ID — пометки идемпотентны, состояние обновляется
+	// re-committing the same IDs — marks are idempotent, the state updates
 	if err := s.CommitDelivery(100, map[string]status.Status{"m1": status.Operational}, ids); err != nil {
 		t.Fatal(err)
 	}
@@ -268,13 +269,13 @@ func TestCommitDelivery(t *testing.T) {
 	if rows, _ = s.PendingOutboxChat(100); len(rows) != 1 {
 		t.Fatalf("re-marking already-sent ids must affect nothing: %+v", rows)
 	}
-	// пустые ids — коммит только уведомлённых состояний
+	// empty ids — a commit of notified states only
 	if err := s.CommitDelivery(100, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// Атомарная замена подписок чата.
+// Atomic replacement of a chat's subscriptions.
 func TestReplaceSubscriptions(t *testing.T) {
 	s := openTest(t)
 	if err := s.ReplaceSubscriptions(100, []string{"a", "b"}); err != nil {
@@ -298,7 +299,7 @@ func TestReplaceSubscriptions(t *testing.T) {
 	}
 }
 
-// Инциденты старше 30 дней удаляются, включая открытые.
+// Incidents older than 30 days are deleted, open ones included.
 func TestDeleteOldIncidents(t *testing.T) {
 	s := openTest(t)
 	old := time.Now().Add(-31 * 24 * time.Hour)
@@ -320,7 +321,7 @@ func TestDeleteOldIncidents(t *testing.T) {
 	}
 }
 
-// Оффсет getUpdates переживает рестарт.
+// The getUpdates offset survives a restart.
 func TestBotOffset(t *testing.T) {
 	s := openTest(t)
 	if off, err := s.BotOffset(); err != nil || off != 0 {
@@ -337,9 +338,9 @@ func TestBotOffset(t *testing.T) {
 	}
 }
 
-// D3: операции инцидентов выполняются в транзакции цикла. Открытие
-// идемпотентно (повтор цикла после сбоя не дублирует), закрытие по ID
-// проваливается целиком с откатом состояний, если инцидент уже закрыт.
+// Incident operations run inside the cycle's transaction. Open is idempotent
+// (a cycle retried after a failure creates no duplicate); a close by ID fails
+// the whole cycle with a state rollback when the incident is already closed.
 func TestApplyCycleIncidentOps(t *testing.T) {
 	s := openTest(t)
 	if err := s.SyncModels([]Model{{ID: "m", Family: "A"}}); err != nil {
@@ -348,7 +349,7 @@ func TestApplyCycleIncidentOps(t *testing.T) {
 	at := time.Now()
 	op := IncidentOp{ModelID: "m", Open: true, OpenFrom: status.Down, OpenAt: at}
 	down := map[string]Check{"m": {ModelID: "m", At: at, HTTPStatus: 503, Status: status.Down}}
-	for i := 0; i < 2; i++ { // коммит + redo той же операции
+	for i := 0; i < 2; i++ { // commit + redo of the same operation
 		if err := s.ApplyCycle(down, nil, op); err != nil {
 			t.Fatal(err)
 		}
@@ -364,7 +365,7 @@ func TestApplyCycleIncidentOps(t *testing.T) {
 	if cur.Started.IsZero() {
 		t.Fatalf("started_at must scan: %+v", cur)
 	}
-	// закрытие в одной транзакции с состоянием
+	// the close lands in one transaction with the state
 	recovered := map[string]Check{"m": {ModelID: "m", At: at.Add(time.Minute), HTTPStatus: 200, Status: status.Operational}}
 	if err := s.ApplyCycle(recovered, nil, IncidentOp{ModelID: "m", CloseID: cur.ID, CloseTo: status.Operational, CloseAt: at.Add(time.Minute)}); err != nil {
 		t.Fatal(err)
@@ -376,7 +377,7 @@ func TestApplyCycleIncidentOps(t *testing.T) {
 	if open, _ := s.HasOpenIncident("m"); open {
 		t.Fatal("close op must close the incident")
 	}
-	// конфликт: закрывать уже нечего — цикл целиком откатывается
+	// conflict: nothing left to close — the whole cycle rolls back
 	fell := map[string]Check{"m": {ModelID: "m", At: at.Add(2 * time.Minute), HTTPStatus: 503, Status: status.Down}}
 	if err := s.ApplyCycle(fell, nil, IncidentOp{ModelID: "m", CloseID: cur.ID, CloseTo: status.Down, CloseAt: at.Add(2 * time.Minute)}); err == nil {
 		t.Fatal("closing an already-closed incident must fail the cycle")
@@ -387,8 +388,8 @@ func TestApplyCycleIncidentOps(t *testing.T) {
 	}
 }
 
-// Этап 2.5: SyncModels удаляет подписки на модели, покинувшие конфигурацию,
-// и закрывает открытые инциденты удалённых моделей (2.3) одной транзакцией.
+// SyncModels drops subscriptions to models that left the configuration and
+// closes open incidents of removed models, in one transaction.
 func TestSyncModelsCleansOrphanSubscriptionsAndIncidents(t *testing.T) {
 	s := openTest(t)
 	if err := s.SyncModels([]Model{{ID: "model-a", Family: "A"}, {ID: "model-b", Family: "B"}}); err != nil {
@@ -407,7 +408,7 @@ func TestSyncModelsCleansOrphanSubscriptionsAndIncidents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// model-a покидает конфигурацию
+	// model-a leaves the configuration
 	if err := s.SyncModels([]Model{{ID: "model-b", Family: "B"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -427,19 +428,19 @@ func TestSyncModelsCleansOrphanSubscriptionsAndIncidents(t *testing.T) {
 	if len(subs101) != 0 {
 		t.Fatalf("all subscriptions of removed model must be dropped: %v", subs101)
 	}
-	// инцидент удалённой модели закрыт (не остаётся открытым навсегда)
+	// the removed model's incident is closed (not left open forever)
 	if open, err := s.HasOpenIncident("model-a"); err != nil || open {
 		t.Fatalf("open incident must be closed when the model leaves the config: %v %v", open, err)
 	}
 }
 
-// Этап 6.3: PendingOutboxDue — строгий FIFO внутри чата и честная выборка:
-// только головная (старейшая) строка каждого чата и только созревшая
-// (next_attempt_at); отложенная голова не выпускает более новые строки
-// своего чата, но не блокирует чужие чаты.
+// PendingOutboxDue — strict per-chat FIFO and a fair pick: only each
+// chat's head (oldest) row and only a matured one (next_attempt_at);
+// a deferred head holds back its chat's newer rows but never blocks
+// other chats.
 func TestPendingOutboxDue(t *testing.T) {
 	s := openTest(t)
-	// чат 100: три строки; чат 200: одна
+	// chat 100: three rows; chat 200: one
 	for _, k := range []string{"k1", "k2", "k3"} {
 		if err := s.EnqueueOutbox(100, "single", k, []byte(`{}`)); err != nil {
 			t.Fatal(err)
@@ -460,7 +461,7 @@ func TestPendingOutboxDue(t *testing.T) {
 		t.Fatalf("chat head must be the oldest row, got %+v", rows[0])
 	}
 
-	// голова чата 100 отложена: чат не участвует в выборке, чат 200 — участвует
+	// chat 100's head is deferred: the chat is out of the pick, chat 200 stays in
 	if err := s.DeferOutboxAttempt(rows[0].ID, time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -472,8 +473,8 @@ func TestPendingOutboxDue(t *testing.T) {
 		t.Fatalf("deferred head must hold back its chat only, got %+v", rows)
 	}
 
-	// созревание (next_attempt_at в прошлом) возвращает голову
-	if err := s.DeferOutboxAttempt(rows[0].ID, -2*time.Hour); err != nil { // и чат 200 заодно отложен в прошлое
+	// maturity (a past next_attempt_at) returns the head
+	if err := s.DeferOutboxAttempt(rows[0].ID, -2*time.Hour); err != nil { // chat 200's row also deferred into the past
 		t.Fatal(err)
 	}
 	if err := s.DeferOutboxAttempt(1, -2*time.Hour); err != nil {
@@ -487,7 +488,7 @@ func TestPendingOutboxDue(t *testing.T) {
 		t.Fatalf("both matured heads expected, got %+v", rows)
 	}
 
-	// доставка головы открывает следующую строку того же чата
+	// delivering a head opens the chat's next row
 	if err := s.MarkOutboxSent(rows[0].ID); err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +503,7 @@ func TestPendingOutboxDue(t *testing.T) {
 		t.Fatalf("next head of chat 100 expected, got %+v", rows)
 	}
 
-	// количество попыток доступно для расчёта backoff (6.1)
+	// the attempt count is available for backoff computation
 	if err := s.BumpOutboxAttempt(rows[0].ID); err != nil {
 		t.Fatal(err)
 	}

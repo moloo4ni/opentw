@@ -56,7 +56,7 @@ func TestGenerateStreamSuccess(t *testing.T) {
 			`{"id":"1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
 			`{"id":"1","choices":[{"index":0,"delta":{"content":"O"},"finish_reason":null}]}`,
 		)
-		time.Sleep(180 * time.Millisecond) // реальная генерация занимает время
+		time.Sleep(180 * time.Millisecond) // real generation takes time
 		writeSSE(w, []string{
 			`{"id":"1","choices":[{"index":0,"delta":{"content":"K"},"finish_reason":null}]}`,
 			`{"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}`,
@@ -319,7 +319,7 @@ func TestGenerateTimeout(t *testing.T) {
 
 func TestGenerateConnRefused(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	srv.Close() // порт закрыт
+	srv.Close() // the port is closed
 
 	res := newTestClient(srv.URL, 2*time.Second, true).Generate(context.Background(), "glm-5.3", 8)
 	if res.ErrorKind != "connrefused" {
@@ -379,7 +379,7 @@ func TestGenerateInvalidResponse(t *testing.T) {
 			} else {
 				w.Header().Set("Content-Type", "application/json")
 			}
-			fmt.Fprint(w, "wow") // заглушка Tonworld без ключа
+			fmt.Fprint(w, "wow") // a keyless Tonworld stub
 		}))
 		res := newTestClient(srv.URL, 5*time.Second, stream).Generate(context.Background(), "glm-5.3", 8)
 		if res.ErrorKind != "invalid" {
@@ -470,8 +470,8 @@ func TestListModelsErrors(t *testing.T) {
 	}
 }
 
-// D13: HTTP 200 с JSON-ошибкой шлюза — текст ошибки сохраняется,
-// а не «пустая генерация».
+// HTTP 200 with a JSON gateway error — the error text is preserved, not
+// replaced by "empty generation".
 func TestNonStreamGatewayErrorInBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -494,15 +494,15 @@ func TestNonStreamGatewayErrorInBody(t *testing.T) {
 	}
 }
 
-// --- 1.2: ошибки чтения тела после заголовков классифицируются той же
-// сетевой причиной, что и ошибки до заголовков ---
+// --- Body-read failures after headers are classified by the same network
+// cause as failures before headers ---
 
-// HTTP 200, первый чанк получен, поток зависает до Client.Timeout.
+// HTTP 200, the first chunk received, the stream hangs until Client.Timeout.
 func TestStreamReadTimeoutAfterFirstChunk(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeChunks(w, `{"choices":[{"index":0,"delta":{"content":"O"},"finish_reason":null}]}`)
-		<-r.Context().Done() // зависание потока после первого чанка
+		<-r.Context().Done() // the stream hangs after the first chunk
 	}))
 	defer srv.Close()
 
@@ -515,8 +515,8 @@ func TestStreamReadTimeoutAfterFirstChunk(t *testing.T) {
 	}
 }
 
-// Отмена ctx во время чтения стримингового ответа: штатная остановка
-// монитора не должна выглядеть ошибкой модели.
+// Cancelling ctx during a streaming read: a normal monitor shutdown must
+// not look like a model error.
 func TestStreamReadCancelled(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -536,7 +536,7 @@ func TestStreamReadCancelled(t *testing.T) {
 	}
 }
 
-// Обрыв соединения во время чтения полного (не-SSE) ответа.
+// A connection cut during a full (non-SSE) response read.
 func TestFullBodyConnectionBreak(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, _, err := w.(http.Hijacker).Hijack()
@@ -544,7 +544,7 @@ func TestFullBodyConnectionBreak(t *testing.T) {
 			t.Fatalf("hijack: %v", err)
 		}
 		conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 200\r\nContent-Type: application/json\r\n\r\n{\"choices\":["))
-		conn.Close() // тело короче Content-Length: разрыв посреди ответа
+		conn.Close() // the body is shorter than Content-Length: a mid-response cut
 	}))
 	defer srv.Close()
 
@@ -560,7 +560,7 @@ func TestFullBodyConnectionBreak(t *testing.T) {
 	}
 }
 
-// Обрыв соединения посреди SSE-потока.
+// A connection cut mid-SSE-stream.
 func TestStreamBodyConnectionBreak(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, _, err := w.(http.Hijacker).Hijack()
@@ -582,10 +582,10 @@ func TestStreamBodyConnectionBreak(t *testing.T) {
 	}
 }
 
-// --- 1.3: ошибка шлюза в streaming-режиме ---
+// --- A gateway error in streaming mode ---
 
-// SSE-чанк с полем error — ошибка шлюза: текст провайдера сохраняется,
-// а не подменяется «пустой генерацией» (паритет с non-stream, D13).
+// An SSE chunk with an error field is a gateway error: the provider text is
+// kept, not replaced with an "empty generation" (parity with non-stream).
 func TestStreamGatewayErrorInSSE(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -608,8 +608,8 @@ func TestStreamGatewayErrorInSSE(t *testing.T) {
 	}
 }
 
-// stream:true, но SSE-данных нет: шлюз отдал обычный JSON с ошибкой —
-// это не «ошибка монитора».
+// stream:true but no SSE data: the gateway answered with a plain JSON
+// error — not a "monitor error".
 func TestStreamGatewayErrorJSONBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -632,8 +632,9 @@ func TestStreamGatewayErrorJSONBody(t *testing.T) {
 	}
 }
 
-// Контент уже сгенерирован, затем error-чанк: частично успешный стрим
-// остаётся успехом — ошибка шлюза важна только при отсутствии генерации.
+// Content was already generated, then an error chunk: a partially
+// successful stream stays a success — the gateway error matters only with
+// no generation.
 func TestStreamErrorChunkAfterContentStaysSuccess(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -653,7 +654,7 @@ func TestStreamErrorChunkAfterContentStaysSuccess(t *testing.T) {
 	}
 }
 
-// --- 1.4: обрезка текста ошибок безопасна для Unicode ---
+// --- Error-text truncation is Unicode-safe ---
 
 func TestTruncateRunesSafe(t *testing.T) {
 	s := strings.Repeat("р", 600)
@@ -661,7 +662,7 @@ func TestTruncateRunesSafe(t *testing.T) {
 	if !utf8.ValidString(got) {
 		t.Fatal("truncate produced invalid UTF-8")
 	}
-	// n рун + многоточие, как в telegram.trunc
+	// n runes + an ellipsis, like telegram.trunc
 	if got != strings.Repeat("р", 512)+"…" {
 		t.Fatalf("truncate = %q", got)
 	}

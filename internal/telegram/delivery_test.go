@@ -15,12 +15,12 @@ import (
 	"opentw/internal/storage"
 )
 
-// cycleAt — цикл с заданным временем (уникальные dedupe-ключи строк).
+// cycleAt is a cycle with the given time (unique row dedupe keys).
 func cycleAt(at time.Time, trs ...monitor.Transition) monitor.CycleResult {
 	return monitor.CycleResult{CycleAt: at, NextAt: at.Add(15 * time.Minute), Transitions: trs}
 }
 
-// firstPendingRow возвращает старейшую pending-строку (для манипуляций).
+// firstPendingRow returns the oldest pending row (for manipulation).
 func firstPendingRow(t *testing.T, store *storage.Store) storage.OutboxRow {
 	t.Helper()
 	rows, err := store.PendingOutbox(10)
@@ -30,8 +30,8 @@ func firstPendingRow(t *testing.T, store *storage.Store) storage.OutboxRow {
 	return rows[0]
 }
 
-// enqueuePending — синтетическая pending-строка с событием модели (для
-// прямой проверки сверки актуальности §9).
+// enqueuePending creates a synthetic pending row with a model event (for
+// directly testing the freshness reconciliation).
 func enqueuePending(t *testing.T, store *storage.Store, chatID int64, modelIDs ...string) {
 	t.Helper()
 	payload, err := json.Marshal(deliveryPayload{Trs: trsOf(modelIDs...)})
@@ -51,7 +51,7 @@ func trsOf(ids ...string) []monitor.Transition {
 	return out
 }
 
-// OnCycle не ходит в сеть: событие ложится в outbox (D3).
+// OnCycle does not touch the network: the event lands in the outbox.
 func TestOnCycleDoesNotSendDirectly(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -72,8 +72,8 @@ func TestOnCycleDoesNotSendDirectly(t *testing.T) {
 	}
 }
 
-// Много моделей в одном цикле — одно rich-сообщение на чат, строки только
-// по его подпискам, порядок — конфиг (§8).
+// Many models in one cycle — one rich message per chat, lines only for its
+// subscriptions, config order.
 func TestManyModelsOneMessageSubscribedOnly(t *testing.T) {
 	m := newMockTG(t)
 	models := []storage.Model{
@@ -98,7 +98,7 @@ func TestManyModelsOneMessageSubscribedOnly(t *testing.T) {
 	commitCycle(t, b, cycle(checks,
 		transition("a", status.Operational, status.Down, now, nil),
 		transition("b", status.Operational, status.Down, now, nil),
-		transition("c", status.Operational, status.Down, now, nil))) // не подписан
+		transition("c", status.Operational, status.Down, now, nil))) // not subscribed
 	b.deliveryTick(context.Background())
 
 	if n := m.callCount("sendRichMessage"); n != 1 {
@@ -117,14 +117,14 @@ func TestManyModelsOneMessageSubscribedOnly(t *testing.T) {
 	if strings.Contains(html, "<code>c</code>") {
 		t.Errorf("unsubscribed model leaked into chat message:\n%s", html)
 	}
-	// порядок строк — порядок конфига: a раньше b
+	// line order follows the config order: a before b
 	if !(strings.Index(html, "<code>a</code>") < strings.Index(html, "<code>b</code>")) {
 		t.Errorf("config order broken:\n%s", html)
 	}
 }
 
-// Сценарий A (§9): падение и восстановление во время простоя доставки при
-// notified=operational — тишина, строки помечаются sent.
+// Scenario A: a fall and recovery during a delivery downtime with
+// notified=operational — silence, rows are marked sent.
 func TestDeliveryScenarioAFullReturnToKnownState(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -143,20 +143,20 @@ func TestDeliveryScenarioAFullReturnToKnownState(t *testing.T) {
 
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n != 0 {
-		t.Fatalf("cur == notified — тишина, got %d sends", n)
+		t.Fatalf("cur == notified — silence, got %d sends", n)
 	}
 	if rows, _ := store.PendingOutbox(10); len(rows) != 0 {
 		t.Fatalf("rows must be marked sent: %+v", rows)
 	}
-	// состояние уведомлённости не изменилось
+	// the notified state did not change
 	st, ok, _ := store.ChatNotifiedState(100, "gpt-6-astra")
 	if !ok || st != status.Operational {
 		t.Fatalf("chat_notified must stay operational, got %q ok=%v", st, ok)
 	}
 }
 
-// Сценарий B (§9): сбой держится — одна красная строка; повторная строка
-// при cur == notified молчит.
+// Scenario B: the outage persists — one red line; a repeated row at
+// cur == notified stays silent.
 func TestDeliveryScenarioBDownPersistsOneLine(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -183,7 +183,7 @@ func TestDeliveryScenarioBDownPersistsOneLine(t *testing.T) {
 		t.Fatalf("chat_notified must be down, got %q ok=%v", st, ok)
 	}
 
-	// пользователь уже знает: новая pending-строка той же модели молчит
+	// the user already knows: a new pending row of the same model stays silent
 	enqueuePending(t, store, 100, "gpt-6-astra")
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n != 1 {
@@ -194,8 +194,8 @@ func TestDeliveryScenarioBDownPersistsOneLine(t *testing.T) {
 	}
 }
 
-// Сценарий C (§9): несколько переключений — ОДНА строка по ТЕКУЩЕМУ
-// состоянию, label из ПОСЛЕДНЕЙ проверки (не из исторической в payload).
+// Scenario C: several flips — ONE line for the CURRENT state, the label
+// from the LATEST check (not the historical one in the payload).
 func TestDeliveryScenarioCOneLineFromCurrentState(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -203,7 +203,7 @@ func TestDeliveryScenarioCOneLineFromCurrentState(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	// историческая проверка — 503, последняя — 429: в строке должен быть 429
+	// the historical check is 503, the latest is 429: the line must show 429
 	if err := b.store.InsertCheck(storage.Check{ModelID: "gpt-6-astra", At: now.Add(-30 * time.Minute),
 		Status: status.Down, HTTPStatus: 503, ErrorType: "http"}); err != nil {
 		t.Fatal(err)
@@ -212,12 +212,12 @@ func TestDeliveryScenarioCOneLineFromCurrentState(t *testing.T) {
 	if err := b.store.InsertCheck(fresh); err != nil {
 		t.Fatal(err)
 	}
-	// исторический payload несёт 503 — строка строится по актуальному check
+	// the historical payload carries 503 — the line is built from the current check
 	tr := transition("gpt-6-astra", status.Operational, status.Down, now.Add(-30*time.Minute), nil)
 	commitCycle(t, b, cycleAt(now.Add(-30*time.Minute), tr))
 	commitCycle(t, b, cycleAt(now.Add(-15*time.Minute),
 		transition("gpt-6-astra", status.Down, status.Operational, now.Add(-15*time.Minute), nil)))
-	// финальное состояние — снова down (check 429)
+	// the final state is down again (the 429 check)
 	final := map[string]storage.Check{"gpt-6-astra": fresh}
 	commitCycle(t, b, cycle(final, transition("gpt-6-astra", status.Operational, status.Down, now, nil)))
 
@@ -244,9 +244,9 @@ func TestDeliveryScenarioCOneLineFromCurrentState(t *testing.T) {
 	}
 }
 
-// Сценарий D (§9/OPW-01): текущее состояние Unknown — тишина без
-// уничтожения свидетельства: строки НЕ помечаются sent, chat_notified НЕ
-// обновляется; вернувшееся достоверное состояние доезжает уведомлением.
+// Scenario D: the current state is Unknown — silence without destroying the
+// evidence: rows are NOT marked sent, chat_notified is NOT updated; a
+// returning definitive state delivers the notification.
 func TestDeliveryScenarioDUnknownSilent(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -255,16 +255,16 @@ func TestDeliveryScenarioDUnknownSilent(t *testing.T) {
 	}
 	checks := downChecks("gpt-6-astra", 503, "http")
 	commitCycle(t, b, cycle(checks, transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
-	// к моменту доставки монитор потерял зрение: last_status = Unknown
+	// by delivery time the monitor lost sight: last_status = Unknown
 	if err := store.SetModelState("gpt-6-astra", status.Unknown, "invalid", "unparseable", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n != 0 {
-		t.Fatalf("cur Unknown — тишина, got %d sends", n)
+		t.Fatalf("cur Unknown — silence, got %d sends", n)
 	}
-	// OPW-01: неопределённость не имеет права поглощать единственное
-	// свидетельство о недоставленном падении — строка обязана остаться pending
+	// uncertainty must not swallow the only evidence of an undelivered fall:
+	// the row must stay pending
 	if rows, _ := store.PendingOutbox(10); len(rows) != 1 {
 		t.Fatalf("row must stay pending while cur is Unknown: %+v", rows)
 	}
@@ -274,7 +274,7 @@ func TestDeliveryScenarioDUnknownSilent(t *testing.T) {
 	if _, ok, _ := store.ChatNotifiedState(100, "gpt-6-astra"); ok {
 		t.Fatal("Unknown must not update chat_notified")
 	}
-	// достоверное состояние вернулось — уведомление о падении доезжает
+	// the definitive state returned — the down notification arrives
 	if err := store.SetModelState("gpt-6-astra", status.Down, "http", "HTTP 503", time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +298,7 @@ func TestDeliveryScenarioDUnknownSilent(t *testing.T) {
 	}
 }
 
-// Отписка во время простоя — строка выбрасывается без отправки (§9).
+// Unsubscribe during downtime — the row is dropped without sending.
 func TestDeliveryUnsubscribeDuringOutageDropsRows(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -319,7 +319,8 @@ func TestDeliveryUnsubscribeDuringOutageDropsRows(t *testing.T) {
 	}
 }
 
-// Повторный OnCycle с тем же временем цикла не дублирует строку (идемпотентность).
+// A repeated OnCycle with the same cycle time does not duplicate the row
+// (idempotence).
 func TestOutboxDedupeSameCycle(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -342,7 +343,7 @@ func TestOutboxDedupeSameCycle(t *testing.T) {
 	}
 }
 
-// Событие переживает рестарт процесса: тот же файл БД, новый Bot.
+// An event survives a process restart: the same DB file, a new Bot.
 func TestOutboxSurvivesRestart(t *testing.T) {
 	m := newMockTG(t)
 	path := t.TempDir() + "/bot.db"
@@ -373,8 +374,8 @@ func TestOutboxSurvivesRestart(t *testing.T) {
 	}
 }
 
-// D1: новое событие чата, закоммиченное ВО ВРЕМЯ отправки его свёртки, не
-// помечается отправленным вместе с backlog и доезжает отдельным сообщением.
+// A new chat event committed DURING the send of its backlog collapse is not
+// marked sent with the backlog and is delivered as a separate message.
 func TestNewRowDuringSendStaysPending(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -397,7 +398,7 @@ func TestNewRowDuringSendStaysPending(t *testing.T) {
 		var p map[string]any
 		json.Unmarshal(body, &p)
 		if len(sent) == 0 {
-			// первая отправка в полёте: цикл коммитит новое событие того же чата
+			// the first send is in flight: the cycle commits a new event of the same chat
 			up := map[string]storage.Check{"glm-5.3": {ModelID: "glm-5.3", At: time.Now(), Status: status.Operational, HTTPStatus: 200}}
 			commitCycle(t, b, cycle(up, transition("glm-5.3", status.Down, status.Operational, time.Now(), nil)))
 		} else if pendingAtSeparateSend < 0 {
@@ -412,11 +413,11 @@ func TestNewRowDuringSendStaysPending(t *testing.T) {
 	if len(sent) != 2 {
 		t.Fatalf("collapsed + separate delivery expected, got %d sends: %v", len(sent), sent)
 	}
-	// первое сообщение — только старое событие
+	// the first message — only the old event
 	if !strings.Contains(sent[0], "<p>🔴 <code>gpt-6-astra</code>") || strings.Contains(sent[0], "glm-5.3") {
 		t.Fatalf("first message must hold only the old backlog:\n%s", sent[0])
 	}
-	// второе — отдельное уведомление о новом событии
+	// the second — a separate notification of the new event
 	if !strings.Contains(sent[1], "<p>🟢 <code>glm-5.3</code> - Восстановилась</p>") {
 		t.Fatalf("new row must be delivered separately:\n%s", sent[1])
 	}
@@ -428,8 +429,8 @@ func TestNewRowDuringSendStaysPending(t *testing.T) {
 	}
 }
 
-// §9.4: «отправка есть — отчёта нет» (MarkOutboxSent не прошёл) — очередь
-// не фризится: повтор доезжает дубликатом (at-least-once), БД не ломается.
+// "send done — report lost" (MarkOutboxSent failed) — the queue does not
+// freeze: the retry arrives as a duplicate (at-least-once), the DB is intact.
 func TestSentButReportLostRecovers(t *testing.T) {
 	m := newMockTG(t)
 	path := t.TempDir() + "/bot.db"
@@ -442,7 +443,7 @@ func TestSentButReportLostRecovers(t *testing.T) {
 	m.handler = func(method string, body []byte) (any, int) {
 		if method == "sendRichMessage" {
 			if closed.CompareAndSwap(false, true) {
-				_ = store.Close() // отчёт о доставке теряется сразу после отправки
+				_ = store.Close() // the delivery report is lost right after the send
 			}
 			return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
 		}
@@ -453,13 +454,13 @@ func TestSentButReportLostRecovers(t *testing.T) {
 	commitCycle(t, b, cycle(checks, transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
 	b.deliveryTick(context.Background())
 
-	// тот же файл БД, новый процесс: строка всё ещё pending и доезжает повтором
+	// the same DB file, a new process: the row is still pending and redelivers
 	b2, store2 := newBotAt(t, m, path, models)
 	if rows, _ := store2.PendingOutbox(10); len(rows) != 1 {
 		t.Fatalf("undelivered row must survive a lost report: %+v", rows)
 	}
-	// коммит после отправки не прошёл — ничего не зафиксировано: ни пометок
-	// строк, ни уведомлённого состояния (единая транзакция, §4.1)
+	// the post-send commit failed — nothing is recorded: neither row marks,
+	// nor the notified state (one transaction)
 	if _, ok, _ := store2.ChatNotifiedState(100, "gpt-6-astra"); ok {
 		t.Fatal("failed commit must not record chat_notified")
 	}
@@ -476,7 +477,8 @@ func TestSentButReportLostRecovers(t *testing.T) {
 	}
 }
 
-// Временный сбой Telegram: строка остаётся, ретраится не раньше backoff (6.1).
+// A temporary Telegram failure: the row stays and is not retried before
+// the backoff.
 func TestTelegramTransientFailurePostpones(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -502,14 +504,14 @@ func TestTelegramTransientFailurePostpones(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("failed row must stay pending: %+v", rows)
 	}
-	// до истечения backoff — никакого повторного запроса
+	// no repeat until the backoff elapses
 	fail.Store(false)
 	m.handler = nil
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("row must not be retried before the backoff elapses, sends = %d", n)
 	}
-	// срок настал — строка доезжает
+	// the deadline arrived — the row delivers
 	if err := store.DeferOutboxAttempt(rows[0].ID, -time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +525,8 @@ func TestTelegramTransientFailurePostpones(t *testing.T) {
 	}
 }
 
-// 429 исчерпал ретраи — событие не теряется, доезжает после нормализации.
+// The 429 exhausted its retries — the event is not lost, it delivers after
+// things normalize.
 func Test429ExhaustionKeepsRow(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -552,7 +555,7 @@ func Test429ExhaustionKeepsRow(t *testing.T) {
 	}
 	limited.Store(false)
 	m.handler = nil
-	// повтор не раньше retry_after (floor 1с) и после снятия паузы батча
+	// a repeat not before retry_after (1s floor) and after the batch pause lifts
 	time.Sleep(time.Until(*rows[0].NextAttemptAt) + 20*time.Millisecond)
 	b.floodUntil.Store(0)
 	b.deliveryTick(context.Background())
@@ -562,7 +565,7 @@ func Test429ExhaustionKeepsRow(t *testing.T) {
 	}
 }
 
-// Завершение во время рассылки: недоставленное остаётся в БД.
+// A shutdown during a delivery burst: undelivered work stays in the DB.
 func TestDeliveryShutdownKeepsPending(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -599,8 +602,8 @@ func TestDeliveryShutdownKeepsPending(t *testing.T) {
 	}
 }
 
-// Панели обновляются воркером из LastChecks: неполный цикл не затирает
-// известное состояние «нет данных» (D1).
+// Panels are refreshed by the worker from LastChecks: an incomplete cycle
+// does not erase a known state.
 func TestPanelsSyncedInWorkerFromLastChecks(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -615,7 +618,7 @@ func TestPanelsSyncedInWorkerFromLastChecks(t *testing.T) {
 	if err := store.InsertCheck(storage.Check{ModelID: "glm-5.3", At: at, Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)}); err != nil {
 		t.Fatal(err)
 	}
-	// «цикл», в котором проверка glm-5.3 отменена: в res.Checks её нет
+	// a "cycle" where glm-5.3's check was cancelled: it is absent from res.Checks
 	commitCycle(t, b, cycle(map[string]storage.Check{
 		"gpt-6-astra": {ModelID: "gpt-6-astra", At: at, Status: status.Operational, HTTPStatus: 200, LatencyUS: ptr1(2_000_000)},
 	}))
@@ -625,15 +628,15 @@ func TestPanelsSyncedInWorkerFromLastChecks(t *testing.T) {
 	}
 	html := lastRichHTML(t, m, "editMessageText")
 	if !strings.Contains(html, "<p><b>GLM</b><br/>🟢 <code>glm-5.3</code> - 2.0s</p>") {
-		t.Fatalf("known state must survive a partial cycle (D1):\n%s", html)
+		t.Fatalf("known state must survive a partial cycle:\n%s", html)
 	}
 	if strings.Contains(html, "Нет данных</tg-button>") {
 		t.Fatalf("no-data must not replace a known state:\n%s", html)
 	}
 }
 
-// 6.1: канонический график нарастающего backoff: 30с, 1м, 2м, 4м, 8м,
-// потолок 15м (и дальше — потолок).
+// The canonical growing-backoff schedule: 30s, 1m, 2m, 4m, 8m, capped at
+// 15m (and stays capped).
 func TestDeferBackoffSchedule(t *testing.T) {
 	want := []time.Duration{30 * time.Second, 60 * time.Second, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 15 * time.Minute, 15 * time.Minute}
 	for i, w := range want {
@@ -643,8 +646,8 @@ func TestDeferBackoffSchedule(t *testing.T) {
 	}
 }
 
-// 6.1: временная ошибка доставки → нарастающий backoff, строка не удаляется
-// и не ретраится раньше срока.
+// A temporary delivery error → a growing backoff; the row is neither
+// deleted nor retried early.
 func TestTemporaryErrorBackoff(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -663,7 +666,7 @@ func TestTemporaryErrorBackoff(t *testing.T) {
 	seedCheck(t, b, checks)
 	commitCycle(t, b, cycle(checks, transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
 
-	// первая неудача: пауза ~30с
+	// the first failure: a ~30s pause
 	b.deliveryTick(context.Background())
 	row := firstPendingRow(t, store)
 	if row.NextAttemptAt == nil {
@@ -673,12 +676,12 @@ func TestTemporaryErrorBackoff(t *testing.T) {
 	if d < 25*time.Second || d > 35*time.Second {
 		t.Fatalf("first backoff = %v, want ~30s", d)
 	}
-	// до истечения backoff строка не ретраится
+	// the row is not retried before the backoff elapses
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("row must not be retried before the backoff elapses, sends = %d", n)
 	}
-	// «прошло 30 секунд»: вторая неудача — пауза строго больше первой
+	// "30 seconds passed": the second failure — a pause strictly longer than the first
 	if err := store.DeferOutboxAttempt(row.ID, -time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -691,7 +694,7 @@ func TestTemporaryErrorBackoff(t *testing.T) {
 	if d2 < 2*d {
 		t.Fatalf("backoff must grow: first = %v, second = %v", d, d2)
 	}
-	// строка дожила и доехала: backoff не удаляет события
+	// the row survived and delivered: the backoff does not delete events
 	fail.Store(false)
 	m.handler = nil
 	if err := store.DeferOutboxAttempt(row.ID, -time.Hour); err != nil {
@@ -703,15 +706,15 @@ func TestTemporaryErrorBackoff(t *testing.T) {
 	}
 }
 
-// 6.2: недоступные чаты не занимают слоты батча — живой чат получает
-// уведомление немедленно, сколько бы ни стояло за головами мёртвых чатов.
+// Unavailable chats do not take batch slots — a live chat receives its
+// notification immediately, no matter how many dead chats queue ahead.
 func TestUnavailableChatsDoNotStarveLiveOnes(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
-	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil { // «мёртвый» чат
+	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil { // the "dead" chat
 		t.Fatal(err)
 	}
-	if err := store.SetSubscription(200, "glm-5.3", true); err != nil { // живой чат
+	if err := store.SetSubscription(200, "glm-5.3", true); err != nil { // the live chat
 		t.Fatal(err)
 	}
 	m.handler = func(method string, body []byte) (any, int) {
@@ -724,9 +727,9 @@ func TestUnavailableChatsDoNotStarveLiveOnes(t *testing.T) {
 		}
 		return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
 	}
-	// 55 строк мёртвому чату (больше одного батча) + одна живому
-	// каждый цикл фиксирует и состояние модели (ApplyCycle), чтобы
-	// доставщик видел cur=Down
+	// 55 rows to the dead chat (more than one batch) + one to the live one;
+	// each cycle also commits the model state (ApplyCycle), so the delivery
+	// worker sees cur=Down
 	down := downChecks("gpt-6-astra", 503, "http")
 	glmDown := downChecks("glm-5.3", 503, "http")
 	for i := 0; i < 55; i++ {
@@ -755,9 +758,9 @@ func TestUnavailableChatsDoNotStarveLiveOnes(t *testing.T) {
 	}
 }
 
-// 6.3 (инвариант FIFO в новой семантике): сообщения чата не дробятся по
-// строкам — свёртка атомарна; пока голова чата ждёт backoff, новых
-// сообщений чату нет; после созревания — одно сообщение с обеими строками.
+// FIFO invariant under the new semantics: a chat's messages are not split
+// per row — the collapse is atomic; while the head waits out a backoff the
+// chat gets no new messages; after maturity both rows arrive in one message.
 func TestChatCollapseAtomicAndFIFOAfterBackoff(t *testing.T) {
 	m := newMockTG(t)
 	models := []storage.Model{{ID: "a", Family: "A"}, {ID: "b", Family: "B"}}
@@ -784,16 +787,16 @@ func TestChatCollapseAtomicAndFIFOAfterBackoff(t *testing.T) {
 		return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
 	}
 	b.deliveryTick(context.Background())
-	// попытка была одна, сообщения нет — свёртка чата не дробится по строкам
+	// one attempt, no message — the chat's collapse is not split per row
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("one collapsed attempt expected, got %d", n)
 	}
-	// пока голова ждёт backoff — никаких сообщений чату
+	// while the head waits out the backoff — no messages to the chat
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("deferred chat must stay silent, got %d sends", n)
 	}
-	// созревание: обе строки доезжают одним сообщением
+	// maturity: both rows arrive in one message
 	row := firstPendingRow(t, store)
 	if err := store.DeferOutboxAttempt(row.ID, -time.Hour); err != nil {
 		t.Fatal(err)
@@ -814,8 +817,8 @@ func TestChatCollapseAtomicAndFIFOAfterBackoff(t *testing.T) {
 	}
 }
 
-// P1-3/P1-4: глобальный 429 останавливает весь батч, а не только строку —
-// флуд-лимит бота общий, и повтор строки не раньше retry_after.
+// A global 429 stops the whole batch, not only the row — the bot's flood
+// limit is shared, and the retry is not earlier than retry_after.
 func Test429PausesWholeBatch(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -843,7 +846,7 @@ func Test429PausesWholeBatch(t *testing.T) {
 	b.deliveryTick(context.Background())
 	limited.Store(false)
 	m.handler = nil
-	// чат 1: 3 запроса (in-request ретраи), затем пауза батча; чат 2 не тронут
+	// chat 1: 3 requests (in-request retries), then the batch pauses; chat 2 untouched
 	if n := m.callCount("sendRichMessage"); n != maxRetries+1 {
 		t.Fatalf("only the first chat may be attempted, got %d", n)
 	}
@@ -854,12 +857,12 @@ func Test429PausesWholeBatch(t *testing.T) {
 	if rows[0].NextAttemptAt == nil {
 		t.Fatal("429 must defer the failed row (P1-4)")
 	}
-	// тик во время паузы ничего не отправляет
+	// a tick during the pause sends nothing
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n != maxRetries+1 {
 		t.Fatalf("flood pause must hold the batch, got %d sends", n)
 	}
-	// пауза снята: отложенная строка ещё ждёт retry_after, свежая — уходит
+	// the pause lifted: the deferred row still waits out retry_after, the fresh one leaves
 	b.floodUntil.Store(0)
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n != maxRetries+2 {
@@ -870,8 +873,8 @@ func Test429PausesWholeBatch(t *testing.T) {
 	}
 }
 
-// 6.4: мёртвый чат — очистка памяти: lastText, pinWarn, drafts и привязка
-// status_messages, а не только подписки и очередь.
+// A dead chat — in-memory cleanup: lastText, pinWarn, drafts and the
+// status_messages binding, not only subscriptions and the queue.
 func TestDeadChatCleanupMemory(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -907,8 +910,8 @@ func TestDeadChatCleanupMemory(t *testing.T) {
 	}
 }
 
-// 6.2: write-forbidden (бот заглушён в группе) — не «мёртвый» чат:
-// подписки и строка остаются, доставка откладывается backoff'ом.
+// write-forbidden (the bot is muted in the group) is NOT a dead chat:
+// subscriptions and the row stay, delivery is postponed by the backoff.
 func TestWriteForbiddenKeepsSubscriptions(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)

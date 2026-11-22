@@ -6,8 +6,8 @@ import (
 	"opentw/internal/api"
 )
 
-// 400 от роутера с сообщением об отсутствии модели/провайдера — это
-// фактически «model not found», то есть Down, а не проблема мониторинга.
+// A router 400 with a missing model/provider message is effectively
+// "model not found" — Down, not a monitoring problem.
 func TestClassifyModelNotFoundBodies(t *testing.T) {
 	cases := []struct {
 		msg  string
@@ -30,7 +30,7 @@ func TestClassifyModelNotFoundBodies(t *testing.T) {
 	}
 }
 
-// 429 — недоступность конкретной модели (Down), независимо от текста.
+// 429 — the unavailability of one specific model (Down), regardless of text.
 func TestClassify429AlwaysDown(t *testing.T) {
 	for _, msg := range []string{"Upstream rate limit", "unknown provider for model x", ""} {
 		if got := Classify(api.RawResult{ErrorKind: "http", HTTPStatus: 429, ErrorMessage: msg}); got != StatusDown {

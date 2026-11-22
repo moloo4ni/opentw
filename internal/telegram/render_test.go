@@ -15,7 +15,7 @@ import (
 
 func mskTime(t *testing.T, h, m, s int) time.Time {
 	t.Helper()
-	// полночь MSK = 21:00 UTC предыдущего дня; время задаём в MSK
+	// MSK midnight = 21:00 UTC of the previous day; times are set in MSK
 	base := time.Date(2026, 11, 15, 21, 0, 0, 0, time.UTC)
 	return base.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(s)*time.Second)
 }
@@ -23,13 +23,13 @@ func mskTime(t *testing.T, h, m, s int) time.Time {
 func ptr1(v int64) *int64     { return &v }
 func ptrF(v float64) *float64 { return &v }
 
-// stBtn — кнопка-ошибка модели: точный ожидаемый фрагмент строки.
+// stBtn is a model's error button: the exact expected line fragment.
 func stBtn(id, label string) string {
 	return `<tg-button type="callback_data" style="link" data="st:` + id + `">` + label + `</tg-button>`
 }
 
-// Панель успешных моделей: заголовок, семейства, latency в строке,
-// футер с датой, легенда последней строкой, БЕЗ сводки и метрик.
+// The panel of successful models: header, families, latency in the line,
+// the dated footer, the legend as the last line, NO summary or metrics.
 func TestPanelFormatOperational(t *testing.T) {
 	models := []storage.Model{
 		{ID: "gpt-6-astra", Family: "GPT"},
@@ -56,8 +56,8 @@ func TestPanelFormatOperational(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{
-		"Модели:", // сводка удалена
-		"TPS",     // метрики удалены
+		"Модели:", // the summary is gone
+		"TPS",     // the metrics are gone
 		"TTFT",
 		"tokens",
 		"154",
@@ -69,8 +69,9 @@ func TestPanelFormatOperational(t *testing.T) {
 	}
 }
 
-// Матрица строк панели: три статуса, кнопка у ошибок, latency у Operational,
-// Operational без latency — без « - »; семейство — один блок с <br/>.
+// Panel line matrix: three statuses, a button on errors, latency on
+// Operational, Operational without latency has no " - "; a family is one
+// block with <br/>.
 func TestPanelThreeStatusLines(t *testing.T) {
 	models := []storage.Model{
 		{ID: "m-down", Family: "M"},
@@ -93,13 +94,13 @@ func TestPanelThreeStatusLines(t *testing.T) {
 	if !strings.Contains(text, want) {
 		t.Errorf("panel family block wrong, want:\n%s\ngot:\n%s", want, text)
 	}
-	// служебное сообщение об ошибке в панель не показывается — есть кнопка с label
+	// the service error message is not shown in the panel — there is a labelled button
 	if strings.Contains(text, "Invalid model.") || strings.Contains(text, "deadline") {
 		t.Fatalf("error messages must not surface in the panel:\n%s", text)
 	}
 }
 
-// Единая короткая подпись ошибки — вся матрица только в этих вариантах.
+// The single short error label — the whole matrix in exactly these variants.
 func TestShortErrorLabel(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -123,7 +124,7 @@ func TestShortErrorLabel(t *testing.T) {
 	}
 }
 
-// Матрица кнопок: каждый вид ошибки даёт кнопку с корректным label.
+// The button matrix: every error kind yields a correctly labelled button.
 func TestPanelErrorButtonMatrix(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -151,7 +152,7 @@ func TestPanelErrorButtonMatrix(t *testing.T) {
 	}
 }
 
-// Порядок строк панели — только конфигурация при любом сочетании статусов.
+// The panel's line order follows the config only, with any status mix.
 func TestPanelOrderFollowsConfig(t *testing.T) {
 	models := []storage.Model{
 		{ID: "m1", Family: "F1"},
@@ -172,7 +173,7 @@ func TestPanelOrderFollowsConfig(t *testing.T) {
 	}
 }
 
-// Экранирование model ID в <code> и в атрибуте data кнопки.
+// Escaping a model ID in <code> and in the button's data attribute.
 func TestPanelEscapesModelID(t *testing.T) {
 	models := []storage.Model{{ID: `x<y>&z`, Family: "M"}}
 	checks := map[string]storage.Check{
@@ -187,7 +188,8 @@ func TestPanelEscapesModelID(t *testing.T) {
 	}
 }
 
-// До первого цикла панель честна: без «Обновлено», у модели — кнопка «Нет данных».
+// Before the first cycle the panel is honest: no "updated", each model gets
+// a no-data button.
 func TestPanelFirstCycle(t *testing.T) {
 	models := []storage.Model{{ID: "a", Family: "A"}}
 	text := RenderStatusPanel(models, nil, time.Now(), time.Now())
@@ -206,7 +208,8 @@ func TestPanelFirstCycle(t *testing.T) {
 	}
 }
 
-// Полный список из config.example.yaml: все 25 моделей, в лимите rich-сообщения.
+// The full config.example.yaml list: all 25 models within the rich-message
+// limit.
 func TestPanelFullExampleConfigFitsRich(t *testing.T) {
 	raw, err := os.ReadFile("../../config.example.yaml")
 	if err != nil {
@@ -253,7 +256,8 @@ func TestPanelFullExampleConfigFitsRich(t *testing.T) {
 	}
 }
 
-// Длинный id: кнопка — в форме устойчивого хэша в пределах 64 байт; resolveCallback понимает её.
+// A long id: the button takes the stable-hash form within 64 bytes;
+// resolveCallback understands it.
 func TestStButtonDataLongIDHashForm(t *testing.T) {
 	long := strings.Repeat("m", 100)
 	data := stButtonData(long)
@@ -268,11 +272,11 @@ func TestStButtonDataLongIDHashForm(t *testing.T) {
 	}
 }
 
-// --- Карточка модели ---
+// --- Model card ---
 
-// Доступная модель: заголовок, статус, дата последней проверки,
-// «Последний запрос» с Latency, «Ответ модели», статистика 24ч.
-// Никаких TTFT/TPS/токенов/переключений.
+// An available model: header, status, the last check date, the "Last
+// request" block with Latency, the model answer, 24h stats. No
+// TTFT/TPS/tokens/toggles.
 func TestModelDetailOperational(t *testing.T) {
 	last := storage.Check{ModelID: "gpt-6-astra", At: mskTime(t, 16, 15, 3), Status: status.Operational,
 		HTTPStatus: 200, LatencyUS: ptr1(2_700_000), TTFTUS: ptr1(420_000), TPS: ptrF(42.3),
@@ -309,17 +313,17 @@ func TestModelDetailOperational(t *testing.T) {
 			t.Errorf("card must not contain %q:\n%s", bad, text)
 		}
 	}
-	// карточка не ссылается на саму себя
+	// the card does not link to itself
 	if strings.Contains(text, `data="st:gpt-6-astra"`) {
 		t.Errorf("card must not contain a self-link:\n%s", text)
 	}
 }
 
-// Статистика 24 часов: три самостоятельных соседних rich-абзаца <p> —
-// вертикальные интервалы между абзацами задаёт сам Telegram (как между
-// остальными секциями карточки), а не <br/>; общий левый край — без
-// начальных пробелов и пробельных сущностей. Проверяем итоговый rich-HTML
-// целиком, чтобы изменения не затронули остальные блоки карточки.
+// The 24-hour statistics: three standalone adjacent rich <p> paragraphs —
+// Telegram itself sets the vertical spacing between paragraphs (as between
+// the card's other sections), not <br/>; one left edge — no leading spaces
+// or whitespace entities. The final rich HTML is compared in full, so the
+// other card blocks cannot be affected unnoticed.
 func TestModelCard24HourStatsVerticalSpacingWithoutIndent(t *testing.T) {
 	last := storage.Check{
 		ModelID:    "glm-5.3-prime",
@@ -351,9 +355,9 @@ func TestModelCard24HourStatsVerticalSpacingWithoutIndent(t *testing.T) {
 	if got != want {
 		t.Fatalf("model card HTML mismatch\nwant:\n%s\ngot:\n%s", want, got)
 	}
-	// статистика — самостоятельные абзацы без искусственных отступов:
-	// ни переносов <br/>, ни пробелов и пробельных сущностей после <p>,
-	// ни вложенных абзацев
+	// the stats are standalone paragraphs without artificial indents: no
+	// <br/> breaks, no spaces or whitespace entities after <p>, no nested
+	// paragraphs
 	for _, bad := range []string{"<br/>", "&#x20;", "&nbsp;", "<p> ", "<p>\t", "<p><p>"} {
 		if strings.Contains(got, bad) {
 			t.Errorf("model card must not contain %q:\n%s", bad, got)
@@ -361,7 +365,8 @@ func TestModelCard24HourStatsVerticalSpacingWithoutIndent(t *testing.T) {
 	}
 }
 
-// Упавшая модель: HTTP-код с «Latency» (HTTP-ответ получен), секция «Ответ API» дословно.
+// A down model: the HTTP code with "Latency" (an HTTP response arrived),
+// the API-answer section verbatim.
 func TestModelDetailDownWithResponse(t *testing.T) {
 	last := storage.Check{ModelID: "m", At: mskTime(t, 16, 15, 3), Status: status.Down,
 		HTTPStatus: 429, ErrorType: "http", LatencyUS: ptr1(1_220_000),
@@ -381,9 +386,10 @@ func TestModelDetailDownWithResponse(t *testing.T) {
 	}
 }
 
-// Заголовок секции ответа: «Ответ модели» для текста модели («» и «response»),
-// «Ответ API» для остальных. HTTP 200 без итогового текста всё равно
-// показывает факт его отсутствия; у HTTP/транспортной ошибки такой секции нет.
+// The answer section title: the model's own text ("" and "response") gets
+// the model-answer label, the rest gets the API-answer label. HTTP 200
+// without a final text still shows the fact of its absence; an HTTP/transport
+// error has no such section.
 func TestModelDetailAnswerSectionTitle(t *testing.T) {
 	for _, tc := range []struct {
 		errType string
@@ -417,10 +423,10 @@ func TestModelDetailAnswerSectionTitle(t *testing.T) {
 	}
 }
 
-// Диагностика пустого итогового ответа: только фактически доступные данные.
-// Ноль и отсутствующий finish_reason не выдумываются, непустой ответ не
-// подменяется диагностикой, HTTP и транспортные ошибки не превращаются в
-// «ответ модели».
+// Diagnostics of an empty final answer: only actually available data.
+// Zero and a missing finish_reason are not invented, a non-empty answer is
+// not replaced by diagnostics, HTTP and transport errors do not become the
+// "model answer".
 func TestModelCardEmptyResponseDiagnostics(t *testing.T) {
 	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
 		HTTPStatus: 200, ErrorType: "response", LatencyUS: ptr1(4_100_000),
@@ -488,9 +494,9 @@ func TestModelCardEmptyResponseDiagnostics(t *testing.T) {
 	}
 }
 
-// Поля без значения не выводятся вообще: ни N/A, ни пустых блоков.
+// Fields without a value are not printed at all: no N/A, no empty blocks.
 func TestModelDetailOmitsAbsentFields(t *testing.T) {
-	// timeout без HTTP-кода и latency: блока «Последний запрос» нет
+	// a timeout without an HTTP code and latency: no "Last request" block
 	last := storage.Check{ModelID: "m", Status: status.Down, ErrorType: "timeout", ErrorMessage: "deadline"}
 	text, _ := renderModelCard("m", status.Down, last, nil)
 	for _, bad := range []string{"Последний запрос", "N/A", "0001", "Последняя проверка:"} {
@@ -498,11 +504,11 @@ func TestModelDetailOmitsAbsentFields(t *testing.T) {
 			t.Errorf("must not contain %q:\n%s", bad, text)
 		}
 	}
-	// нет истории — блока статистики нет
+	// no history — no stats block
 	if strings.Contains(text, "За последние 24 часа") || strings.Contains(text, "Проверок:") {
 		t.Fatalf("no history must omit the 24h block:\n%s", text)
 	}
-	// Operational без latency: только дата проверки и статус
+	// Operational without latency: only the check date and status
 	ok := storage.Check{ModelID: "m", At: time.Now(), Status: status.Operational}
 	text, _ = renderModelCard("m", status.Operational, ok, nil)
 	if strings.Contains(text, "Последний запрос") {
@@ -510,7 +516,7 @@ func TestModelDetailOmitsAbsentFields(t *testing.T) {
 	}
 }
 
-// Uptime не считает ⚪: знаменатель — только ok+down.
+// Uptime excludes Unknown: the denominator is ok+down only.
 func TestModelDetailUptimeExcludesUnknown(t *testing.T) {
 	base := time.Now().Add(-2 * time.Hour)
 	var checks []storage.Check
@@ -533,7 +539,7 @@ func TestModelDetailUptimeExcludesUnknown(t *testing.T) {
 	}
 }
 
-// Все проверки за 24 часа — ⚪: строки Uptime нет, счётчики остаются.
+// All checks within 24h are Unknown: no Uptime line, the counters stay.
 func TestModelDetailUptimeAllUnknown(t *testing.T) {
 	checks := []storage.Check{
 		{ModelID: "m", At: time.Now(), Status: status.Unknown, ErrorType: "invalid"},
@@ -550,7 +556,7 @@ func TestModelDetailUptimeAllUnknown(t *testing.T) {
 	}
 }
 
-// Ответ хранится дословно и экранируется перед отправкой.
+// The response is stored verbatim and escaped before sending.
 func TestModelDetailEscapesResponse(t *testing.T) {
 	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
 		ErrorType: "response", Response: "<script>alert('x')</script>"}
@@ -563,7 +569,8 @@ func TestModelDetailEscapesResponse(t *testing.T) {
 	}
 }
 
-// Длинный «Ответ» не обрезается молча: карточка в лимите, хвост — follow-up.
+// A long answer is not silently truncated: the card fits the limit, the
+// tail goes as follow-ups.
 func TestModelCardLongResponseSplit(t *testing.T) {
 	resp := strings.Repeat("a", 40000)
 	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
@@ -584,9 +591,9 @@ func TestModelCardLongResponseSplit(t *testing.T) {
 	}
 }
 
-// Регрессия: спец-символы растут в 5–6 раз после
-// экранирования — бюджет должен считаться по экранированному тексту,
-// иначе карточка превышает лимит и не отправляется вовсе.
+// Regression: special characters grow 5–6× after escaping — the budget must
+// be counted over the escaped text, or the card exceeds the limit and is
+// not sent at all.
 func TestModelCardEscapableResponseSplitFitsLimit(t *testing.T) {
 	resp := strings.Repeat("&", 40000) // & → &amp; (×5)
 	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
@@ -607,9 +614,9 @@ func TestModelCardEscapableResponseSplitFitsLimit(t *testing.T) {
 	}
 }
 
-// Единый словарь статусов: слова трёх статусов живут только в statusWordRu;
-// легенда панели, /help, заголовок карточки, строки моделей и подпись ошибок
-// строятся из него — любое расхождение ловится здесь.
+// The single status dictionary: the three statuses' words live only in
+// statusWordRu; the panel legend, /help, the card header, model lines and
+// error labels are built from it — any divergence is caught here.
 func TestStatusWordsSingleSource(t *testing.T) {
 	for st, want := range map[status.Status]string{
 		status.Operational: "Работает",
@@ -623,12 +630,12 @@ func TestStatusWordsSingleSource(t *testing.T) {
 	if got := panelLegend(); got != "🟢 Работает · 🔴 Недоступна · ⚪ Нет данных" {
 		t.Errorf("panel legend = %q", got)
 	}
-	// /help показывает ту же легенду — без завершающей точки, как панель
+	// /help shows the same legend — no trailing period, like the panel
 	help := RenderHelp(15 * time.Minute)
 	if !strings.Contains(help, "Статусы: "+panelLegend()+"\n") {
 		t.Errorf("help legend must equal the panel legend with no trailing period:\n%s", help)
 	}
-	// подпись «Нет данных» у ошибок и строки Unknown — тоже из словаря
+	// the no-data error label and Unknown lines also come from the dictionary
 	if got := shortErrorLabel(storage.Check{}); got != statusWordRu(status.Unknown) {
 		t.Errorf("shortErrorLabel default = %q, want %q", got, statusWordRu(status.Unknown))
 	}
@@ -642,7 +649,7 @@ func TestStatusWordsSingleSource(t *testing.T) {
 	}
 }
 
-// Заголовок карточки: model ID в <code>, как в строках панели, не в жирном.
+// The card header: the model ID in <code>, like the panel lines, not bold.
 func TestModelCardHeaderCodeID(t *testing.T) {
 	last := storage.Check{ModelID: "deepseek-v4.1-flash", At: time.Now(), Status: status.Operational}
 	card, _ := renderModelCard("deepseek-v4.1-flash", status.Operational, last, nil)
@@ -652,31 +659,32 @@ func TestModelCardHeaderCodeID(t *testing.T) {
 	if strings.Contains(card, "<p>🟢 <b>") {
 		t.Fatalf("header must not use bold for model ID:\n%s", card)
 	}
-	// экранирование сохраняется и в заголовке
+	// escaping is preserved in the header too
 	card, _ = renderModelCard("x<y>", status.Down, storage.Check{}, nil)
 	if !strings.Contains(card, "<p>🔴 <code>x&lt;y&gt;</code> - Недоступна</p>") {
 		t.Fatalf("header must escape model ID:\n%s", card)
 	}
 }
 
-// Единая точность времени в карточке: один знак после запятой и у Latency,
-// и у «Времени до ошибки»; различие только в названии метрики.
+// The single time precision in the card: one decimal digit for both Latency
+// and the time-to-error label; only the metric's name differs.
 func TestModelCardLatencySingleDecimal(t *testing.T) {
-	// HTTP-ответ получен, содержимое не прошло проверку — всё равно Latency
+	// an HTTP response arrived, the content failed the check — still Latency
 	last := storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
 		HTTPStatus: 200, ErrorType: "response", LatencyUS: ptr1(1_220_000)}
 	text, _ := renderModelCard("m", status.Down, last, nil)
 	if !strings.Contains(text, "<p>HTTP 200 · Latency 1.2s</p>") {
 		t.Errorf("HTTP 200 with unexpected content must show Latency 1.2s:\n%s", text)
 	}
-	// HTTP-ответа не было (timeout) — «Время до ошибки» из измеренной длительности
+	// no HTTP response (timeout) — the time-to-error label from the measured
+	// duration
 	last = storage.Check{ModelID: "m", At: time.Now(), Status: status.Down,
 		ErrorType: "timeout", LatencyUS: ptr1(3_000_000)}
 	text, _ = renderModelCard("m", status.Down, last, nil)
 	if !strings.Contains(text, "<p>Время до ошибки 3.0s</p>") {
 		t.Errorf("timeout without HTTP response must show Время до ошибки 3.0s:\n%s", text)
 	}
-	// двух знаков после запятой нет нигде
+	// two decimal digits appear nowhere
 	for _, bad := range []string{"1.22s", "3.00s", ".00s"} {
 		if strings.Contains(text, bad) {
 			t.Errorf("single decimal expected, found %q:\n%s", bad, text)
@@ -684,8 +692,8 @@ func TestModelCardLatencySingleDecimal(t *testing.T) {
 	}
 }
 
-// Примеры уведомлений в README соответствуют фактическому формату строк:
-// разделитель после model ID — ASCII « - », не «·».
+// README notification examples match the actual line format: the separator
+// after a model ID is ASCII " - ", not "·".
 func TestReadmeNotificationExamples(t *testing.T) {
 	raw, err := os.ReadFile("../../README.md")
 	if err != nil {
@@ -703,8 +711,8 @@ func TestReadmeNotificationExamples(t *testing.T) {
 	}
 }
 
-// Root-меню подписок: фраза без искусственного переноса внутри предложения —
-// перенос строк отдаёт клиенту Telegram.
+// The subscribe root: a sentence without artificial line breaks — line
+// wrapping is up to the Telegram client.
 func TestSubscribeRootNoManualBreak(t *testing.T) {
 	text, _ := RenderSubscribeRoot(nil, nil, nil)
 	if !strings.Contains(text, "Уведомления приходят только по выбранным моделям при смене их состояния. Панель /status не зависит от подписок.") {
@@ -715,7 +723,7 @@ func TestSubscribeRootNoManualBreak(t *testing.T) {
 	}
 }
 
-// --- Меню подписок (не изменилось) и /help ---
+// --- Subscribe menu (unchanged) and /help ---
 
 func TestSubscribePanel(t *testing.T) {
 	models := []storage.Model{
@@ -734,7 +742,7 @@ func TestSubscribePanel(t *testing.T) {
 	if !strings.Contains(text, "Выбрано: 2 из 4 (изменения: +2 -1)") {
 		t.Fatalf("selection counter with diff wrong:\n%s", text)
 	}
-	if len(kb.InlineKeyboard) != 3 { // пары семейств + масс + Сохранить/Отменить
+	if len(kb.InlineKeyboard) != 3 { // family pairs + bulk + Save/Cancel
 		t.Fatalf("root rows = %d: %+v", len(kb.InlineKeyboard), kb.InlineKeyboard)
 	}
 	if famRow := kb.InlineKeyboard[0]; len(famRow) != 2 || famRow[0].Text != "GPT 1/2" || famRow[0].CallbackData != "f:GPT" ||
@@ -795,7 +803,7 @@ func TestHelp(t *testing.T) {
 	}
 }
 
-// /help: новая легенда трёх статусов и настраиваемый интервал.
+// /help: the new three-status legend and a configurable interval.
 func TestHelpContent(t *testing.T) {
 	text := RenderHelp(15 * time.Minute)
 	for _, want := range []string{
@@ -808,7 +816,7 @@ func TestHelpContent(t *testing.T) {
 			t.Errorf("help missing %q:\n%s", want, text)
 		}
 	}
-	text = RenderHelp(0) // интервал неизвестен — нейтральная формулировка
+	text = RenderHelp(0) // the interval is unknown — the neutral wording
 	if !strings.Contains(text, "каждый цикл проверки") {
 		t.Fatalf("neutral wording expected:\n%s", text)
 	}

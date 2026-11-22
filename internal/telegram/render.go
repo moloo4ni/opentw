@@ -13,21 +13,21 @@ import (
 	"opentw/internal/storage"
 )
 
-// MSK — часовой пояс всех времён в интерфейсе OpenTW.
+// MSK is the timezone of all times shown in the OpenTW UI.
 var MSK = time.FixedZone("MSK", 3*60*60)
 
 const (
-	maxRichMessage  = 32768 // лимит rich-сообщения в рунах
-	maxCallbackData = 64    // лимит Telegram на callback_data в байтах
+	maxRichMessage  = 32768 // rich-message limit, in runes
+	maxCallbackData = 64    // Telegram's callback_data limit, in bytes
 )
 
 func fmtClockMSK(t time.Time) string { return t.In(MSK).Format("15:04:05") }
 
-// fmtDateClockMSK — дата+время: панель трёхдневной свежести должна отличаться
-// от свежей.
+// fmtDateClockMSK prints date+time: a three-day-old panel must differ from
+// a fresh one.
 func fmtDateClockMSK(t time.Time) string { return t.In(MSK).Format("02.01.2006 15:04:05") }
 
-// intervalHuman — интервал проверки словами для справки.
+// intervalHuman renders the check interval in words for the help text.
 func intervalHuman(d time.Duration) string {
 	h, m := int(d.Hours()), int(d.Minutes())%60
 	switch {
@@ -40,10 +40,10 @@ func intervalHuman(d time.Duration) string {
 	}
 }
 
-// fmtSecs1 — единая точность времени в карточке: один знак после запятой.
+// fmtSecs1 is the single time precision of the card: one decimal digit.
 func fmtSecs1(us int64) string { return fmt.Sprintf("%.1fs", float64(us)/1e6) }
 
-// EscapeHTML экранирует любые внешние строки перед отправкой в Telegram.
+// EscapeHTML escapes any external string before it goes to Telegram.
 func EscapeHTML(s string) string { return html.EscapeString(s) }
 
 func trunc(s string, n int) string {
@@ -54,9 +54,9 @@ func trunc(s string, n int) string {
 	return string(r[:n]) + "..."
 }
 
-// statusWordRu — единый словарь пользовательских названий трёх статусов:
-// легенда панели и /help, заголовок карточки, строки моделей и подпись
-// «Нет данных» у ошибок берут слово только отсюда.
+// statusWordRu is the single dictionary of the three statuses' user-facing
+// names: the panel legend and /help, the card header, model lines and the
+// no-data error label all take the word from here only.
 func statusWordRu(st status.Status) string {
 	switch st {
 	case status.Operational:
@@ -68,15 +68,15 @@ func statusWordRu(st status.Status) string {
 	}
 }
 
-// panelLegend — расшифровка кружков, последняя строка панели и справки.
+// panelLegend is the circles legend, the last line of the panel and help.
 func panelLegend() string {
 	return status.Operational.Emoji() + " " + statusWordRu(status.Operational) +
 		" · " + status.Down.Emoji() + " " + statusWordRu(status.Down) +
 		" · " + status.Unknown.Emoji() + " " + statusWordRu(status.Unknown)
 }
 
-// shortErrorLabel — единая короткая подпись ошибки по проверке:
-// панель, уведомления и карточки строятся на ней. Operational не вызывается.
+// shortErrorLabel is the single short error label of a check: the panel,
+// notifications and cards are all built on it. Never called for Operational.
 func shortErrorLabel(c storage.Check) string {
 	switch c.ErrorType {
 	case "http":
@@ -87,35 +87,35 @@ func shortErrorLabel(c storage.Check) string {
 		return "Connection refused"
 	case "response", "empty":
 		return "Unexpected response"
-	default: // unknown, нет данных, прочие мониторные варианты
+	default: // unknown, no data and other monitor-side cases
 		return statusWordRu(status.Unknown)
 	}
 }
 
-// stButtonData кодирует модель кнопки-ошибки: точный id; длинные id —
-// хэш-форма, как у всех callback-кнопок.
+// stButtonData encodes the error-button model: exact id; long ids take the
+// hash form, like all callback buttons.
 func stButtonData(id string) string { return cbData("st", id) }
 
-// richErrorButton — кликабельная ошибка модели: текст и атрибут data
-// экранируются; визуально — ссылка без рамки.
+// richErrorButton is a clickable model error: text and data attribute are
+// escaped; visually a borderless link.
 func richErrorButton(id, label string) string {
 	return fmt.Sprintf(`<tg-button type="callback_data" style="link" data="%s">%s</tg-button>`,
 		EscapeHTML(stButtonData(id)), EscapeHTML(label))
 }
 
-// codeID оборачивает model ID в моноширинный формат Telegram.
+// codeID wraps a model ID in Telegram's monospace format.
 func codeID(id string) string { return "<code>" + EscapeHTML(id) + "</code>" }
 
-// downModelLine — строка недоступной модели: единый HTML для главной панели
-// и уведомлений, различаются только caller-данные (model ID и label ошибки).
+// downModelLine is an unavailable model's line: shared HTML for the main
+// panel and notifications; only the caller data differs (model ID, error label).
 func downModelLine(modelID, label string) string {
 	return "🔴 " + codeID(modelID) + " - " + richErrorButton(modelID, label)
 }
 
-// modelLine — rich-строка одной модели: Operational — только latency;
-// Down/Unknown/старые статусы — кнопка с подписью; порядок конфига задаёт
-// вызывающий код. Возвращает строку без обёртки: панели склеивают строки
-// семейства в один блок с <br/>, уведомления оборачивают в <p> сами.
+// modelLine is one model's rich line: Operational shows only latency;
+// Down/Unknown/stale statuses get a labelled button; the caller sets the
+// config order. Returns the bare line: panels join a family's lines into
+// one block with <br/>, notifications wrap in <p> themselves.
 func modelLine(m storage.Model, c storage.Check) string {
 	id := codeID(m.ID)
 	switch c.Status {
@@ -126,13 +126,13 @@ func modelLine(m storage.Model, c storage.Check) string {
 		return "🟢 " + id
 	case status.Down:
 		return downModelLine(m.ID, shortErrorLabel(c))
-	default: // Unknown и старые статусы из payload — без паники
+	default: // Unknown and stale statuses from the payload — no panic
 		return "⚪ " + id + " - " + richErrorButton(m.ID, statusWordRu(status.Unknown))
 	}
 }
 
-// RenderStatusPanel renders the pinned /status panel: без сводки,
-// порядок строк — только конфиг,Operational показывает latency.
+// RenderStatusPanel renders the pinned /status panel: no summary, line order
+// follows the config only, Operational shows latency.
 func RenderStatusPanel(models []storage.Model, checks map[string]storage.Check, updatedAt, nextAt time.Time) string {
 	var b strings.Builder
 	b.WriteString("<p><b>OpenTW</b></p>")
@@ -145,13 +145,13 @@ func RenderStatusPanel(models []storage.Model, checks map[string]storage.Check, 
 		}
 	}
 	if !checked {
-		// до первого цикла честно предупреждаем вместо фальшивого «Обновлено: сейчас»
+		// before the first cycle an honest notice beats a fake "updated now"
 		b.WriteString("<p>Первый цикл проверки выполняется - панель обновится автоматически</p>")
 	}
 
-	// Семейство — один смысловой блок: заголовок и строки моделей через <br/>;
-	// обычные \n в rich-HTML игнорируются, визуальные интервалы дают
-	// только границы блоков <p>.
+	// A family is one semantic block: a header plus model lines joined with
+	// <br/>; plain \n is ignored in rich HTML, only <p> boundaries create
+	// visual spacing.
 	family := ""
 	var block []string
 	flush := func() {
@@ -178,24 +178,25 @@ func RenderStatusPanel(models []storage.Model, checks map[string]storage.Check, 
 	return b.String()
 }
 
-// renderModelCard — карточка и не поместившийся в лимит хвост секции «Ответ»
-// (сырой, неэкранированный текст): молчаливая обрезка данных запрещена.
-// Бюджет считается в ЭКРАНИРОВАННЫХ рунах: EscapeHTML растит спец-руны
-// в 4–6 раз, лимит rich-сообщения нарушается именно после экранирования.
+// renderModelCard returns the card and the tail of the "Response" section
+// that exceeds the limit (raw, unescaped text): silent data truncation is
+// forbidden. The budget is counted in ESCAPED runes: EscapeHTML grows
+// special runes 4–6×, and the rich-message limit applies after escaping.
 func renderModelCard(modelID string, st status.Status, last storage.Check, last24 []storage.Check) (string, string) {
 	card := buildModelCard(modelID, st, last, last24, EscapeHTML(last.Response))
 	if last.Response == "" || utf8.RuneCountInString(card) <= maxRichMessage {
 		return card, ""
 	}
-	// фиксированная часть задаёт бюджет ответа; обёртка секции = карточка
-	// с одной руной ответа минус карточка без ответа минус эта руна
+	// the fixed part sets the response budget; the section's wrapper overhead
+	// is the card with a one-rune response minus the card without one, minus
+	// that rune
 	fixed := utf8.RuneCountInString(buildModelCard(modelID, st, last, last24, ""))
 	one := utf8.RuneCountInString(buildModelCard(modelID, st, last, last24, "x"))
 	overhead := one - fixed - 1
 	budget := maxRichMessage - fixed - overhead
 	resp := []rune(last.Response)
-	// наибольший префикс, экранирование которого укладывается в бюджет
-	// (бинарный поиск: экранированная длина монотонна по префиксу)
+	// the longest prefix whose escaping fits the budget
+	// (binary search: escaped length is monotone in the prefix)
 	lo, hi := 0, len(resp)
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
@@ -208,9 +209,9 @@ func renderModelCard(modelID string, st status.Status, last storage.Check, last2
 	return buildModelCard(modelID, st, last, last24, EscapeHTML(string(resp[:lo]))), string(resp[lo:])
 }
 
-// escapedRunes — длина s в рунах ПОСЛЕ EscapeHTML: каждая спец-руна
-// становится entity из 4–6 символов, и именно экранированный текст
-// ограничен лимитом rich-сообщения.
+// escapedRunes is the length of s in runes AFTER EscapeHTML: every special
+// rune becomes a 4–6 character entity, and it is the escaped text that is
+// bounded by the rich-message limit.
 func escapedRunes(s string) int {
 	n := 0
 	for _, r := range s {
@@ -234,30 +235,32 @@ func escapedRuneLen(r rune) int {
 	}
 }
 
-// buildModelCard — карточка модели; respHTML — экранированный дословный ответ
-// ("" — секция опускается). Поля без значения не выводятся.
+// buildModelCard is the model card; respHTML is the escaped verbatim
+// response ("" — the section is omitted). Empty fields are not printed.
 func buildModelCard(modelID string, st status.Status, last storage.Check, last24 []storage.Check, respHTML string) string {
 	var b strings.Builder
-	// Заголовок: эмодзи, model ID (<code>, как в строках панели) и статус
-	// в одной строке
+	// Header: emoji, model ID (<code>, like the panel lines) and status,
+	// all on one line
 	b.WriteString("<p>" + st.Emoji() + " " + codeID(modelID) + " - " + statusWordRu(st) + "</p>")
 	if !last.At.IsZero() {
-		// 24-часовое окно пересекает полночь: отметки с датой
+		// the 24h window crosses midnight: timestamps carry the date
 		b.WriteString("<p>Последняя проверка: " + fmtDateClockMSK(last.At) + " MSK</p>")
 	}
 	b.WriteString(requestBlock(last))
 	if respHTML != "" {
 		title := "Ответ API"
-		// Текст — генерация самой модели: успешный ответ («», т.е. OK) или
-		// неожиданный ответ вместо OK («response»); остальное — текст API.
+		// The text is the model's own generation: a successful answer ("", i.e.
+		// OK) or an unexpected answer instead of OK ("response"); the rest is
+		// API text.
 		if last.ErrorType == "" || last.ErrorType == "response" {
 			title = "Ответ модели"
 		}
 		b.WriteString("<p><b>" + title + "</b></p><p>" + respHTML + "</p>")
 	} else if last.Response == "" && last.HTTPStatus == 200 &&
 		(last.ErrorType == "" || last.ErrorType == "response" || last.ErrorType == "empty") {
-		// HTTP 200 был, но итогового пользовательского текста нет. Это факт,
-		// а не интерпретация причины; reasoning из отдельного поля не показываем.
+		// HTTP 200 arrived but there is no final user text. A fact, not an
+		// interpretation of the cause; reasoning from a separate field is not
+		// shown.
 		b.WriteString("<p><b>Ответ модели</b></p><p>Итоговый текст отсутствует.</p>")
 	}
 	if stats := last24Block(last24); stats != "" {
@@ -267,11 +270,12 @@ func buildModelCard(modelID string, st status.Status, last storage.Check, last24
 	return b.String()
 }
 
-// requestBlock — блок «Последний запрос»: HTTP-код и latency. HTTP-ответ
-// получен — «Latency», даже если содержимое не прошло проверку (включая
-// 4xx/5xx: сервер ответил). «Время до ошибки» — только когда HTTP-ответа
-// не было вовсе (timeout, connection failure) и длительность измерена.
-// Время везде — одним знаком после запятой. Пустые поля опускаются.
+// requestBlock is the "Last request" block: HTTP code and latency. An HTTP
+// response arrived — "Latency", even when the content failed the check
+// (including 4xx/5xx: the server answered). The time-to-error label appears
+// only when there was no HTTP response at all (timeout, connection failure)
+// and the duration was measured. Times use one decimal digit. Empty fields
+// are omitted.
 func requestBlock(c storage.Check) string {
 	var parts []string
 	if c.HTTPStatus > 0 {
@@ -285,8 +289,8 @@ func requestBlock(c storage.Check) string {
 			parts = append(parts, "Время до ошибки "+lat)
 		}
 	}
-	// Диагностика выводится только когда итогового текста нет. nil не
-	// превращается в ноль, отсутствующий finish_reason не выдумывается.
+	// Diagnostics are shown only when there is no final text. nil never turns
+	// into zero; a missing finish_reason is not invented.
 	if c.Response == "" {
 		if c.OutputTokens != nil {
 			parts = append(parts, fmt.Sprintf("Токенов ответа: %d", *c.OutputTokens))
@@ -301,8 +305,8 @@ func requestBlock(c storage.Check) string {
 	return "<p><b>Последний запрос</b></p><p>" + strings.Join(parts, " · ") + "</p>"
 }
 
-// finishReason извлекает только значение служебного диагностического
-// finish_reason=...; обычный текст провайдера не интерпретируется.
+// finishReason extracts only the service diagnostic finish_reason=...
+// value; plain provider text is not interpreted.
 func finishReason(message string) string {
 	for _, part := range strings.Split(message, "; ") {
 		if reason, ok := strings.CutPrefix(part, "finish_reason="); ok && reason != "" {
@@ -312,11 +316,11 @@ func finishReason(message string) string {
 	return ""
 }
 
-// last24Block — статистика 24 часов: Uptime = ok/(ok+down), Unknown не
-// входит в знаменатель; блок целиком опускается без истории. Каждая строка —
-// самостоятельный абзац <p>: вертикальные интервалы между абзацами задаёт
-// Telegram, как и между остальными секциями карточки, поэтому вызывающий
-// код вставляет результат без дополнительной обёртки.
+// last24Block is the 24-hour statistics: Uptime = ok/(ok+down), Unknown
+// excluded from the denominator; the whole block is omitted without
+// history. Every line is its own <p> paragraph: Telegram sets the vertical
+// spacing between paragraphs as between the card's other sections, so the
+// caller inserts the result without an extra wrapper.
 func last24Block(checks []storage.Check) string {
 	if len(checks) == 0 {
 		return ""
@@ -328,20 +332,21 @@ func last24Block(checks []storage.Check) string {
 			okCount++
 		case status.Down:
 			downCount++
-		default: // Unknown и старые статусы
+		default: // Unknown and stale statuses
 			unknownCount++
 		}
 	}
 	var lines []string
 	if n := okCount + downCount; n > 0 {
-		// 23/24 → 95.83%: две значащие цифры, как в согласованном формате
+		// 23/24 → 95.83%: two significant digits, the agreed format
 		lines = append(lines, fmt.Sprintf("Uptime: %.2f%%", float64(okCount)/float64(n)*100))
 	}
 	lines = append(lines, fmt.Sprintf("Проверок: %d", len(checks)))
-	// статусные эмодзи — только в строке категорий; слово Unknown — из словаря
+	// status emojis only in the category line; the Unknown word comes from
+	// the dictionary
 	lines = append(lines, fmt.Sprintf("🟢 Успешных: %d · 🔴 Неудачных: %d · ⚪ %s: %d", okCount, downCount, statusWordRu(status.Unknown), unknownCount))
-	// каждая строка — отдельный rich-абзац: без <br/> и начальных пробелов,
-	// все строки начинаются от одного левого края
+	// every line is a separate rich paragraph: no <br/>, no leading spaces,
+	// all lines share one left edge
 	return "<p>" + strings.Join(lines, "</p><p>") + "</p>"
 }
 
@@ -357,10 +362,10 @@ func pluralModels(n int) string {
 	}
 }
 
-// cbData кодирует идентификатор модели/семейства в callback-кнопку:
-// идентификатор идёт как есть — он стабилен при переупорядочении конфига
-// и рестартах (позиционный индекс такой гарантии не даёт); длинные ID
-// сворачиваются в устойчивый хэш (cbData с префиксом не влезает в лимит).
+// cbData encodes a model/family id into a callback button: the id goes
+// as-is — it is stable across config reordering and restarts (a positional
+// index is not); long ids collapse to a stable hash (prefixed cbData does
+// not fit the limit).
 func cbData(prefix, id string) string {
 	if len(prefix)+len(id)+1 <= maxCallbackData {
 		return prefix + ":" + id
@@ -368,16 +373,16 @@ func cbData(prefix, id string) string {
 	return prefix + ":h:" + shortHash(id)
 }
 
-// shortHash — 10 hex-символов sha256: достаточно без коллизий для десятков ID.
+// shortHash is 10 hex chars of sha256: collision-free enough for dozens of ids.
 func shortHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:5])
 }
 
-// resolveCallback сопоставляет payload нажатой кнопки с идентификатором
-// из текущей конфигурации; ok=false — кнопка ссылается на удалённую
-// модель/семейство (устаревшая клавиатура). Точное совпадение, потом
-// хэш-форма; кандидатов по префиксу нет.
+// resolveCallback matches the pressed button's payload against the current
+// configuration; ok=false means the button references a removed
+// model/family (a stale keyboard). Exact match first, then the hash form;
+// no prefix candidates.
 func resolveCallback(payload string, candidates []string) (string, bool) {
 	for _, id := range candidates {
 		if id == payload {
@@ -394,7 +399,7 @@ func resolveCallback(payload string, candidates []string) (string, bool) {
 	return "", false
 }
 
-// modelIDs — список ID моделей (кандидаты для кнопок "s:"/"st:").
+// modelIDs lists the model IDs (candidates for "s:"/"st:" buttons).
 func modelIDs(models []storage.Model) []string {
 	ids := make([]string, len(models))
 	for i, m := range models {
@@ -403,7 +408,7 @@ func modelIDs(models []storage.Model) []string {
 	return ids
 }
 
-// diffBracket — «(+A -R)» относительно сохранённого; пустая строка без изменений.
+// diffBracket is "(+A -R)" against the saved set; empty string when equal.
 func diffBracket(scope []storage.Model, draft, saved map[string]bool) string {
 	added, removed := 0, 0
 	for _, m := range scope {
@@ -426,8 +431,8 @@ func diffBracket(scope []storage.Model, draft, saved map[string]bool) string {
 	return " (изменения: " + strings.Join(parts, " ") + ")"
 }
 
-// RenderSubscribeRoot — первый экран /subscribe: кнопки семейств с числом
-// выбранных, масс-операции, Сохранить и Отменить. Callback data: "f:<family>".
+// RenderSubscribeRoot is the first /subscribe screen: family buttons with
+// selected counts, bulk operations, Save and Cancel. Callback data: "f:<family>".
 func RenderSubscribeRoot(models []storage.Model, draft, saved map[string]bool) (string, *InlineKeyboardMarkup) {
 	var b strings.Builder
 	b.WriteString("OpenTW - Настройка уведомлений\n\n")
@@ -477,9 +482,8 @@ func RenderSubscribeRoot(models []storage.Model, draft, saved map[string]bool) (
 	return b.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
-// RenderSubscribeFamily — экран одного семейства: модели столбцом с
-// идентификаторами в кнопках ("s:<model-id>"), масс-операции семейства,
-// Назад/Отменить/Сохранить.
+// RenderSubscribeFamily is the family screen: models in a column with ids
+// in the buttons ("s:<model-id>"), family bulk operations, Back/Cancel/Save.
 func RenderSubscribeFamily(family string, allModels []storage.Model, draft, saved map[string]bool) (string, *InlineKeyboardMarkup) {
 	var b strings.Builder
 	b.WriteString("<b>" + EscapeHTML(family) + "</b>\n\n")
@@ -513,7 +517,7 @@ func RenderSubscribeFamily(family string, allModels []storage.Model, draft, save
 	return b.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
-// FamiliesOf — семейства в порядке конфигурации без повторов.
+// FamiliesOf lists families in config order without repeats.
 func FamiliesOf(models []storage.Model) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -526,8 +530,8 @@ func FamiliesOf(models []storage.Model) []string {
 	return out
 }
 
-// RenderHelp renders /help; интервал проверки — из фактической конфигурации
-// (0 — нейтральная формулировка «каждый цикл проверки»).
+// RenderHelp renders /help; the check interval comes from the actual
+// configuration (0 — the neutral per-cycle wording).
 func RenderHelp(interval time.Duration) string {
 	perCycle := "каждый цикл проверки"
 	if interval > 0 {
@@ -549,7 +553,7 @@ func RenderHelp(interval time.Duration) string {
 	}, "\n")
 }
 
-// RenderSubscribedSaved подтверждает сохранение подписок.
+// RenderSubscribedSaved confirms the saved subscriptions.
 func RenderSubscribedSaved(count int) string {
 	if count == 0 {
 		return "Уведомления отключены: подписок нет.\nСтатус всех моделей по-прежнему виден в /status."

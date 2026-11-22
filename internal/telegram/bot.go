@@ -18,12 +18,12 @@ import (
 type BotCfg struct {
 	API      *Client
 	Store    *storage.Store
-	Models   []storage.Model // упорядоченные модели (family, id)
+	Models   []storage.Model // ordered models (family, id)
 	Logger   *slog.Logger
-	Interval time.Duration // интервал мониторинга для «Следующая проверка»
+	Interval time.Duration // monitoring interval, for "next check" lines
 }
 
-// Bot обрабатывает команды Telegram и ведёт статусные панели.
+// Bot handles Telegram commands and maintains status panels.
 type Bot struct {
 	api    *Client
 	store  *storage.Store
@@ -31,19 +31,19 @@ type Bot struct {
 	log    *slog.Logger
 	tick   time.Duration
 
-	lastText map[int64]string // кэш последнего текста панели по чату
-	pinWarn  map[int64]bool   // однократное предупреждение о запрете закрепления
+	lastText map[int64]string // per-chat cache of the last panel text
+	pinWarn  map[int64]bool   // one-time warning about a missing pin permission
 
-	drafts map[int64]map[string]bool // черновики подписок до «Сохранить»
+	drafts map[int64]map[string]bool // subscription drafts until "Save"
 	mu     sync.Mutex
 
-	wake        chan struct{} // букс deliveries-воркера после цикла
-	floodUntil  atomic.Int64  // unix-сек паузы рассылки после 429 (флуд-лимит бота глобальный)
-	panelDirty  atomic.Bool   // цикл изменил состояние — панели надо обновить
-	lastCleanup atomic.Int64  // unix-время последней очистки outbox
+	wake        chan struct{} // nudges the delivery worker after a cycle
+	floodUntil  atomic.Int64  // unix seconds of the batch pause after a 429 (the bot's flood limit is global)
+	panelDirty  atomic.Bool   // a cycle changed state — panels need a refresh
+	lastCleanup atomic.Int64  // unix time of the last outbox cleanup
 }
 
-// wakeDelivery будит воркер доставки (неблокирующе).
+// wakeDelivery wakes the delivery worker (non-blocking).
 func (b *Bot) wakeDelivery() {
 	select {
 	case b.wake <- struct{}{}:
@@ -51,7 +51,7 @@ func (b *Bot) wakeDelivery() {
 	}
 }
 
-// NewBot создаёт бота.
+// NewBot creates the bot.
 func NewBot(cfg BotCfg) *Bot {
 	log := cfg.Logger
 	if log == nil {
@@ -70,7 +70,7 @@ func NewBot(cfg BotCfg) *Bot {
 	}
 }
 
-// Run запускает long polling до отмены ctx.
+// Run runs long polling until ctx is cancelled.
 func (b *Bot) Run(ctx context.Context) error {
 	if err := b.api.SetMyCommands(ctx, []BotCommand{
 		{Command: "start", Description: "Показать статус моделей"},
@@ -80,7 +80,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	}); err != nil {
 		b.log.Warn("telegram: setMyCommands failed", "err", err)
 	}
-	offset, err := b.store.BotOffset() // подтверждённые ранее апдейты не доставляются повторно
+	offset, err := b.store.BotOffset() // previously confirmed updates are not re-delivered
 	if err != nil {
 		b.log.Error("telegram: read offset", "err", err)
 	}
@@ -113,8 +113,8 @@ func (b *Bot) Run(ctx context.Context) error {
 					b.log.Error("telegram: handle update", "err", err)
 				}
 			}()
-			// подтверждаем апдейт только после обработки: крах в этом окне
-			// даст повтор (идемпотентный), а не потерю команды
+			// the update is confirmed only after handling: a crash in this window
+			// yields a (idempotent) repeat, not a lost command
 			if err := b.store.SetBotOffset(offset); err != nil {
 				b.log.Warn("telegram: persist offset", "offset", offset, "err", err)
 			}
@@ -122,7 +122,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 }
 
-// HandleUpdate маршрутизирует один апдейт.
+// HandleUpdate routes one update.
 func (b *Bot) HandleUpdate(ctx context.Context, u *Update) error {
 	switch {
 	case u.Message != nil:
@@ -151,7 +151,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg *Message) error {
 	case "":
 		return nil
 	default:
-		return nil // неизвестные команды молча игнорируются (лишних команд нет)
+		return nil // unknown commands are silently ignored (no extra commands exist)
 	}
 }
 
@@ -172,10 +172,11 @@ func fromID(msg *Message) int64 {
 	if msg.Chat.Type == "private" {
 		return msg.Chat.ID
 	}
-	return 0 // анонимный канал-пост; коллбэки от реальных пользователей проверяются отдельно
+	return 0 // anonymous channel post; callbacks from real users are checked separately
 }
 
-// handleStatusCommand: /status (без аргумента — панель) или /status model-id.
+// handleStatusCommand: /status without an argument shows the panel;
+// /status model-id shows the model card.
 func (b *Bot) handleStatusCommand(ctx context.Context, chat Chat, modelID string) error {
 	if modelID == "" {
 		return b.ensurePanel(ctx, chat.ID)
@@ -189,7 +190,7 @@ func (b *Bot) handleModelDetail(ctx context.Context, chatID int64, modelID strin
 		return err
 	}
 	if m == nil {
-		// смягчение ввода: уникальный префикс достаивает до точного ID
+		// input softening: a unique prefix completes to the exact ID
 		if id := b.uniquePrefix(modelID); id != "" {
 			modelID = id
 			m, err = b.store.Model(modelID)
@@ -200,12 +201,12 @@ func (b *Bot) handleModelDetail(ctx context.Context, chatID int64, modelID strin
 	}
 	if m == nil {
 		if cands := b.prefixCandidates(modelID); len(cands) > 0 {
-			// неоднозначный префикс: подсказываем ближайшие
+			// ambiguous prefix: suggest the nearest matches
 			_, err := b.api.SendMessage(ctx, chatID, "Уточните модель: "+codeIDs(cands))
 			return err
 		}
-		// аргумент — внешние данные: ограничиваем до экранирования,
-		// иначе длинный ввод раздувает ответ за лимит Telegram
+		// the argument is external input: truncate before escaping, or a
+		// long paste inflates the reply past the Telegram limit
 		_, err := b.api.SendMessage(ctx, chatID, "Модель не найдена: "+EscapeHTML(trunc(modelID, 64))+"\nТочный model-id указан в панели /status.")
 		return err
 	}
@@ -222,17 +223,17 @@ func (b *Bot) handleModelDetail(ctx context.Context, chatID int64, modelID strin
 	return b.sendModelCard(ctx, chatID, modelID, m.LastStatus, last, checks)
 }
 
-// sendModelCard отправляет rich-карточку модели; не поместившийся в лимит
-// хвост секции «Ответ» — следующими rich-сообщениями, без молчаливой
-// обрезки. Куси считаются в ЭКРАНИРОВАННЫХ рунах: спец-символы
-// растут до 6 раз после EscapeHTML, лимит считается по итоговому HTML.
+// sendModelCard sends the model's rich card; the tail of the "Response"
+// section that does not fit the limit goes as follow-up rich messages,
+// without silent truncation. Runes are counted ESCAPED: special characters
+// grow up to 6× after EscapeHTML, the limit applies to the final HTML.
 func (b *Bot) sendModelCard(ctx context.Context, chatID int64, modelID string, st status.Status, last storage.Check, checks []storage.Check) error {
 	card, followup := renderModelCard(modelID, st, last, checks)
 	if _, err := b.api.SendRichMessage(ctx, chatID, card); err != nil {
 		return err
 	}
 	rest := []rune(followup)
-	const limit = maxRichMessage - 8 // запас на обёртку <p>…</p>
+	const limit = maxRichMessage - 8 // headroom for the <p>…</p> wrapper
 	i := 0
 	for i < len(rest) {
 		cost := 0
@@ -240,7 +241,7 @@ func (b *Bot) sendModelCard(ctx context.Context, chatID int64, modelID string, s
 		for j < len(rest) {
 			c := escapedRuneLen(rest[j])
 			if cost+c > limit {
-				break // одиночная руна (макс 6) лимита не превышает
+				break // a single rune (max 6) never exceeds the limit
 			}
 			cost += c
 			j++
@@ -253,7 +254,7 @@ func (b *Bot) sendModelCard(ctx context.Context, chatID int64, modelID string, s
 	return nil
 }
 
-// uniquePrefix — точное совпадение по префиксу, если оно единственное.
+// uniquePrefix returns the exact ID when the prefix matches exactly one model.
 func (b *Bot) uniquePrefix(arg string) string {
 	c := b.prefixCandidates(arg)
 	if len(c) == 1 {
@@ -262,7 +263,7 @@ func (b *Bot) uniquePrefix(arg string) string {
 	return ""
 }
 
-// prefixCandidates — ID моделей, начинающиеся с arg (до 5 шт. для подсказки).
+// prefixCandidates returns model IDs starting with arg (up to 5, for hints).
 func (b *Bot) prefixCandidates(arg string) []string {
 	if arg == "" {
 		return nil
@@ -287,22 +288,22 @@ func codeIDs(ids []string) string {
 	return strings.Join(parts, ", ")
 }
 
-// handleStatusCallback — кнопки-ошибки в панелях и уведомлениях:
-// немедленный answerCallbackQuery, карточка — НОВЫМ сообщением в тот же
-// чат, панель не редактируется, подписки и черновики не трогаем.
-// Модель в статусе Down/Unknown — НЕ устаревшая кнопка:
-// недоступность не делает callback недействительным.
+// handleStatusCallback — error buttons in panels and notifications:
+// answerCallbackQuery immediately, the card goes as a NEW message to the
+// same chat, the panel is not edited, subscriptions and drafts untouched.
+// A model in Down/Unknown is NOT a stale button: unavailability does not
+// invalidate the callback.
 func (b *Bot) handleStatusCallback(ctx context.Context, cb *CallbackQuery) error {
 	if cb.Message == nil {
-		// ни chat_id, ни message_id — карточку отправить некуда
+		// neither chat_id nor message_id — nowhere to send the card
 		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Не удалось открыть карточку модели.")
 	}
 	id, ok := resolveCallback(strings.TrimPrefix(cb.Data, "st:"), modelIDs(b.models))
 	if !ok {
-		// модель удалена из конфигурации: кнопка осталась в старом сообщении
+		// model removed from config: the button lives in an old message
 		return b.api.AnswerCallbackQuery(ctx, cb.ID, "Модель больше не отслеживается.")
 	}
-	// индикатор загрузки снимается до тяжёлой работы
+	// the loading indicator is dropped before the heavy work
 	if err := b.api.AnswerCallbackQuery(ctx, cb.ID, ""); err != nil {
 		b.log.Warn("status callback: answer", "err", err)
 	}

@@ -12,15 +12,15 @@ import (
 	"opentw/internal/storage"
 )
 
-// supervise обязан вернуть только после завершения ВСЕХ компонентов:
-// именно тогда defer store.Close() в run() закрыть базу безопасно.
+// supervise must return only after ALL components finished: only then is
+// it safe for run()'s deferred store.Close() to close the database.
 func TestSuperviseWaitsForAllComponents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	slowDone := make(chan struct{})
 	release := make(chan struct{})
 	slow := func(context.Context) error {
-		<-release // имитация финального цикла, дотягивающего работу после отмены
+		<-release // an emulated final cycle finishing its work after the cancel
 		close(slowDone)
 		return nil
 	}
@@ -40,8 +40,8 @@ func TestSuperviseWaitsForAllComponents(t *testing.T) {
 	}
 }
 
-// Ошибка одного компонента отменяет второй, и supervise не возвращается,
-// пока второй не завершится.
+// One component's failure cancels the other, and supervise does not return
+// until the other finishes.
 func TestSuperviseStopsSiblingOnError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -63,9 +63,10 @@ func TestSuperviseStopsSiblingOnError(t *testing.T) {
 	}
 }
 
-// --- Этап 7.6: запуск ---
+// --- Startup ---
 
-// writeTestConfig создаёт временный config.yaml без сети (секреты из ENV).
+// writeTestConfig creates a temporary config.yaml without network use
+// (secrets come from ENV).
 func writeTestConfig(t *testing.T, sqlitePath string) string {
 	t.Helper()
 	cfg := "interval: 5m\nhttp_timeout: 5s\nconcurrency: 2\nmax_tokens: 8\nstreaming: false\nsqlite_path: " + sqlitePath + "\n" +
@@ -77,7 +78,8 @@ func writeTestConfig(t *testing.T, sqlitePath string) string {
 	return path
 }
 
-// Флаг -backup: согласный снапшот живой базы, чтение после закрытия.
+// The -backup flag: a consistent snapshot of a live database, readable after
+// closing.
 func TestRunBackupFlag(t *testing.T) {
 	db := t.TempDir() + "/live.db"
 	s, err := storage.Open(db)
@@ -94,7 +96,7 @@ func TestRunBackupFlag(t *testing.T) {
 
 	t.Setenv("BOT_TOKEN", "T")
 	t.Setenv("API_KEY", "K")
-	t.Setenv("API_BASE_URL", "http://localhost:1") // до бэкапа сеть не трогается
+	t.Setenv("API_BASE_URL", "http://localhost:1") // the network is not touched before the backup
 	cfgPath := writeTestConfig(t, db)
 	snap := t.TempDir() + "/snap.db"
 
@@ -107,7 +109,7 @@ func TestRunBackupFlag(t *testing.T) {
 	if _, err := os.Stat(snap); err != nil {
 		t.Fatalf("snapshot missing: %v", err)
 	}
-	// снапшот согласен: открывается и содержит данные
+	// the snapshot is consistent: opens and holds the data
 	s2, err := storage.Open(snap)
 	if err != nil {
 		t.Fatalf("snapshot open: %v", err)
@@ -117,11 +119,11 @@ func TestRunBackupFlag(t *testing.T) {
 	if err != nil || len(checks) != 1 {
 		t.Fatalf("snapshot must hold the check: %v %v", checks, err)
 	}
-	// повтор в существующий файл — понятный отказ (I3)
+	// a repeat into an existing file fails loudly
 	if err := run(); err == nil {
 		t.Fatal("backup into an existing file must fail loudly")
 	}
-	// run() закрыл живую базу (defer store.Close): файл можно открыть снова
+	// run() closed the live database (deferred store.Close): the file reopens
 	s3, err := storage.Open(db)
 	if err != nil {
 		t.Fatalf("live db must be closed by run(): %v", err)
@@ -129,7 +131,7 @@ func TestRunBackupFlag(t *testing.T) {
 	s3.Close()
 }
 
-// Испорченный конфиг — понятная ошибка, без создания базы.
+// A broken config — a clear error, no database created.
 func TestRunBadConfig(t *testing.T) {
 	t.Setenv("BOT_TOKEN", "T")
 	t.Setenv("API_KEY", "K")
@@ -146,10 +148,10 @@ func TestRunBadConfig(t *testing.T) {
 	}
 }
 
-// Худший цикл учитывает запрос каталога и волны проверок (согласован с
-// HEALTHCHECK и maxage).
+// The worst cycle accounts for the catalog request and the check waves
+// (consistent with the HEALTHCHECK and maxage).
 func TestWorstCycleTime(t *testing.T) {
-	// 25 моделей, concurrency 4, timeout 120s: каталог + ceil(25/4)=7 волн
+	// 25 models, concurrency 4, timeout 120s: catalog + ceil(25/4)=7 waves
 	if got := worstCycleTime(25, 4, 120*time.Second); got != (1+7)*120*time.Second {
 		t.Fatalf("worstCycleTime = %v", got)
 	}

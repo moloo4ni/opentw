@@ -9,8 +9,8 @@ import (
 	"opentw/internal/storage"
 )
 
-// Панель в стиле референсного бота: model ID моноширинным (<code>),
-// заголовки семейств жирным (<b>), одна строка на модель.
+// The panel in the reference bot's style: model IDs monospaced (<code>),
+// family headers bold (<b>), one line per model.
 func TestPanelCompactOneLine(t *testing.T) {
 	models := []storage.Model{{ID: "deepseek-v4.1-flash-1017", Family: "DeepSeek"}}
 	checks := map[string]storage.Check{
@@ -31,8 +31,8 @@ func TestPanelCompactOneLine(t *testing.T) {
 	}
 }
 
-// В строках панели нет декоративных Unicode-символов (—, …): после model ID —
-// ASCII « - », метрики внутри строки разделяются «·» (§4/финальная полировка §6).
+// No decorative Unicode characters (—, …) in panel lines: after a model ID
+// comes the ASCII " - ", metrics inside a line are separated by "·".
 func TestPanelNoDashesOrEllipsis(t *testing.T) {
 	models := []storage.Model{
 		{ID: "grok-4.6", Family: "Grok"},
@@ -52,8 +52,8 @@ func TestPanelNoDashesOrEllipsis(t *testing.T) {
 	}
 }
 
-// Строка ошибки: только короткий label в кнопке, длинный текст провайдера —
-// в карточке модели (§4/ТЗ §7).
+// The error line: only the short label in the button; the provider's long
+// text goes to the model card.
 func TestPanelErrorLineCompact(t *testing.T) {
 	models := []storage.Model{{ID: "grok-4.6", Family: "Grok"}}
 	checks := map[string]storage.Check{
@@ -69,7 +69,8 @@ func TestPanelErrorLineCompact(t *testing.T) {
 	}
 }
 
-// Меню подписок: полный список моделей живёт в кнопках; текст не дублирует его.
+// The subscribe menu: the full model list lives in the buttons; the text
+// does not duplicate it.
 func TestSubscribeTextCompact(t *testing.T) {
 	models := []storage.Model{
 		{ID: "gpt-6-astra", Family: "GPT"},
@@ -83,7 +84,7 @@ func TestSubscribeTextCompact(t *testing.T) {
 		t.Fatalf("selection counter missing:\n%s", text)
 	}
 	rows := kb.InlineKeyboard
-	if len(rows) != 3 { // 2 семейства уложились в 1 ряд + масс + Сохранить/Отменить
+	if len(rows) != 3 { // 2 families fit into 1 row + bulk + Save/Cancel
 		t.Fatalf("root rows = %d: %+v", len(rows), rows)
 	}
 	famRow := rows[0]
@@ -93,8 +94,8 @@ func TestSubscribeTextCompact(t *testing.T) {
 	}
 }
 
-// Уведомления §8: строка падения — интерактивная кнопка с label,
-// строка восстановления — без кнопки.
+// Notifications: the down line is an interactive button with a label;
+// the recovery line has no button.
 func TestNotificationLineFormat(t *testing.T) {
 	down := downLine("gpt-6-astra", storage.Check{ModelID: "gpt-6-astra", Status: status.Down,
 		HTTPStatus: 429, ErrorType: "http", ErrorMessage: "Upstream rate limit"})
@@ -111,7 +112,8 @@ func TestNotificationLineFormat(t *testing.T) {
 	}
 }
 
-// 15.4/15.6 (матрица label): каждый вид ошибки даёт корректную кнопку в строке уведомления.
+// The label matrix: every error kind yields the correct button in a
+// notification line.
 func TestNotificationButtonLabelMatrix(t *testing.T) {
 	for _, tc := range []struct {
 		name string

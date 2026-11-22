@@ -15,8 +15,8 @@ import (
 	"opentw/internal/storage"
 )
 
-// TestLiveCycle выполняет один настоящий цикл против API из окружения.
-// Запуск: LIVE=1 go test -tags live ./internal/monitor -run TestLiveCycle -v
+// TestLiveCycle runs one real cycle against the API from the environment.
+// Run: LIVE=1 go test -tags live ./internal/monitor -run TestLiveCycle -v
 func TestLiveCycle(t *testing.T) {
 	if os.Getenv("LIVE") == "" {
 		t.Skip("set LIVE=1 to run against the real API")

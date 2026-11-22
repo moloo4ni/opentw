@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// Буферизованный провайдер присылает все чанки разом: время генерации
-// практически нулевое, TPS получается абсурдным. Такое значение недостоверно
-// и должно быть N/A, а не миллионами токенов в секунду.
+// A buffered provider sends all chunks at once: the generation time is
+// nearly zero and TPS comes out absurd. Such a value is not trustworthy
+// and must be N/A, not millions of tokens per second.
 func TestGenerateBufferedStreamHasNoTPS(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -39,7 +39,7 @@ func TestGenerateBufferedStreamHasNoTPS(t *testing.T) {
 	}
 }
 
-// TTFT/TPS достоверны, когда чанки действительно разнесены во времени.
+// TTFT/TPS are trustworthy when the chunks are actually spaced in time.
 func TestGeneratePacedStreamHasTPS(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

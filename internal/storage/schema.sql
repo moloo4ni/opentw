@@ -1,7 +1,8 @@
--- OpenTW — единственная актуальная начальная схема базы.
--- Применяется целиком при создании новой базы (storage.Open); маркер
--- PRAGMA user_version = 1 ставится в той же транзакции. Исторических
--- миграций нет: старые/чужие базы отвергаются при старте понятной ошибкой.
+-- OpenTW's single current initial schema.
+-- Applied in full when a new database is created (storage.Open); the marker
+-- PRAGMA user_version = 1 is set in the same transaction. There are no
+-- historical migrations: legacy/foreign databases are rejected at startup
+-- with a clear error.
 
 CREATE TABLE models (
     model_id      TEXT PRIMARY KEY,
@@ -57,7 +58,7 @@ CREATE TABLE status_messages (
     created_at TEXT NOT NULL
 );
 
--- Outbox-доставка: события переживают рестарт и сбои Telegram.
+-- Durable outbox delivery: events survive restarts and Telegram outages.
 CREATE TABLE notification_outbox (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id         INTEGER NOT NULL,
@@ -73,14 +74,14 @@ CREATE TABLE notification_outbox (
 
 CREATE INDEX idx_outbox_pending ON notification_outbox (id) WHERE sent_at IS NULL;
 
--- Оффсет long polling: не перечитывать уже обработанные апдейты после рестарта.
+-- Long polling offset: skip already processed updates after a restart.
 CREATE TABLE bot_state (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     offset  INTEGER NOT NULL
 );
 
--- Последнее состояние, о котором чат был реально уведомлён (основа
--- доставки только актуальных изменений).
+-- Last state the chat was actually notified about (the basis for
+-- delivering only current changes).
 CREATE TABLE chat_notified (
   chat_id    INTEGER NOT NULL,
   model_id   TEXT    NOT NULL,

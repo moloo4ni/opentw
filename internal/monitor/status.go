@@ -17,38 +17,37 @@ const (
 	StatusUnknown     = status.Unknown
 )
 
-// expectedReply — единственный ответ, который засчитывается как успешная
-// проверка: ответом на `Reply with exactly "OK"` должно быть ровно «OK».
-// Сравнение регистрозависимое, допускается только обрезка внешних пробелов.
+// expectedReply is the only answer counted as a successful check: a reply
+// to `Reply with exactly "OK"` must be exactly "OK". Case-sensitive; only
+// outer whitespace may be trimmed.
 const expectedReply = "OK"
 
-// ContentOK решает, выполнила ли модель проверочное задание: итоговое
-// содержимое ответа (без reasoning) обязано быть ровно «OK».
+// ContentOK decides whether the model fulfilled the probe task: the final
+// answer content (reasoning excluded) must be exactly "OK".
 func ContentOK(content string) bool {
 	return strings.TrimSpace(content) == expectedReply
 }
 
-// Classify maps one raw check result to a status.
-// Успешной проверкой считается только ожидаемый итоговый ответ «OK»;
-// HTTP 200 с любым иным (в т.ч. пустым) содержимым — Down: модель не
-// выполнила проверочный запрос. Проблемы самого монитора (его ключ,
-// нечитаемый ответ) — Unknown. Cancelled results are filtered by the
-// caller before recording.
+// Classify maps one raw check result to a status. A check succeeds only on
+// the expected exact "OK" answer; HTTP 200 with any other (including empty)
+// content is Down: the model failed the probe. Monitor-side problems (own
+// key, unparseable response) are Unknown. Cancelled results are filtered by
+// the caller before recording.
 func Classify(res api.RawResult) Status {
 	switch res.ErrorKind {
 	case "":
-		// HTTP 200 и генерация была: вердикт — по итоговому содержимому.
+		// HTTP 200 with generation: the verdict follows the final content.
 		if ContentOK(res.Content) {
 			return StatusOperational
 		}
 		return StatusDown
 	case "empty":
-		// HTTP 200 без генерации: модель не ответила на проверочный запрос.
+		// HTTP 200 without generation: the model did not answer the probe.
 		return StatusDown
 	case "http":
 		switch {
 		case res.HTTPStatus == 429:
-			// Rate limit провайдера для конкретной модели: модель недоступна.
+			// Provider rate limit for this model: the model is unavailable.
 			return StatusDown
 		case res.HTTPStatus == 404:
 			// Model not found.
@@ -60,12 +59,12 @@ func Classify(res api.RawResult) Status {
 			// The monitor's own authorization problem.
 			return StatusUnknown
 		case looksLikeModelNotFound(res.ErrorMessage):
-			// 400 от роутера: модель/провайдер не обслуживается.
+			// A 400 from the router: the model/provider is not served.
 			return StatusDown
 		case looksLikeModelOffline(res.ErrorMessage):
-			// Провайдер явно сообщает, что конкретная модель offline
-			// («The model kimi-k2.6 has been offline», HTTP 400) — это 🔴,
-			// а не «монитор не может проверить».
+			// The provider explicitly states this model is offline
+			// ("The model kimi-k2.6 has been offline", HTTP 400): Down,
+			// not "the monitor cannot check".
 			return StatusDown
 		default:
 			// Other 4xx: incompatible request/response shape — monitoring issue.
@@ -74,12 +73,12 @@ func Classify(res api.RawResult) Status {
 	case "timeout", "connrefused":
 		return StatusDown
 	default:
-		// "invalid" и прочее: монитор не смог достоверно проверить модель.
+		// "invalid" and the rest: the monitor could not verify the model.
 		return StatusUnknown
 	}
 }
 
-// looksLikeModelNotFound распознаёт 400-ответы об отсутствии модели.
+// looksLikeModelNotFound recognizes 400 responses about a missing model.
 func looksLikeModelNotFound(msg string) bool {
 	m := strings.ToLower(msg)
 	for _, marker := range []string{
@@ -96,11 +95,11 @@ func looksLikeModelNotFound(msg string) bool {
 	return false
 }
 
-// looksLikeModelOffline распознаёт узкий класс сообщений, в которых сам
-// провайдер заявляет недоступность конкретной модели: живые формулировки
-// аудита — «The model kimi-k2.6 has been offline» и «model "..." not
-// available» (HTTP 400). Прочие 4xx (несовместимый запрос, конфигурация,
-// квота/аккаунты) сюда не попадают и остаются ⚪ Unknown.
+// looksLikeModelOffline recognizes the narrow class of messages where the
+// provider itself declares a model unavailable: observed live wordings are
+// "The model kimi-k2.6 has been offline" and "model "..." not available"
+// (HTTP 400). Other 4xx (incompatible request, configuration, quota or
+// account issues) do not match and stay Unknown.
 func looksLikeModelOffline(msg string) bool {
 	m := strings.ToLower(msg)
 	for _, marker := range []string{
@@ -112,9 +111,9 @@ func looksLikeModelOffline(msg string) bool {
 			return true
 		}
 	}
-	// «model … not available»: слово о конкретной модели, идущее РАНЬШЕ
-	// заявления о недоступности. «tool use is not available for this model»
-	// и «no available accounts» под маркер не подходят.
+	// "model … not available": the word about a specific model comes BEFORE
+	// the unavailability claim. "tool use is not available for this model"
+	// and "no available accounts" must not match.
 	mi, ni := strings.Index(m, "model"), strings.Index(m, "not available")
 	return mi >= 0 && ni > mi
 }

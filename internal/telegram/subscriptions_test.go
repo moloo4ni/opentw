@@ -10,8 +10,8 @@ import (
 	"opentw/internal/storage"
 )
 
-// Рестарт бота между открытием /subscribe и «Сохранить»
-// не стирает сохранённые подписки — черновик гидратируется из БД.
+// A bot restart between opening /subscribe and "Save" does not wipe the
+// saved subscriptions — the draft is hydrated from the DB.
 func TestStaleMenuSaveKeepsSubscriptions(t *testing.T) {
 	m := newMockTG(t)
 	path := t.TempDir() + "/bot.db"
@@ -27,7 +27,7 @@ func TestStaleMenuSaveKeepsSubscriptions(t *testing.T) {
 	}
 
 	b2, store2 := newBotAt(t, m, path, []storage.Model{{ID: "gpt-6-astra", Family: "GPT"}, {ID: "glm-5.3", Family: "GLM"}})
-	if err := b2.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:gpt-6-astra")); err != nil { // снимаем одну
+	if err := b2.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:gpt-6-astra")); err != nil { // toggling one off
 		t.Fatal(err)
 	}
 	if err := b2.HandleUpdate(context.Background(), cbUpdate(100, 1, "save")); err != nil {
@@ -39,7 +39,7 @@ func TestStaleMenuSaveKeepsSubscriptions(t *testing.T) {
 	}
 }
 
-// «Сохранить» без открытого меню (после рестарта) не меняет сохранённое.
+// "Save" without an open menu (after a restart) changes nothing saved.
 func TestSaveWithoutMenuKeepsSubscriptions(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -55,7 +55,7 @@ func TestSaveWithoutMenuKeepsSubscriptions(t *testing.T) {
 	}
 }
 
-// Масс-кнопки на обоих экранах, данные в лимите 64 байт.
+// Bulk buttons on both screens, callback data within the 64-byte limit.
 func TestMassButtonsPresent(t *testing.T) {
 	models := []storage.Model{
 		{ID: "g1", Family: "GPT"},
@@ -95,7 +95,7 @@ func TestMassButtonsPresent(t *testing.T) {
 	}
 }
 
-// `fa:` меняет только черновик до save; после save — всё семейство.
+// `fa:` changes only the draft until save; after save — the whole family.
 func TestFamilySelectAllDraftThenSave(t *testing.T) {
 	m := newMockTG(t)
 	models := []storage.Model{
@@ -120,7 +120,7 @@ func TestFamilySelectAllDraftThenSave(t *testing.T) {
 	}
 }
 
-// «Снять всё» — счётчик с диффом, текст нуля после save.
+// "Deselect all" — a counter with the diff, a zero text after save.
 func TestNoneDeselectsAll(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -153,7 +153,7 @@ func TestNoneDeselectsAll(t *testing.T) {
 	}
 }
 
-// Дифф относительно сохранённого состояния; без изменений скобка опускается.
+// The diff is against the saved state; no brackets when equal.
 func TestDraftDiffAgainstSaved(t *testing.T) {
 	m := newMockTG(t)
 	models := []storage.Model{
@@ -164,7 +164,7 @@ func TestDraftDiffAgainstSaved(t *testing.T) {
 	if err := store.SetSubscription(100, "g1", true); err != nil {
 		t.Fatal(err)
 	}
-	// новое меню начинается с сохранённого состояния — скобки нет
+	// the fresh menu starts from the saved state — no brackets
 	if err := b.HandleUpdate(context.Background(), msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestDraftDiffAgainstSaved(t *testing.T) {
 	if !strings.Contains(text, "Выбрано: 1 из 2") || strings.Contains(text, "изменения:") {
 		t.Fatalf("no-change bracket must be omitted:\n%s", text)
 	}
-	// снимаем g1 в черновике — семейство показывает -1
+	// g1 untoggled in the draft — the family shows -1
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:g1")); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestDraftDiffAgainstSaved(t *testing.T) {
 	if !strings.Contains(text, "Выбрано: 0 из 2 (изменения: -1)") {
 		t.Fatalf("family diff wrong:\n%s", text)
 	}
-	// возвращаем g1: скобка исчезает
+	// g1 back: the bracket disappears
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:g1")); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestDraftDiffAgainstSaved(t *testing.T) {
 	if !strings.Contains(text, "Выбрано: 1 из 2") || strings.Contains(text, "изменения:") {
 		t.Fatalf("restored draft must hide the bracket:\n%s", text)
 	}
-	// mass select all: +1 (g2 новый относительно сохранённого)
+	// mass select all: +1 (g2 is new against the saved set)
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "fa:GPT")); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestDraftDiffAgainstSaved(t *testing.T) {
 	}
 }
 
-// «Отменить» на экране семейства удаляет меню, не сохраняя и не стирая.
+// "Cancel" on the family screen deletes the menu, saving and wiping nothing.
 func TestFamilyScreenCancel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -208,7 +208,7 @@ func TestFamilyScreenCancel(t *testing.T) {
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "f:GPT")); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:gpt-6-astra")); err != nil { // сняли в черновике
+	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:gpt-6-astra")); err != nil { // untoggled in the draft
 		t.Fatal(err)
 	}
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "cancel")); err != nil {
@@ -223,8 +223,8 @@ func TestFamilyScreenCancel(t *testing.T) {
 	}
 }
 
-// Ошибка БД при сохранении: понятный тост, черновик не потерян, повторная
-// кнопка save после восстановления сохраняет.
+// A DB failure on save: a clear toast, the draft is not lost, a repeated
+// save after recovery works.
 func TestSubscribeSaveDBErrorKeepsDraft(t *testing.T) {
 	m := newMockTG(t)
 	path := t.TempDir() + "/bot.db"
@@ -232,11 +232,11 @@ func TestSubscribeSaveDBErrorKeepsDraft(t *testing.T) {
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:g1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Close(); err != nil { // «SQLite умер»
+	if err := store.Close(); err != nil { // "SQLite died"
 		t.Fatal(err)
 	}
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "save")); err == nil {
-		// ошибка наружу не обязательна, но тост обязан быть понятным
+		// surfacing the error is optional, but the toast must be clear
 		_ = err
 	}
 	ack := fmt.Sprint(m.lastBody("answerCallbackQuery")["text"])
@@ -245,7 +245,8 @@ func TestSubscribeSaveDBErrorKeepsDraft(t *testing.T) {
 	}
 }
 
-// /status с уникальным префиксом находит модель (rich-карточка); неоднозначный — подсказывает.
+// /status with a unique prefix finds the model (a rich card); an ambiguous
+// one suggests matches.
 func TestStatusPrefixLookup(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -265,7 +266,7 @@ func TestStatusPrefixLookup(t *testing.T) {
 	}
 }
 
-// Неудачное редактирование меню — понятный тост вместо пустого.
+// A failed menu edit — a clear toast instead of silence.
 func TestMenuEditFailureToast(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -284,10 +285,10 @@ func TestMenuEditFailureToast(t *testing.T) {
 	}
 }
 
-// --- Этап 7.2: колбэки ---
+// --- Callbacks ---
 
-// Колбэк без сообщения (отозванная/старая клавиатура) не должен ни паниковать,
-// ни портить данные нулевым chat_id — только вежливый тост.
+// A callback without a message (a revoked/stale keyboard) must neither panic
+// nor corrupt data with a zero chat_id — only a polite toast.
 func TestCallbackWithoutMessageNoPanic(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -307,7 +308,7 @@ func TestCallbackWithoutMessageNoPanic(t *testing.T) {
 	if body["text"] != "Кнопка устарела, откройте /subscribe заново" {
 		t.Fatalf("stale toast = %v", body["text"])
 	}
-	// подписка не тронута, пустые chat_id в базу не попадали
+	// the subscription is untouched, zero chat_ids never hit the database
 	subs, _ := store.Subscriptions(100)
 	if len(subs) != 1 {
 		t.Fatalf("subscriptions must be intact, got %v", subs)
@@ -317,7 +318,7 @@ func TestCallbackWithoutMessageNoPanic(t *testing.T) {
 	}
 }
 
-// 7.2: «message is not modified» — штатный двойной клик, а не ошибка меню.
+// "message is not modified" — a benign double click, not a menu error.
 func TestEditMenuNotModifiedIsBenign(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -326,7 +327,7 @@ func TestEditMenuNotModifiedIsBenign(t *testing.T) {
 	}
 	m.handler = func(method string, body []byte) (any, int) {
 		if method == "editMessageText" {
-			// «пользователь дважды ткнул, текст не изменился»
+			// "the user clicked twice, the text did not change"
 			return map[string]any{"ok": false, "error_code": 400, "description": "Bad Request: message is not modified"}, http.StatusBadRequest
 		}
 		if method == "getChatMember" {

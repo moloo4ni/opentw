@@ -11,7 +11,7 @@ import (
 	"opentw/internal/storage"
 )
 
-// seedModelDetail — модель с проверкой, чтобы карточка по st: была полноценной.
+// seedModelDetail — a model with a check, so the st: card is complete.
 func seedModelDetail(t *testing.T, b *Bot, modelID string, st status.Status, httpStatus int, errType, response string) {
 	t.Helper()
 	at := time.Now()
@@ -24,8 +24,9 @@ func seedModelDetail(t *testing.T, b *Bot, modelID string, st status.Status, htt
 	}
 }
 
-// st:-кнопка из лички: answerCallbackQuery до тяжёлой работы, карточка —
-// НОВЫМ rich-сообщением в тот же чат, панель не редактируется.
+// An st: button from a private chat: answerCallbackQuery before the heavy
+// work, the card goes as a NEW rich message to the same chat, the panel is
+// not edited.
 func TestStatusCallbackOpensCardPrivate(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -41,7 +42,7 @@ func TestStatusCallbackOpensCardPrivate(t *testing.T) {
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("card must be sent as a new rich message, got %d", n)
 	}
-	// ответ приходит раньше отправки карточки (снять индикатор загрузки)
+	// the answer comes before the card (drop the loading indicator)
 	if !(callIndex(m, "answerCallbackQuery") < callIndex(m, "sendRichMessage")) {
 		t.Fatalf("answerCallbackQuery must precede the card: %v", m.callList())
 	}
@@ -63,21 +64,21 @@ func TestStatusCallbackOpensCardPrivate(t *testing.T) {
 	}
 }
 
-// Колбэк из группы и канала: карточка отправляется в чат нажатия.
+// Callbacks from a group and a channel: the card goes to the pressing chat.
 func TestStatusCallbackFromGroupAndChannel(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
 	seedModelDetail(t, b, "gpt-6-astra", status.Down, 429, "http", "upstream")
 	ctx := context.Background()
 
-	// группа
+	// group
 	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 7, "st:gpt-6-astra")); err != nil {
 		t.Fatal(err)
 	}
 	if body := m.lastBody("sendRichMessage"); body["chat_id"].(float64) != -200 {
 		t.Fatalf("group card must go to -200, got %v", body["chat_id"])
 	}
-	// канал
+	// channel
 	cb := cbUpdate(-300, 7, "st:gpt-6-astra")
 	cb.CallbackQuery.Message.Chat.Type = "channel"
 	if err := b.HandleUpdate(ctx, cb); err != nil {
@@ -87,14 +88,14 @@ func TestStatusCallbackFromGroupAndChannel(t *testing.T) {
 		t.Fatalf("channel card must go to -300, got %v", body["chat_id"])
 	}
 	if m.callCount("getChatMember") != 0 {
-		// st:-кнопки не меню подписок: проверка прав не нужна
+		// st: buttons are not the subscribe menu: no permission check needed
 		t.Fatalf("st: callback must not require admin checks: %v", m.callList())
 	}
 }
 
-// Удалённая из конфигурации модель и мусорный payload — вежливый тост,
-// карточки нет. Недоступная, но присутствующая в конфигурации модель
-// (тесты ниже/выше открывают её с Down) — не устаревшая кнопка.
+// A model removed from the config and a garbage payload — a polite toast,
+// no card. An unavailable but configured model (other tests open it with
+// Down) is NOT a stale button.
 func TestStatusCallbackRemovedOrInvalid(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -104,7 +105,7 @@ func TestStatusCallbackRemovedOrInvalid(t *testing.T) {
 		"st:removed-model",
 		"st:garbage",
 		"st:",
-		"st:h:0000000000", // хэш, не совпадающий ни с одной моделью
+		"st:h:0000000000", // a hash matching no model
 	} {
 		if err := b.HandleUpdate(ctx, cbUpdate(100, 7, data)); err != nil {
 			t.Fatalf("data=%q: err = %v", data, err)
@@ -119,7 +120,8 @@ func TestStatusCallbackRemovedOrInvalid(t *testing.T) {
 	}
 }
 
-// Колбэк без сообщения (отозванная клавиатура) — отдельный тост, без паники.
+// A callback without a message (a revoked keyboard) — a dedicated toast,
+// no panic.
 func TestStatusCallbackWithoutMessageOnlyToast(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -139,7 +141,7 @@ func TestStatusCallbackWithoutMessageOnlyToast(t *testing.T) {
 	}
 }
 
-// Хэш-форма для длинных id: st:h:<hash> открывает карточку правильной модели.
+// The hash form for long ids: st:h:<hash> opens the right model's card.
 func TestStatusCallbackHashFormLongID(t *testing.T) {
 	m := newMockTG(t)
 	long := strings.Repeat("m", 100)
@@ -161,8 +163,8 @@ func TestStatusCallbackHashFormLongID(t *testing.T) {
 	}
 }
 
-// Нажатие st:-кнопки на закреплённой панели: карточка — отдельным сообщением,
-// панель не редактируется и не пересоздаётся.
+// An st: button press on the pinned panel: the card is a separate message,
+// the panel is not edited or recreated.
 func TestStatusCallbackDoesNotTouchPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -192,7 +194,7 @@ func TestStatusCallbackDoesNotTouchPanel(t *testing.T) {
 	}
 }
 
-// Несколько кнопок в одном сообщении: каждое нажатие открывает свою карточку.
+// Several buttons in one message: every press opens its own card.
 func TestStatusCallbackMultipleButtons(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -212,7 +214,7 @@ func TestStatusCallbackMultipleButtons(t *testing.T) {
 	}
 }
 
-// Переход к карточке не трогает подписки и черновик меню.
+// Opening a card touches neither subscriptions nor the menu draft.
 func TestStatusCallbackDoesNotTouchSubscriptions(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -220,7 +222,7 @@ func TestStatusCallbackDoesNotTouchSubscriptions(t *testing.T) {
 	if err := store.SetSubscription(100, "glm-5.3", true); err != nil {
 		t.Fatal(err)
 	}
-	// открытый черновик меню: включили модель, но не сохранили
+	// an open menu draft: a model turned on, not saved
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:gpt-6-astra")); err != nil {
 		t.Fatal(err)
 	}
@@ -242,8 +244,8 @@ func TestStatusCallbackDoesNotTouchSubscriptions(t *testing.T) {
 	}
 }
 
-// Сбой чтения карточки (БД недоступна): колбэк всё равно отвечен,
-// процесс не падает (всегда answerCallbackQuery).
+// A card read failure (the DB is down): the callback is still answered,
+// the process does not crash (always answerCallbackQuery).
 func TestStatusCallbackReadErrorStillAnswered(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -262,13 +264,13 @@ func TestStatusCallbackReadErrorStillAnswered(t *testing.T) {
 	}
 }
 
-// Перестановка списка моделей между созданием клавиатуры и нажатием
-// кнопки не должна подменять модель: колбэк несёт ID модели, а не позицию.
+// Reordering the model list between keyboard creation and a button press
+// must not swap the model: the callback carries a model ID, not a position.
 func TestCallbackToggleSurvivesConfigReorder(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
-	// клавиатура создана при порядке [gpt-6-astra, glm-5.3];
-	// после перезапуска конфигурация — в обратном порядке
+	// the keyboard was created with the order [gpt-6-astra, glm-5.3];
+	// after a restart the configuration is in the reverse order
 	b.models = []storage.Model{{ID: "glm-5.3", Family: "GLM"}, {ID: "gpt-6-astra", Family: "GPT"}}
 	if err := b.HandleUpdate(context.Background(), cbUpdate(100, 1, "s:gpt-6-astra")); err != nil {
 		t.Fatal(err)
@@ -280,8 +282,8 @@ func TestCallbackToggleSurvivesConfigReorder(t *testing.T) {
 	}
 }
 
-// Идентификатора больше нет в конфигурации: кнопка вежливо отвергается
-// и ничего не переключает — ни модель, ни семейство.
+// The id is no longer in the configuration: the button is politely rejected
+// and toggles nothing — no model, no family.
 func TestStaleCallbackRejected(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -299,8 +301,8 @@ func TestStaleCallbackRejected(t *testing.T) {
 	}
 }
 
-// ID длиннее лимита Telegram callback_data (64 байта) кодируется стабильным
-// хэшем и всё равно переключает правильную модель.
+// An id longer than the Telegram callback_data limit (64 bytes) is encoded
+// as a stable hash and still toggles the right model.
 func TestCallbackDataEncodesLongIDs(t *testing.T) {
 	m := newMockTG(t)
 	long := strings.Repeat("m", 100)

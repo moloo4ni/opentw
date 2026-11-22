@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// Неверный BOT_TOKEN — фатальная ошибка конфигурации: бот обязан
-// завершиться, а не ретраить getUpdates вечно.
+// A wrong BOT_TOKEN is a fatal configuration error: the bot must exit,
+// not retry getUpdates forever.
 func TestRunFailsFastOnUnauthorized(t *testing.T) {
 	m := newMockTG(t)
 	m.handler = func(method string, body []byte) (any, int) {
@@ -32,7 +32,7 @@ func TestRunFailsFastOnUnauthorized(t *testing.T) {
 	}
 }
 
-// Прочие ошибки (например 502) — временные: polling продолжается.
+// Other errors (e.g. 502) are temporary: polling continues.
 func TestRunRetriesTransientErrors(t *testing.T) {
 	m := newMockTG(t)
 	var calls int
@@ -50,7 +50,7 @@ func TestRunRetriesTransientErrors(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
 
-	// за время жизни ctx должно быть больше одной попытки
+	// more than one attempt must happen within the ctx lifetime
 	select {
 	case err := <-done:
 		if err != nil {
@@ -64,8 +64,8 @@ func TestRunRetriesTransientErrors(t *testing.T) {
 	}
 }
 
-// D15: оффсет long polling персистентен — после рестарта подтверждённые
-// апдейты не доставляются повторно.
+// The long polling offset is persistent — after a restart confirmed
+// updates are not delivered again.
 func TestOffsetPersistedAcrossRestart(t *testing.T) {
 	m := newMockTG(t)
 	var first atomic.Bool

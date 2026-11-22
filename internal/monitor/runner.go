@@ -49,9 +49,10 @@ type RunnerCfg struct {
 	MaxTokens     int
 	Interval      time.Duration
 	Retention     time.Duration // checks older than this are deleted; default 7d
-	HeartbeatPath string        // НЕ пусто — mtime файла = свежесть мониторинга (HEALTHCHECK)
-	// OnCycle готовит события уведомлений цикла (чтения, без записи в БД):
-	// раннер фиксирует их атомарно с состояниями моделей через Store.ApplyCycle.
+	HeartbeatPath string        // non-empty: file mtime is the freshness signal for the HEALTHCHECK
+	// OnCycle prepares the cycle's notification events (reads only, no DB
+	// writes): the runner commits them atomically with model states via
+	// Store.ApplyCycle.
 	OnCycle func(CycleResult) ([]storage.OutboxEvent, error)
 	Logger  *slog.Logger
 }
@@ -60,16 +61,16 @@ type RunnerCfg struct {
 type Runner struct {
 	cfg     RunnerCfg
 	running chan struct{} // closed when idle; used as a single-flight token
-	lastOK  bool          // последний цикл дожил до конца (управляет стартовым heartbeat)
+	lastOK  bool          // the last cycle ran to completion (gates the startup heartbeat)
 	log     *slog.Logger
 
-	// allUnknownStreak — подряд идущие циклы без единого осмысленного
-	// вердикта (A01-5): живой монитор, мёртвый ключ. Операционный сигнал,
-	// семантику статусов и /status не меняет.
+	// allUnknownStreak counts consecutive cycles with zero definitive
+	// verdicts: a live monitor with a dead key. Operational signal only;
+	// it never changes status semantics or /status output.
 	allUnknownStreak int
 }
 
-// Store exposes the storage handle (для бота и тестов).
+// Store exposes the storage handle (for the bot and tests).
 func (r *Runner) Store() *storage.Store { return r.cfg.Store }
 
 // NewRunner builds a runner.
@@ -86,8 +87,8 @@ func NewRunner(cfg RunnerCfg) *Runner {
 
 // Run starts the first cycle immediately and then one at every interval
 // boundary of the clock (:00/:15/:30/:45 for 15m) until ctx is cancelled:
-// расписание не зависит от момента запуска. Errors never stop the loop: a
-// failed cycle is logged and retried on the next tick.
+// the schedule does not depend on the start moment. Errors never stop the
+// loop: a failed cycle is logged and retried on the next tick.
 func (r *Runner) Run(ctx context.Context) error {
 	r.log.Info("monitor: starting", "first_cycle", "immediate", "interval", r.cfg.Interval.String())
 	r.runOne(ctx)
@@ -99,14 +100,14 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		case <-timer.C:
 			r.runOne(ctx)
-			// затянувшийся за границу цикл: следующий тик — ближайшая
-			// незапущенная граница от текущего момента
+			// a cycle that overran its slot: the next tick is the nearest
+			// not-yet-run boundary from the current moment
 			timer.Reset(time.Until(NextTick(r.cfg.Interval, time.Now())))
 		}
 	}
 }
 
-// NextTick — ближайшая после from граница сетки интервала (15м → :00/:15/:30/:45).
+// NextTick is the first interval-grid boundary after from (15m → :00/:15/:30/:45).
 func NextTick(interval time.Duration, from time.Time) time.Time {
 	return from.Truncate(interval).Add(interval)
 }
@@ -128,12 +129,12 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 	}
 	defer func() { <-r.running }()
 
-	// Стартовый heartbeat — только если прошлый цикл был успешен: цикл с
-	// мёртвой базой проваливается мгновенно и не должен продлевать жизнь
-	// HEALTHCHECK (I1: красный статус должен наступать при отказах БД). Итог
-	// успешного цикла фиксируется ниже — вместе с heartbeat в его конце.
+	// Startup heartbeat only when the previous cycle succeeded: a cycle
+	// against a dead database fails instantly and must not keep the
+	// HEALTHCHECK alive. The successful outcome is recorded below, with the
+	// heartbeat at the cycle's end.
 	prevOK := r.lastOK
-	r.lastOK = false // любой исход, кроме успешного конца, оставит false
+	r.lastOK = false // anything but a successful completion leaves it false
 	if prevOK {
 		r.writeHeartbeat()
 	}
@@ -151,15 +152,16 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 			catalog[id] = true
 		}
 	}
-	// Сигнатура сбоя каталога — контрольный зонд «монитор сам не может проверить»:
-	// совпадающая ошибка у моделей превращает 🔴 в ⚪, а не в ложный вал событий.
+	// A catalog failure signature is the "the monitor itself cannot check"
+	// probe: a matching model error turns Down into Unknown instead of a
+	// false avalanche of events.
 	catIssue := catalogIssue(err)
 
 	prevStates := map[string]storage.Model{}
 	prevModels, err := r.cfg.Store.Models()
 	if err != nil {
-		// без предыдущих состояний переходы были бы о первом наблюдении —
-		// это переоткрыло бы инциденты и сломало события; прерываем цикл
+		// without previous states every change would look like a first
+		// sighting — reopening incidents and breaking events; abort the cycle
 		return nil, fmt.Errorf("read previous states: %w", err)
 	}
 	for _, m := range prevModels {
@@ -206,9 +208,9 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 		Checks:      checks,
 		Transitions: transitions,
 	}
-	// События готовит колбэк (чтения подписчиков, сериализация), записи —
-	// запрещены: единственная связь уже в руках раннера, и ApplyCycle
-	// фиксирует их вместе с состояниями единым коммитом.
+	// The callback prepares events (subscriber reads, serialization); DB
+	// writes are forbidden: the only link is already in the runner's hands,
+	// and ApplyCycle commits them together with the states in one commit.
 	var events []storage.OutboxEvent
 	if r.cfg.OnCycle != nil {
 		var err error
@@ -216,21 +218,21 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 			return nil, fmt.Errorf("prepare events: %w", err)
 		}
 	}
-	// Атомарный итог: либо новые состояния, события и инциденты вместе, либо
-	// ничего — рестарт/сбой посреди цикла не теряет события: следующий цикл
-	// увидит прежние состояния и переоткроет те же переходы (и те же
-	// инцидентные операции — они идемпотентны).
+	// Atomic outcome: new states, events and incidents all land together or
+	// nothing does — a restart/crash mid-cycle loses no events: the next
+	// cycle sees the previous states and reopens the same transitions (and
+	// the same idempotent incident operations).
 	if err := r.cfg.Store.ApplyCycle(res.Checks, events, incidents...); err != nil {
 		return nil, fmt.Errorf("commit cycle: %w", err)
 	}
-	// Очистка старых измерений и инцидентов — строго ПОСЛЕ коммита цикла:
-	// до коммита она могла удалить инцидент, прочитанный планровщиком →
-	// ApplyCycle падал бы («уже закрыт») и ломал фиксацию состояния цикла.
-	// Атомарность ApplyCycle не затрагивается: очистка — отдельные транзакции.
+	// Retention runs strictly AFTER the cycle commit: before it, cleanup
+	// could delete an incident the planner read → ApplyCycle would fail
+	// ("already closed") and break the cycle's state commit. ApplyCycle's
+	// atomicity is untouched: cleanup runs in separate transactions.
 	if _, err := r.cfg.Store.DeleteOldChecks(r.cfg.Retention); err != nil {
 		r.log.Error("monitor: retention cleanup failed", "err", err)
 	}
-	// инциденты флэппинг-моделей растут по ~48 строк/сутки: режем по 30 дням
+	// flapping models grow ~48 incident rows/day: cut at 30 days
 	if _, err := r.cfg.Store.DeleteOldIncidents(30 * 24 * time.Hour); err != nil {
 		r.log.Error("monitor: incident cleanup failed", "err", err)
 	}
@@ -240,8 +242,8 @@ func (r *Runner) RunCycle(ctx context.Context) (*CycleResult, error) {
 	return res, nil
 }
 
-// logCycle — единственная строка успешного цикла для оператора (I5): без неё
-// здоровая система «молчит», а деградация видна только постфактум.
+// logCycle emits the operator's single line per successful cycle: without
+// it a healthy system is silent and regressions surface only afterwards.
 func (r *Runner) logCycle(checks map[string]storage.Check, events []storage.OutboxEvent) {
 	var nOK, nDown, nUnknown int
 	for _, c := range checks {
@@ -262,9 +264,9 @@ func (r *Runner) logCycle(checks map[string]storage.Check, events []storage.Outb
 		"checked", len(checks), "ok", nOK, "down", nDown, "unknown", nUnknown,
 		"events", len(events), "outbox_pending", pending)
 
-	// A01-5: циклы успешны (heartbeat жив, контейнер healthy), но осмысленных
-	// вердиктов нет — проблемы ключа/шлюза выдают себя только этим сигналом.
-	// Статусы моделей остаются честными ⚪; ложных падений не создаём.
+	// Cycles succeed (heartbeat alive, container healthy) yet no definitive
+	// verdicts — a key/gateway problem betrays itself only through this
+	// signal. Model statuses stay honest Unknown; no fake falls are created.
 	if len(checks) > 0 && nOK+nDown == 0 {
 		r.allUnknownStreak++
 		if r.allUnknownStreak >= 2 {
@@ -276,7 +278,7 @@ func (r *Runner) logCycle(checks map[string]storage.Check, events []storage.Outb
 	}
 }
 
-// writeHeartbeat обновляет mtime файла живости (основа HEALTHCHECK).
+// writeHeartbeat touches the freshness file (the HEALTHCHECK basis).
 func (r *Runner) writeHeartbeat() {
 	if r.cfg.HeartbeatPath == "" {
 		return
@@ -291,8 +293,8 @@ func (r *Runner) writeHeartbeat() {
 // operation for the cycle's transaction (nil when nothing changes).
 func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[string]bool, catalogOK bool, catIssue string, prev storage.Model, now time.Time) (storage.Check, *Transition, *storage.IncidentOp, error) {
 	if catalogOK && !catalog[m.ID] {
-		// исчезла из каталога — проверяем всё равно: вердикт должен
-		// быть реальным ответом API, а не синтетической заглушкой
+		// gone from the catalog — probe anyway: the verdict must be a real
+		// API answer, not a synthetic stub
 		r.log.Warn("monitor: model missing from catalog, probing anyway", "model", m.ID)
 	}
 	raw := r.cfg.API.Generate(ctx, m.ID, r.cfg.MaxTokens)
@@ -302,9 +304,9 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 
 	st := Classify(*raw)
 	if catIssue != "" && matchesCatalogIssue(catIssue, raw) {
-		// Ошибка модели совпала с ошибкой каталога тем же транспортом/ключом:
-		// это проблема монитора, а не падение конкретной модели. Реальная ошибка
-		// сохраняется в check — детали видны в /status model-id.
+		// The model's error matches the catalog's error with the same
+		// transport/key: a monitor problem, not this model's fall. The real
+		// error is kept in the check — details are visible in /status model-id.
 		st = StatusUnknown
 	}
 	check := storage.Check{
@@ -320,31 +322,31 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 		OutputTokens: raw.OutputTokens,
 		ErrorType:    raw.ErrorKind,
 		ErrorMessage: raw.ErrorMessage,
-		// Оригинальный текст ответа модели/API — дословно; он же
-		// диагностический ответ в карточке модели.
+		// Verbatim model/API response text; also the diagnostic answer on the
+		// model card.
 		Response: raw.Response,
 	}
 	if st == StatusDown && raw.ErrorKind == "" {
-		// HTTP 200, но модель не ответила ожидаемым «OK»: краткий внутренний
-		// тип ошибки — «response»; дословный текст уже в Response, причина
-		// не выдумывается. Названию краткой ошибки место не в длинном тексте.
+		// HTTP 200 but the model did not answer the expected "OK": short
+		// internal error type "response"; the verbatim text is already in
+		// Response, the cause is not invented.
 		check.ErrorType = "response"
 		check.ErrorMessage = ""
 	}
 
 	if st == StatusDown && raw.HTTPStatus == 200 && raw.FinishReason != "" {
-		// finish_reason — диагностический факт терминального чанка, а не ответ
-		// модели и не новый ErrorKind. Существующее поле ErrorMessage позволяет
-		// сохранить его без миграции; содержательный текст провайдера не затирается.
+		// finish_reason is a diagnostic fact of the terminal chunk, not the
+		// model's answer and not a new ErrorKind. The existing ErrorMessage
+		// field carries it without a migration; provider text is not overwritten.
 		check.ErrorMessage = appendFinishReason(check.ErrorMessage, raw.FinishReason)
 	}
 
 	if err := r.cfg.Store.InsertCheck(check); err != nil {
 		return check, nil, nil, fmt.Errorf("insert check: %w", err)
 	}
-	// Состояние и инциденты НЕ пишутся здесь: их фиксирует ApplyCycle в конце
-	// цикла одним коммитом с событиями — иначе ранний рестарт/сбой
-	// БД терял бы события и оставлял мусорные инциденты.
+	// State and incidents are NOT written here: ApplyCycle commits them at
+	// the end of the cycle together with events — otherwise an early restart
+	// or DB failure would lose events and leave spurious incidents.
 	prevStatus := prev.LastStatus
 	op, closed, blindFall := r.planIncident(m.ID, prevStatus, st, check.At)
 
@@ -359,8 +361,9 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 			Incident: closed,
 		}
 	case prevStatus == StatusUnknown && st == StatusOperational && closed != nil:
-		// Восстановление из ⚪-периода (проблема монитора): инцидент закрылся —
-		// событие должно дойти, иначе подписчик никогда не узнает о восстановлении.
+		// Recovery from an Unknown period (a monitor problem): the incident
+		// closed — the event must reach subscribers, or they never learn about
+		// the recovery.
 		tr = &Transition{
 			ModelID:  m.ID,
 			From:     prevStatus,
@@ -369,10 +372,10 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 			Incident: closed,
 		}
 	case blindFall:
-		// Модель упала, пока монитор был слеп (⚪), и падение подтверждено
-		// реальным ответом API: событие обязательно — иначе подписчик узнает о
-		// сбое только по панели. Длительность инцидента неизвестна и не
-		// выдумывается: renderer честно помечает это через From=Unknown.
+		// The model fell while the monitor was blind and the fall is confirmed
+		// by a real API answer: the event is mandatory, or subscribers learn
+		// about the failure only from the panel. The incident's duration is
+		// unknown and not invented: the renderer marks it via From=Unknown.
 		tr = &Transition{
 			ModelID: m.ID,
 			From:    prevStatus,
@@ -383,8 +386,8 @@ func (r *Runner) checkModel(ctx context.Context, m storage.Model, catalog map[st
 	return check, tr, op, nil
 }
 
-// appendFinishReason сохраняет причину завершения генерации в существующей
-// диагностической строке. Это не классификация и не замена Response.
+// appendFinishReason stores the generation completion reason in the
+// existing diagnostic string. Not a classification, not a Response replacement.
 func appendFinishReason(message, reason string) string {
 	diag := "finish_reason=" + reason
 	if message == "" {
@@ -396,10 +399,11 @@ func appendFinishReason(message, reason string) string {
 	return message + "; " + diag
 }
 
-// planIncident решает изменения инцидентов модели на цикл: записи
-// выполняет только Store.ApplyCycle в общей транзакции цикла. Возвращает
-// операцию (nil — менять нечего), закрываемый инцидент (его длительность —
-// в событии) и признак падения, обнаруженного после слепого окна монитора.
+// planIncident decides one model's incident changes for a cycle; the
+// writes are performed only by Store.ApplyCycle in the cycle's shared
+// transaction. Returns the operation (nil — nothing to change), the closed
+// incident (its duration goes into the event) and the flag of a fall
+// detected after a blind window.
 // Rules:
 //   - Unknown check result changes nothing: an open incident stays open
 //     (the monitor cannot judge).
@@ -417,9 +421,9 @@ func (r *Runner) planIncident(modelID string, prev, cur status.Status, at time.T
 		return nil, nil, false
 	}
 	if prev == "" {
-		// Первое наблюдение: события нет, но неоперациональное состояние
-		// начинает отсчёт длительности инцидента. Дубликат не создаётся: op.Open
-		// идемпотентен (модель могла вернуться в конфиг с живым инцидентом).
+		// First sighting: no event, but a non-operational state starts the
+		// incident clock. No duplicate: op.Open is idempotent (the model may
+		// be back in the config with a live incident).
 		if cur == StatusOperational {
 			return nil, nil, false
 		}
@@ -435,19 +439,19 @@ func (r *Runner) planIncident(modelID string, prev, cur status.Status, at time.T
 			return nil, nil, false
 		}
 		if open != nil {
-			// слепое окно не меняет картину: открытый инцидент того же состояния
-			// (🔴→⚪→🔴) живёт с исходного события — без повторного
-			// события, без второго инцидента и без сброса длительности.
-			// Инцидент при этом мог открыться до ⚪; непрерывность
-			// длительности важнее лишнего события.
+			// The blind window changes nothing: an open incident of the same
+			// state (Down→Unknown→Down) lives on from the original fall — no
+			// repeated event, no second incident, no duration reset.
+			// Continuity of the duration beats a redundant event.
 			if open.From == cur || cur == StatusDown {
 				return nil, nil, false
 			}
-			// (с тремя статусами иных «улучшений» из ⚪ не существует: неоперациональное
-			// состояние только 🔴, и оно погашено выше; путь ниже — теоретический)
+			// With three statuses no other "improvements" from Unknown exist:
+			// the only non-operational state is Down and is handled above; the
+			// path below is theoretical.
 		} else {
-			// состояние возникло В слепое окно — инцидент с момента
-			// обнаружения (истинное начало неизвестно), событие обязательно.
+			// The state arose DURING the blind window — the incident starts at
+			// discovery (the true start is unknown), the event is mandatory.
 			return &storage.IncidentOp{ModelID: modelID, Open: true, OpenFrom: cur, OpenAt: at}, nil, true
 		}
 	}
@@ -478,8 +482,8 @@ func (r *Runner) planIncident(modelID string, prev, cur status.Status, at time.T
 
 var errCancelled = errors.New("check cancelled")
 
-// catalogIssue классифицирует сбой каталога по строке его ошибки
-// (ListModels форматирует HTTP-ошибки как «HTTP <код>», прочее — транспорт).
+// catalogIssue classifies a catalog failure from its error string
+// (ListModels formats HTTP errors as "HTTP <code>", the rest is transport).
 func catalogIssue(err error) string {
 	if err == nil {
 		return ""
@@ -491,17 +495,18 @@ func catalogIssue(err error) string {
 	case strings.Contains(msg, "HTTP 429"):
 		return "ratelimit"
 	case strings.Contains(msg, "HTTP "):
-		return "" // иной HTTP-сбой каталога: сам по себе ничего не доказывает
+		return "" // a different HTTP failure proves nothing by itself
 	case strings.Contains(msg, "invalid response"), strings.Contains(msg, "build request"):
-		// мусорный ответ каталога — тоже не доказательство проблемы моделей:
-		// гасить им реальные таймауты значило бы маскировать аварию
+		// A garbage catalog response proves no model problem either:
+		// masking real timeouts with it would hide an outage.
 		return ""
 	default:
 		return "transport"
 	}
 }
 
-// matchesCatalogIssue — сигнатура ошибки модели совпала с ошибкой каталога.
+// matchesCatalogIssue reports whether the model's error matches the
+// catalog failure signature.
 func matchesCatalogIssue(catIssue string, raw *api.RawResult) bool {
 	switch catIssue {
 	case "transport":

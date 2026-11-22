@@ -17,10 +17,10 @@ var (
 	errKicked       = "bot was kicked"
 )
 
-// chatUnavailable распознаёт ошибки Telegram, означающие, что бот больше
-// не может взаимодействовать с чатом: заблокирован, исключён из группы/канала,
-// чат удалён или пользователь деактивирован. Временные сбои (сеть, 429, 5xx,
-// 401 — проблема самого токена) сюда не попадают.
+// chatUnavailable recognizes Telegram errors meaning the bot can no longer
+// interact with the chat: blocked, kicked from a group/channel, chat deleted
+// or user deactivated. Temporary failures (network, 429, 5xx, 401 — the
+// token's own problem) do not match.
 func chatUnavailable(err error) bool {
 	var apiErr *ApiError
 	if !errors.As(err, &apiErr) {
@@ -41,7 +41,7 @@ func chatUnavailable(err error) bool {
 	return false
 }
 
-// panelText собирает текущий текст панели (порядок моделей — из конфига).
+// panelText builds the current panel text (model order follows the config).
 func (b *Bot) panelText(checks map[string]storage.Check) string {
 	models := b.models
 	updated := time.Now()
@@ -64,9 +64,9 @@ func (b *Bot) interval() time.Duration {
 	return 15 * time.Minute
 }
 
-// ensurePanel: /status из чата — всегда создаёт новую панель: новое
-// сообщение закрепляется, прежнее открепляется после успешного закрепления
-// нового, привязка обновляется только после успешной отправки.
+// ensurePanel: a chat's /status always creates a fresh panel: the new
+// message is pinned, the old one is unpinned after the new pin succeeds,
+// and the binding is updated only after a successful send.
 func (b *Bot) ensurePanel(ctx context.Context, chatID int64) error {
 	checks, err := b.store.LastChecks()
 	if err != nil {
@@ -100,8 +100,8 @@ func (b *Bot) postPanel(ctx context.Context, chatID int64, checks map[string]sto
 			}
 		}
 	case pinErr != nil && old != nil:
-		// прежнее закрепление не трогали — оно остаётся в силе; попытка
-		// восстановить его на случай, если Telegram его уже сбросил
+		// the old pin was not touched — it stays in force; try to restore it
+		// in case Telegram already dropped it
 		if err := b.api.PinChatMessage(ctx, chatID, old.MessageID); err != nil {
 			b.log.Info("panel: old re-pin failed", "chat", chatID, "err", err)
 		}
@@ -149,10 +149,11 @@ func (b *Bot) cachedPanel(chatID int64) string {
 	return b.lastText[chatID]
 }
 
-// OnCycle вызывается монитором в конце цикла: готовит события уведомлений
-// (без записи в БД — коммитит их раннер атомарно с состояниями), панели
-// помечаются грязными — доставкой занимается воркер (network-free).
-// Ошибка = события недоступны → цикл не фиксируется целиком.
+// OnCycle is called by the monitor at the end of a cycle: it prepares the
+// notification events (no DB writes — the runner commits them atomically
+// with the states) and flags the panels dirty — the delivery worker (network
+// calls) handles them. An error means events are unavailable → the whole
+// cycle is not committed.
 func (b *Bot) OnCycle(_ context.Context, res monitor.CycleResult) ([]storage.OutboxEvent, error) {
 	events, err := b.prepareTransitions(res)
 	if err != nil {
@@ -165,11 +166,11 @@ func (b *Bot) OnCycle(_ context.Context, res monitor.CycleResult) ([]storage.Out
 	return events, nil
 }
 
-// syncPanel редактирует закреплённую панель чата; при удалении сообщения —
-// создаёт новую панель.
+// syncPanel edits the chat's pinned panel; when the message is gone it
+// creates a fresh panel.
 func (b *Bot) syncPanel(ctx context.Context, chatID int64, text string) {
 	if b.cachedPanel(chatID) == text {
-		return // текст не изменился — лишнее редактирование не нужно
+		return // text unchanged — no needless edit
 	}
 	sm, err := b.store.StatusMessage(chatID)
 	if err != nil || sm == nil {
@@ -188,14 +189,14 @@ func (b *Bot) syncPanel(ctx context.Context, chatID int64, text string) {
 			b.cachePanel(chatID, text)
 			return
 		case apiErr.Code == 400 && (strings.Contains(desc, errEditNotFound) || strings.Contains(desc, "message to delete not found")):
-			// панель удалена: пересоздаём и закрепляем
+			// panel deleted: recreate and pin
 			b.log.Info("panel: deleted, recreating", "chat", chatID)
 			if postErr := b.postPanelCycle(ctx, chatID, text); postErr != nil {
 				b.log.Error("panel: recreate failed", "chat", chatID, "err", postErr)
 			}
 			return
 		case chatUnavailable(err):
-			// бот удалён из чата — забываем привязку, чтобы не спамить
+			// the bot was removed from the chat — forget the binding to avoid noise
 			if delErr := b.store.DeleteStatusMessage(chatID); delErr != nil {
 				b.log.Error("panel: drop binding failed", "chat", chatID, "err", delErr)
 			}
@@ -205,7 +206,7 @@ func (b *Bot) syncPanel(ctx context.Context, chatID int64, text string) {
 	b.log.Error("panel: edit failed", "chat", chatID, "err", err)
 }
 
-// postPanelCycle пересоздаёт панель во время цикла (сообщение удалено).
+// postPanelCycle recreates the panel during a cycle (message deleted).
 func (b *Bot) postPanelCycle(ctx context.Context, chatID int64, text string) error {
 	msg, err := b.api.SendRichMessage(ctx, chatID, text)
 	if err != nil {

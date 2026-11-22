@@ -41,8 +41,8 @@ func TestOpenIdempotent(t *testing.T) {
 	s2.Close()
 }
 
-// Свежая (несуществующая) база создаётся целиком из schema.sql: все таблицы,
-// индексы и колонки, которые реально читает код, плюс маркер user_version.
+// A fresh (nonexistent) database is created in full from schema.sql: every
+// table, index and column the code really reads, plus the user_version marker.
 func TestOpenCreatesFreshSchema(t *testing.T) {
 	s := openTest(t)
 	tables, indexes := map[string]bool{}, map[string]bool{}
@@ -114,9 +114,9 @@ func TestOpenCreatesFreshSchema(t *testing.T) {
 	}
 }
 
-// База от старой версии OpenTW (таблицы исторических миграций без маркера
-// актуальной схемы) блокирует запуск понятной ошибкой: никакой тихой
-// конверсии и никакого удаления данных.
+// A database from an old OpenTW version (historical migration tables without
+// the current schema marker) blocks startup with a clear error: no silent
+// conversion and no data deletion.
 func TestOpenRejectsLegacyDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	raw, err := sql.Open("sqlite", "file:"+path)
@@ -141,7 +141,7 @@ func TestOpenRejectsLegacyDatabase(t *testing.T) {
 	if !strings.Contains(err.Error(), "not compatible") || !strings.Contains(err.Error(), "clean database") {
 		t.Fatalf("rejection must explain the fix: %v", err)
 	}
-	// база не тронута: данные и отсутствие маркера — как были
+	// the database is untouched: the data and the missing marker stay as they were
 	raw2, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
@@ -157,12 +157,12 @@ func TestOpenRejectsLegacyDatabase(t *testing.T) {
 	}
 }
 
-// Реальная копия продовой базы (opentw-backup-final.db): отвергается той же
-// понятной ошибкой — миграция исторических данных не выполняется по дизайну.
+// A real copy of the production database (opentw-backup-final.db): rejected
+// with the same clear error — migrating historical data is not done by design.
 func TestOpenRejectsRealSnapshot(t *testing.T) {
 	src := filepath.Join("..", "..", "opentw-backup-final.db")
 	if _, err := os.Stat(src); err != nil {
-		t.Skip("opentw-backup-final.db отсутствует")
+		t.Skip("opentw-backup-final.db is absent")
 	}
 	dst := filepath.Join(t.TempDir(), "backup.db")
 	in, err := os.Open(src)
@@ -222,9 +222,9 @@ func TestSyncModels(t *testing.T) {
 	}
 }
 
-// Модель ушла из конфигурации: вместе со строкой состояния и подписками
-// уходит и уведомлённое состояние чатов — возвратившаяся модель не глухнет
-// к первому повторному инциденту по stale chat_notified.
+// A model left the configuration: its state row, subscriptions and the
+// chats' notified states all go together — a returning model must not stay
+// deaf to its first repeated incident via a stale chat_notified.
 func TestSyncModelsDropsNotifiedStateOfRemovedModels(t *testing.T) {
 	s := openTest(t)
 	if err := s.SyncModels([]Model{{ID: "a", Family: "A"}, {ID: "gone", Family: "G"}}); err != nil {
@@ -487,8 +487,8 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	}
 }
 
-// BackupTo: согласованный снапшот живой WAL-базы (маркер схемы сохраняется),
-// повтор в тот же файл — ошибка.
+// BackupTo: a consistent snapshot of a live WAL database (the schema marker
+// is preserved); a repeat into the same file is an error.
 func TestBackupTo(t *testing.T) {
 	s := openTest(t)
 	if err := s.SyncModels([]Model{{ID: "glm-5.3", Family: "GLM"}}); err != nil {
@@ -502,7 +502,7 @@ func TestBackupTo(t *testing.T) {
 	if err := s.BackupTo(dst); err != nil {
 		t.Fatal(err)
 	}
-	// снимок открыт и валиден независимо от исходной базы
+	// the snapshot opens and is valid independently of the source database
 	s2, err := Open(dst)
 	if err != nil {
 		t.Fatalf("open snapshot: %v", err)

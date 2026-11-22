@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const maxRetries = 2 // 429: до 2 повторных попыток с retry_after, всего до 3 запросов
+const maxRetries = 2 // 429: up to 2 retries with retry_after, at most 3 requests total
 
 // ApiError is a Bot API level error (ok:false).
 type ApiError struct {
@@ -31,10 +31,10 @@ func asApiError(err error, target **ApiError) bool {
 	return errors.As(err, target)
 }
 
-// redactTransportError снимает *url.Error: его текст содержит URL метода
-// вместе с BOT_TOKEN. Причина сбоя (ue.Err — dial/timeout/отмена) сохраняется
-// для диагностики, распознавание ApiError/429 не затрагивается — они приходят
-// из тела ответа, а не из транспорта.
+// redactTransportError unwraps *url.Error: its text contains the method URL
+// with the BOT_TOKEN. The failure cause (ue.Err — dial/timeout/cancel) is
+// kept for diagnostics; ApiError/429 recognition is unaffected — those come
+// from the response body, not the transport.
 func redactTransportError(err error) error {
 	var ue *url.Error
 	if !errors.As(err, &ue) {
@@ -43,7 +43,7 @@ func redactTransportError(err error) error {
 	if ue.Err != nil {
 		return ue.Err
 	}
-	return errors.New(ue.Op + " request failed") // url.Error без причины URL не раскрывает
+	return errors.New(ue.Op + " request failed") // a url.Error without a cause reveals no URL
 }
 
 // Client talks to the Bot API; BaseURL is injectable for tests.
@@ -188,7 +188,7 @@ func (c *Client) SendRichMessage(ctx context.Context, chatID int64, html string)
 }
 
 // EditRichMessageText replaces the content of a message via rich_message
-// (no parse_mode: rich-разметка редактирования панели).
+// (no parse_mode: the panel edit uses rich markup).
 func (c *Client) EditRichMessageText(ctx context.Context, chatID, messageID int64, html string) error {
 	payload := map[string]any{
 		"chat_id":    chatID,
@@ -211,8 +211,8 @@ func (c *Client) UnpinChatMessage(ctx context.Context, chatID, messageID int64) 
 	return c.call(ctx, "unpinChatMessage", map[string]any{"chat_id": chatID, "message_id": messageID}, nil)
 }
 
-// DeleteMessage deletes a message (в личных чатах и группах бот может
-// удалять свои сообщения; в каналах нужно право администратора).
+// DeleteMessage deletes a message (in private chats and groups the bot may
+// delete its own messages; in channels it needs the admin right).
 func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) error {
 	return c.call(ctx, "deleteMessage", map[string]any{"chat_id": chatID, "message_id": messageID}, nil)
 }

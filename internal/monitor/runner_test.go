@@ -63,8 +63,8 @@ func (f *fakeAPI) usedMaxTokens() int {
 
 func ptrLat(v int64) *int64 { return &v }
 
-// okResult — успешная проверка: итоговый ответ ровно «OK» (Content/Response,
-// как их заполняет api.Client).
+// okResult — a successful check: the final answer is exactly "OK"
+// (Content/Response as api.Client fills them).
 func okResult(id string, latUS int64, tps float64) *api.RawResult {
 	return &api.RawResult{
 		ModelID: id, Timestamp: time.Now(), ErrorKind: "", HTTPStatus: 200,
@@ -75,7 +75,7 @@ func okResult(id string, latUS int64, tps float64) *api.RawResult {
 	}
 }
 
-// errResult — HTTP-ошибка провайдера: Response дословно несёт его текст.
+// errResult — the provider's HTTP error: Response carries its text verbatim.
 func errResult(id string, status int, msg string) *api.RawResult {
 	return &api.RawResult{ModelID: id, Timestamp: time.Now(), ErrorKind: "http", HTTPStatus: status, ErrorMessage: msg, Response: msg, LatencyUS: 40_000}
 }
@@ -106,17 +106,17 @@ func newRunner(t *testing.T, f *fakeAPI, models []storage.Model) (*Runner, *[]Cy
 	return r, results
 }
 
-// Расписание циклов привязано к границам интервала, а не к моменту
-// старта: при 15м проверки идут в :00/:15/:30/:45 независимо от того,
-// когда процесс запущен.
+// The cycle schedule is bound to interval-grid boundaries, not to the start
+// moment: at 15m checks run at :00/:15/:30/:45 regardless of when the
+// process started.
 func TestNextTickAligned(t *testing.T) {
 	m := func(h, min, s int) time.Time { return time.Date(2026, 11, 16, h, min, s, 0, time.UTC) }
 	for _, tc := range []struct {
 		from, want time.Time
 	}{
-		{m(13, 52, 6), m(14, 0, 0)},   // старт между границами → ближайшая
-		{m(14, 0, 0), m(14, 15, 0)},   // ровно на границе → следующая
-		{m(14, 14, 59), m(14, 15, 0)}, // за секунду до границы
+		{m(13, 52, 6), m(14, 0, 0)},   // start between boundaries → nearest one
+		{m(14, 0, 0), m(14, 15, 0)},   // exactly on a boundary → next one
+		{m(14, 14, 59), m(14, 15, 0)}, // a second before the boundary
 	} {
 		if got := NextTick(15*time.Minute, tc.from); !got.Equal(tc.want) {
 			t.Fatalf("NextTick(15m, %s) = %s, want %s", tc.from, got, tc.want)
@@ -127,8 +127,8 @@ func TestNextTickAligned(t *testing.T) {
 	}
 }
 
-// Ошибка чтения предыдущих состояний прерывает цикл: без них корректная
-// классификация переходов невозможна (иначе откроются дубли инцидентов).
+// A previous-states read failure aborts the cycle: without them a correct
+// transition classification is impossible (duplicate incidents would open).
 func TestCycleAbortsWhenStatesUnreadable(t *testing.T) {
 	f := newFakeAPI([]string{"model-a", "model-b"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -136,7 +136,7 @@ func TestCycleAbortsWhenStatesUnreadable(t *testing.T) {
 	if _, err := r.RunCycle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	r.Store().Close() // следующие операции с хранилищем обязаны ошибаться
+	r.Store().Close() // further storage operations must fail
 	_, err := r.RunCycle(context.Background())
 	if err == nil {
 		t.Fatal("cycle must abort when previous states are unreadable")
@@ -153,7 +153,7 @@ func basicModels() []storage.Model {
 	}
 }
 
-// Настроенный лимит доходит до каждой реальной генерации без per-model исключений.
+// The configured limit reaches every real generation without per-model exceptions.
 func TestRunnerUsesConfiguredMaxTokens(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -198,8 +198,8 @@ func TestFirstCycleBaselineNoEvents(t *testing.T) {
 	if len(last) != 2 || last["model-b"].HTTPStatus != 503 {
 		t.Fatalf("checks = %+v", last)
 	}
-	// D2-сценарий B: первое наблюдение Down — базлайн без уведомления,
-	// но инцидент (учёт длительности) открывается.
+	// Blind-window case B: the first sighting of Down is the baseline without
+	// a notification, but the incident (duration accounting) opens.
 	if open, _ := r.Store().HasOpenIncident("model-b"); !open {
 		t.Fatal("first-sight Down must still open an incident (baseline accounting)")
 	}
@@ -269,8 +269,8 @@ func TestSameStatusNoRepeatEvents(t *testing.T) {
 	}
 }
 
-// HTTP 200 с «иностранным» текстом вместо OK: Down, error_type 'response',
-// Response — дословный текст, ErrorMessage пуст.
+// HTTP 200 with a foreign text instead of OK: Down, error_type "response",
+// Response is the verbatim text, ErrorMessage empty.
 func TestForeignTextDownVerbatimResponse(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	foreign := "抱歉，无法处理该请求。"
@@ -306,8 +306,9 @@ func TestForeignTextDownVerbatimResponse(t *testing.T) {
 	}
 }
 
-// Строка проверки переносит дословный Response и краткий ErrorType из
-// RawResult: текст провайдера у http-ошибки, пустой Response у транспортной.
+// The check row carries the verbatim Response and the short ErrorType from
+// RawResult: the provider's text on an http error, an empty Response on a
+// transport failure.
 func TestCheckRowCarriesResponseAndErrorType(t *testing.T) {
 	f := newFakeAPI([]string{"model-a", "model-b", "model-c"})
 	f.hook = func(id string) *api.RawResult {
@@ -337,8 +338,9 @@ func TestCheckRowCarriesResponseAndErrorType(t *testing.T) {
 	}
 }
 
-// Пустой итоговый ответ с finish_reason=length остаётся Down, но причина
-// завершения сохраняется через существующее диагностическое поле без миграции.
+// An empty final answer with finish_reason=length stays Down, but the
+// completion reason is preserved via the existing diagnostic field, without
+// a migration.
 func TestEmptyResponseFinishReasonPersisted(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult {
@@ -371,7 +373,7 @@ func TestEmptyResponseFinishReasonPersisted(t *testing.T) {
 	}
 }
 
-// Провайдерское сообщение нельзя затирать диагностикой завершения.
+// A provider message must not be overwritten with the completion diagnostic.
 func TestEmptyResponseFinishReasonPreservesProviderMessage(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult {
@@ -399,8 +401,8 @@ func basicModelsPlusC() []storage.Model {
 	return append(basicModels(), storage.Model{ID: "model-c", Family: "C"})
 }
 
-// Очень высокая latency при ответе OK — Operational: никакой
-// «деградации по производительности» больше не существует.
+// A very high latency with an OK answer is Operational: no
+// "performance degradation" exists anymore.
 func TestHighLatencyOKStaysOperational(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 120_000_000, 1) }
@@ -419,7 +421,7 @@ func TestHighLatencyOKStaysOperational(t *testing.T) {
 }
 
 func TestCatalogAbsenceStillChecks(t *testing.T) {
-	f := newFakeAPI([]string{"model-a"}) // model-b отсутствует в каталоге
+	f := newFakeAPI([]string{"model-a"}) // model-b is absent from the catalog
 	f.hook = func(id string) *api.RawResult {
 		if id == "model-b" {
 			return errResult(id, 404, "Invalid model.")
@@ -468,7 +470,7 @@ func TestUnknownStatusNoEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
-	res2, err := r.RunCycle(context.Background()) // операционная ошибка монитора → Unknown
+	res2, err := r.RunCycle(context.Background()) // a monitor-side failure → Unknown
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,8 +536,8 @@ func TestSingleFlight(t *testing.T) {
 	}
 }
 
-// Сбой транспорта при каталоге + транспортные же ошибки моделей → у всех
-// ⚪ Unknown («монитор не может проверить»), а не 27 ложных «модель упала».
+// A transport failure on the catalog + transport errors on the models → all
+// ⚪ Unknown ("the monitor cannot check"), not 27 false "model down".
 func TestCatalogTransportMarksUnknown(t *testing.T) {
 	f := newFakeAPI(nil)
 	f.catErr = errors.New("api: models: dial tcp: connection refused")
@@ -563,12 +565,13 @@ func TestCatalogTransportMarksUnknown(t *testing.T) {
 	_ = res0
 }
 
-// Каталог в 429 (лимит ключа монитора) + модели в 429 → у моделей ⚪.
+// A 429 catalog (the monitor's own key limit) + models in 429 → Unknown for
+// the models.
 func TestCatalogRatelimitMarksUnknown(t *testing.T) {
 	f := newFakeAPI(nil)
 	f.catErr = errors.New("api: models: HTTP 429: Too Many Requests")
 	f.hook = func(id string) *api.RawResult {
-		if id == "model-b" { // модель с другой ошибкой остаётся при своём статусе
+		if id == "model-b" { // a model with a different error keeps its own status
 			return errResult(id, 500, "boom")
 		}
 		return errResult(id, 429, "Too Many Requests")
@@ -587,7 +590,8 @@ func TestCatalogRatelimitMarksUnknown(t *testing.T) {
 	}
 }
 
-// Живой каталог: транспортные ошибки моделей — честные 🔴 (не «проблема монитора»).
+// A live catalog: the models' transport errors are honest Down (not
+// "monitor problem").
 func TestCatalogOKStillDown(t *testing.T) {
 	f := newFakeAPI([]string{"model-a", "model-b"})
 	f.hook = func(id string) *api.RawResult {
@@ -603,17 +607,18 @@ func TestCatalogOKStillDown(t *testing.T) {
 	}
 }
 
-// Тихое восстановление из Unknown устранено: после ⚪-периода (сбитый ключ)
-// восстановление модели доходит подписчикам, длительность инцидента честная.
+// Silent recovery from Unknown is gone: after an Unknown period (a broken
+// key) the model's recovery reaches subscribers, the incident duration is
+// honest.
 func TestRecoveryFromUnknownEmitsEvent(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
 	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
-	if _, err := r.RunCycle(context.Background()); err != nil { // первое наблюдение Down
+	if _, err := r.RunCycle(context.Background()); err != nil { // first sighting of Down
 		t.Fatal(err)
 	}
 	f.hook = func(id string) *api.RawResult { return errResult(id, 500, "keep down") }
-	if _, err := r.RunCycle(context.Background()); err != nil { // 503 → 500: Down→Down, но инцидент уже открыт после 503
+	if _, err := r.RunCycle(context.Background()); err != nil { // 503 → 500: Down→Down, the incident already opened at 503
 		t.Fatal(err)
 	}
 	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
@@ -644,7 +649,7 @@ func TestRecoveryFromUnknownEmitsEvent(t *testing.T) {
 	}
 }
 
-// Кратковременный ⚪ без открытого инцидента (была 🟢) → восстановления-события нет.
+// A short ⚪ blip without an open incident (previously 🟢) → no recovery event.
 func TestUnknownBlipAfterOperationalNoEvent(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -666,7 +671,7 @@ func TestUnknownBlipAfterOperationalNoEvent(t *testing.T) {
 	}
 }
 
-// Перезапуск во время инцидента: постоянный Down не эмитит повторных событий.
+// A restart during an incident: a persistent Down emits no repeated events.
 func TestRestartWhileDownNoFalseTransitions(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := dir + "/test.db"
@@ -700,7 +705,7 @@ func TestRestartWhileDownNoFalseTransitions(t *testing.T) {
 	}
 }
 
-// Цикл вычищает инциденты старше retention (D7).
+// The cycle cleans up incidents older than retention.
 func TestIncidentRetentionInCycle(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -722,7 +727,7 @@ func TestIncidentRetentionInCycle(t *testing.T) {
 	}
 }
 
-// D9: heartbeat-файл обновляется в конце каждого цикла (основа HEALTHCHECK).
+// The heartbeat file is updated at the end of every cycle (the HEALTHCHECK basis).
 func TestHeartbeatFileWritten(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -754,8 +759,8 @@ func TestHeartbeatFileWritten(t *testing.T) {
 	}
 }
 
-// Мусорный ответ каталога — не транспортный сбой: совпадающих с ним
-// ошибок моделей он не «гасит» (Rev-1).
+// A garbage catalog response is not a transport failure: it must not mask
+// matching model errors.
 func TestCatalogInvalidJSONNotTransport(t *testing.T) {
 	f := newFakeAPI(nil)
 	f.catErr = errors.New("api: models: invalid response: bad json")
@@ -772,8 +777,8 @@ func TestCatalogInvalidJSONNotTransport(t *testing.T) {
 	}
 }
 
-// Unknown→Down не перезапускает инцидент: длительность считается от
-// исходного падения, а не от «прозрения» монитора (Rev-5).
+// Unknown→Down does not restart the incident: the duration counts from the
+// original fall, not from the monitor "regaining sight".
 func TestUnknownToDownKeepsOriginalIncident(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
@@ -783,16 +788,16 @@ func TestUnknownToDownKeepsOriginalIncident(t *testing.T) {
 	}
 	time.Sleep(10 * time.Millisecond)
 	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
-	if _, err := r.RunCycle(context.Background()); err != nil { // ⚪ (инцидент остаётся открытым)
+	if _, err := r.RunCycle(context.Background()); err != nil { // ⚪ (the incident stays open)
 		t.Fatal(err)
 	}
 	time.Sleep(10 * time.Millisecond)
 	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
-	if _, err := r.RunCycle(context.Background()); err != nil { // снова Down
+	if _, err := r.RunCycle(context.Background()); err != nil { // Down again
 		t.Fatal(err)
 	}
-	// D2-сценарий C: старый инцидент не дублируется и остаётся открытым —
-	// длительность считается от исходного падения, не от «прозрения».
+	// Blind-window case C: the old incident is not duplicated and stays open —
+	// the duration counts from the original fall, not from "regaining sight".
 	if open, _ := r.Store().HasOpenIncident("model-a"); !open {
 		t.Fatal("original incident must stay open through the blind period")
 	}
@@ -811,9 +816,9 @@ func TestUnknownToDownKeepsOriginalIncident(t *testing.T) {
 	}
 }
 
-// P0-1: сбой подготовки событий (подписки недоступны) не должен фиксировать
-// состояния — иначе события цикла терялись бы навсегда (следующий цикл видел
-// prev == cur). Следующий цикл обязан переоткрыть переход.
+// An event-preparation failure (subscribers unavailable) must not commit
+// states — otherwise the cycle's events would be lost forever (the next
+// cycle would see prev == cur). The next cycle must reopen the transition.
 func TestOnCycleErrorKeepsState(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -838,11 +843,11 @@ func TestOnCycleErrorKeepsState(t *testing.T) {
 		},
 	})
 
-	// базлайн: модель работает
+	// baseline: the model works
 	if _, err := r.RunCycle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// модель падает, но фиксация невозможна
+	// the model falls, but committing is impossible
 	fail = true
 	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "boom") }
 	if _, err := r.RunCycle(context.Background()); err == nil {
@@ -855,7 +860,7 @@ func TestOnCycleErrorKeepsState(t *testing.T) {
 	if m.LastStatus != StatusOperational {
 		t.Fatalf("failed cycle must not commit state, got %q", m.LastStatus)
 	}
-	// доставка восстановилась: следующий цикл обязан переоткрыть переход
+	// delivery recovered: the next cycle must reopen the transition
 	fail = false
 	res, err := r.RunCycle(context.Background())
 	if err != nil {
@@ -873,8 +878,8 @@ func TestOnCycleErrorKeepsState(t *testing.T) {
 	}
 }
 
-// I1: проваленный цикл (мёртвая база) не освежает heartbeat — HEALTHCHECK
-// обязан краснеть, а не показывать вечно живой монитор.
+// A failed cycle (dead database) does not refresh the heartbeat — the
+// HEALTHCHECK must go red instead of showing an eternally live monitor.
 func TestHeartbeatNotRefreshedByFailedCycle(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult("model-a", 1_000_000, 40) }
@@ -900,9 +905,10 @@ func TestHeartbeatNotRefreshedByFailedCycle(t *testing.T) {
 	}
 	fresh := st.ModTime()
 
-	// база умерла: чтение предыдущих состояний проваливается. Первый
-	// проваленный цикл ещё имел право на стартовый heartbeat (прошый цикл
-	// был успешен, монитор был жив на старте), второй подряд — уже нет.
+	// The database is dead: reading previous states fails. The first failed
+	// cycle still had a right to the startup heartbeat (the previous cycle
+	// succeeded, the monitor was alive at start), a second consecutive one
+	// does not.
 	s.Close()
 	if _, err := r.RunCycle(context.Background()); err == nil {
 		t.Fatal("cycle must fail with closed store")
@@ -927,10 +933,10 @@ func TestHeartbeatNotRefreshedByFailedCycle(t *testing.T) {
 	}
 }
 
-// Рестарт посреди цикла (P0-1): состояния, зафиксированные до рестарта,
-// не опережают события — применяются одним коммитом в конце цикла.
-// Проверяем через OnCycle: события, подготовленные вместе с состояниями,
-// оказываются в outbox тем же коммитом.
+// A restart mid-cycle: states committed before the restart do not outrun
+// the events — they are applied by one commit at the end of the cycle.
+// Verified through OnCycle: events prepared together with the states land
+// in the outbox by the same commit.
 func TestCycleCommitsStateAndEventsTogether(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -957,11 +963,11 @@ func TestCycleCommitsStateAndEventsTogether(t *testing.T) {
 			return evs, nil
 		},
 	})
-	// первый цикл: без переходов
+	// the first cycle: no transitions
 	if _, err := r.RunCycle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// модель падает — событие готовится и фиксируется коммитом цикла
+	// the model falls — the event is prepared and committed by the cycle's commit
 	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "boom") }
 	if _, err := r.RunCycle(context.Background()); err != nil {
 		t.Fatal(err)
@@ -979,19 +985,20 @@ func TestCycleCommitsStateAndEventsTogether(t *testing.T) {
 	}
 }
 
-// D2-сценарий A: модель была 🟢, монитор временно ослеп (401 → ⚪), за это
-// время модель реально упала, зрение вернулось и API подтверждает 🔴.
-// Падение обязано дойти подписчику событием, инцидент — открыться; время
-// начала недоступности неизвестно и длительность не выдумывается.
+// Blind-window case A: the model was 🟢, the monitor went temporarily blind
+// (401 → ⚪), the model really fell during it, sight returned and the API
+// confirms Down. The fall must reach the subscriber as an event, the
+// incident must open; the unavailability start time is unknown and the
+// duration is not fabricated.
 func TestFallDuringBlindnessNotified(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
 	r, _ := newRunner(t, f, []storage.Model{{ID: "model-a", Family: "A"}})
-	if _, err := r.RunCycle(context.Background()); err != nil { // 🟢 базлайн
+	if _, err := r.RunCycle(context.Background()); err != nil { // 🟢 baseline
 		t.Fatal(err)
 	}
 	f.hook = func(id string) *api.RawResult { return errResult(id, 401, "Invalid API key") }
-	res, err := r.RunCycle(context.Background()) // ⚪ слепота монитора
+	res, err := r.RunCycle(context.Background()) // ⚪ the monitor is blind
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1003,7 +1010,7 @@ func TestFallDuringBlindnessNotified(t *testing.T) {
 		t.Fatalf("status after 401 = %q", m.LastStatus)
 	}
 	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
-	res, err = r.RunCycle(context.Background()) // зрение вернулось: подтверждённое падение
+	res, err = r.RunCycle(context.Background()) // sight returned: a confirmed fall
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1028,8 +1035,8 @@ func TestFallDuringBlindnessNotified(t *testing.T) {
 	if last["model-a"].ErrorMessage != "Service Unavailable" {
 		t.Fatalf("provider message lost: %+v", last["model-a"])
 	}
-	// D2-сценарий D: восстановление приходит с честной длительностью —
-	// от момента обнаружения падения (не выдуманной).
+	// Blind-window case D: the recovery carries an honest duration — from
+	// the moment the fall was discovered (not fabricated).
 	time.Sleep(10 * time.Millisecond)
 	f.hook = func(id string) *api.RawResult { return okResult(id, 900_000, 55) }
 	res, err = r.RunCycle(context.Background())
@@ -1051,9 +1058,10 @@ func TestFallDuringBlindnessNotified(t *testing.T) {
 	}
 }
 
-// D3: инциденты применяются только вместе с коммитом цикла. Сбой подготовки
-// событий после планирования не оставляет ни открытого инцидента, ни дублей
-// после успешного повтора; восстановление закрывает ровно один инцидент.
+// Incidents are applied only together with the cycle's commit. An
+// event-preparation failure after planning leaves neither an open incident
+// nor duplicates after a successful retry; the recovery closes exactly one
+// incident.
 func TestIncidentsAtomicWithCycleCommit(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
@@ -1076,7 +1084,7 @@ func TestIncidentsAtomicWithCycleCommit(t *testing.T) {
 			return nil, nil
 		},
 	})
-	// цикл спланировал инцидент, но провалился до коммита: ничего не записано
+	// the cycle planned the incident but failed before the commit: nothing is recorded
 	fail = true
 	if _, err := r.RunCycle(context.Background()); err == nil {
 		t.Fatal("cycle must fail when events cannot be prepared")
@@ -1088,7 +1096,7 @@ func TestIncidentsAtomicWithCycleCommit(t *testing.T) {
 	if m.LastStatus != "" {
 		t.Fatalf("failed cycle must not commit state, got %q", m.LastStatus)
 	}
-	// успешный повтор открывает инцидент ровно один раз
+	// a successful retry opens the incident exactly once
 	fail = false
 	if _, err := r.RunCycle(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1096,8 +1104,8 @@ func TestIncidentsAtomicWithCycleCommit(t *testing.T) {
 	if open, _ := s.HasOpenIncident("model-a"); !open {
 		t.Fatal("successful cycle must open the incident")
 	}
-	// восстановление закрывает его; при дубликатах открытым остался бы
-	// старый (закрывается только новейший) — длительность не теряется
+	// the recovery closes it; with duplicates the old one would stay open
+	// (only the newest is closed) — the duration would be lost
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
 	res, err := r.RunCycle(context.Background())
 	if err != nil {
@@ -1114,14 +1122,14 @@ func TestIncidentsAtomicWithCycleCommit(t *testing.T) {
 	}
 }
 
-// Классификация offline-заявлений провайдера: живой ответ kimi-k2.6
-// «The model kimi-k2.6 has been offline» (HTTP 400) — это 🔴, а не ⚪:
-// событие подписчикам, инцидент, дословно сохранённая причина.
+// Classification of provider offline statements: the live kimi-k2.6 reply
+// "The model kimi-k2.6 has been offline" (HTTP 400) is Down, not Unknown:
+// an event to subscribers, an incident, the verbatim reason.
 func TestProviderOfflineMessageIsDown(t *testing.T) {
 	f := newFakeAPI([]string{"kimi-k2.6"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
 	r, _ := newRunner(t, f, []storage.Model{{ID: "kimi-k2.6", Family: "KIMI"}})
-	if _, err := r.RunCycle(context.Background()); err != nil { // 🟢 базлайн
+	if _, err := r.RunCycle(context.Background()); err != nil { // 🟢 baseline
 		t.Fatal(err)
 	}
 	f.hook = func(id string) *api.RawResult {
@@ -1147,9 +1155,9 @@ func TestProviderOfflineMessageIsDown(t *testing.T) {
 	}
 }
 
-// --- Этап 2: главный цикл Runner.Run ---
+// --- Stage: the Runner.Run main loop ---
 
-// newRunnerAt создаёт раннер с настраиваемым интервалом и OnCycle (для тестов Run).
+// newRunnerAt creates a runner with a configurable interval and OnCycle (for Run tests).
 func newRunnerAt(t *testing.T, f *fakeAPI, models []storage.Model, interval time.Duration, onCycle func(CycleResult) ([]storage.OutboxEvent, error)) (*Runner, *storage.Store) {
 	t.Helper()
 	s, err := storage.Open(t.TempDir() + "/test.db")
@@ -1180,7 +1188,7 @@ func waitForCond(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Fatal("condition not met before timeout")
 }
 
-// Первый цикл выполняется немедленно, не дожидаясь интервала.
+// The first cycle runs immediately, without waiting for the interval.
 func TestRunFirstCycleImmediate(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -1196,7 +1204,7 @@ func TestRunFirstCycleImmediate(t *testing.T) {
 	}
 }
 
-// Run выполняет несколько циклов по расписанию сетки интервала.
+// Run performs several cycles on the interval-grid schedule.
 func TestRunRunsMultipleCycles(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -1212,7 +1220,7 @@ func TestRunRunsMultipleCycles(t *testing.T) {
 	}
 }
 
-// Ошибка одного цикла не останавливает цикл последующие.
+// One cycle's failure does not stop the following cycles.
 func TestRunContinuesAfterFailedCycle(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -1236,8 +1244,8 @@ func TestRunContinuesAfterFailedCycle(t *testing.T) {
 	}
 }
 
-// Отмена ctx во время выполняющегося цикла: цикл завершается и фиксируется,
-// Run возвращается только после его конца (не посередине).
+// Cancelling ctx during an in-flight cycle: the cycle finishes and commits;
+// Run returns only after its end (not midway).
 func TestRunCancelDuringCycleWaitsForIt(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	entered := make(chan struct{})
@@ -1245,7 +1253,7 @@ func TestRunCancelDuringCycleWaitsForIt(t *testing.T) {
 	var hookCalls int32
 	f.hook = func(id string) *api.RawResult {
 		if atomic.AddInt32(&hookCalls, 1) == 1 {
-			close(entered) // первый цикл завис в проверке
+			close(entered) // the first cycle is stuck in a check
 			<-release
 		}
 		return okResult(id, 1_000_000, 40)
@@ -1256,17 +1264,17 @@ func TestRunCancelDuringCycleWaitsForIt(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(ctx) }()
 	<-entered
-	cancel() // штатная остановка во время выполняющегося цикла
+	cancel() // a normal shutdown during an in-flight cycle
 	select {
 	case <-done:
 		t.Fatal("Run must not return while the in-flight cycle is still running")
 	case <-time.After(150 * time.Millisecond):
 	}
-	close(release) // цикл может завершиться
+	close(release) // the cycle may finish
 	if err := <-done; err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// цикл обязан был зафиксироваться до возврата Run
+	// the cycle must have been committed before Run returned
 	m, err := s.Model("model-a")
 	if err != nil {
 		t.Fatal(err)
@@ -1276,10 +1284,10 @@ func TestRunCancelDuringCycleWaitsForIt(t *testing.T) {
 	}
 }
 
-// --- Этап 2: переходы состояний ---
+// --- Stage: state transitions ---
 
-// 2.3: инцидент модели, покинувшей конфигурацию, не остаётся открытым
-// навсегда — закрывается при синхронизации, возврат модели ничего не ломает.
+// The incident of a model that left the configuration does not stay open
+// forever — it is closed on sync; the model's return breaks nothing.
 func TestRemovedModelIncidentNotOrphaned(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return errResult(id, 503, "Service Unavailable") }
@@ -1294,20 +1302,20 @@ func TestRemovedModelIncidentNotOrphaned(t *testing.T) {
 	}
 	r := NewRunner(RunnerCfg{API: f, Store: s, Models: models, Concurrency: 1, MaxTokens: 8,
 		Interval: time.Minute})
-	if _, err := r.RunCycle(context.Background()); err != nil { // 🔴 + инцидент
+	if _, err := r.RunCycle(context.Background()); err != nil { // Down + an incident
 		t.Fatal(err)
 	}
 	if open, _ := s.HasOpenIncident("model-a"); !open {
 		t.Fatal("setup: incident must be open while the model is down")
 	}
-	// model-a покидает конфигурацию
+	// model-a leaves the configuration
 	if err := s.SyncModels([]storage.Model{{ID: "model-b", Family: "B"}}); err != nil {
 		t.Fatal(err)
 	}
 	if open, _ := s.HasOpenIncident("model-a"); open {
 		t.Fatal("removed model must not leave an orphaned open incident (2.3)")
 	}
-	// возврат модели в конфиг и Operational: сирот не заводится
+	// the model returns to the config and is Operational: no orphan appears
 	if err := s.SyncModels(models); err != nil {
 		t.Fatal(err)
 	}
@@ -1326,8 +1334,8 @@ func TestRemovedModelIncidentNotOrphaned(t *testing.T) {
 	}
 }
 
-// 2.4: очистка старых инцидентов не должна ломать фиксацию текущего цикла:
-// цикл, закрывающий инцидент ровно до границы retention, обязан коммититься.
+// Retention cleanup must not break the current cycle's commit: a cycle
+// closing an incident right at the retention boundary must commit.
 func TestRetentionCleanupDoesNotBreakCycleCommit(t *testing.T) {
 	f := newFakeAPI([]string{"model-a"})
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
@@ -1349,7 +1357,7 @@ func TestRetentionCleanupDoesNotBreakCycleCommit(t *testing.T) {
 	}
 	r := NewRunner(RunnerCfg{API: f, Store: s, Models: models, Concurrency: 1, MaxTokens: 8,
 		Interval: time.Minute})
-	res, err := r.RunCycle(context.Background()) // восстановление закрывает старый инцидент
+	res, err := r.RunCycle(context.Background()) // the recovery closes the old incident
 	if err != nil {
 		t.Fatalf("retention cleanup must not break the cycle commit: %v", err)
 	}
@@ -1368,16 +1376,16 @@ func TestRetentionCleanupDoesNotBreakCycleCommit(t *testing.T) {
 	}
 }
 
-// Матрица значимых переходов prev × cur (три статуса): согласованные
-// событие и инциденты. Degraded не существует.
+// The matrix of meaningful prev × cur transitions (three statuses):
+// consistent events and incidents. Degraded does not exist.
 func TestTransitionMatrix(t *testing.T) {
 	type tcase struct {
 		name       string
 		prev, cur  Status
-		seedInc    Status // "" — инцидент не сеем (prev считается живым состоянием)
+		seedInc    Status // "" — no seeded incident (prev counts as the live state)
 		wantEvents int
 		wantOpen   bool
-		keepID     bool // открытый инцидент сохраняет ID после цикла
+		keepID     bool // the open incident keeps its ID after the cycle
 	}
 	cases := []tcase{
 		{"green→green", StatusOperational, StatusOperational, "", 0, false, false},
@@ -1386,15 +1394,15 @@ func TestTransitionMatrix(t *testing.T) {
 		{"green→red", StatusOperational, StatusDown, "", 1, true, false},
 		{"red→green", StatusDown, StatusOperational, StatusDown, 1, false, false},
 		{"green→unknown", StatusOperational, StatusUnknown, "", 0, false, false},
-		// инцидент переживает слепоту монитора: без события и дубля
+		// the incident survives the monitor's blindness: no event, no duplicate
 		{"red→unknown,inc", StatusDown, StatusUnknown, StatusDown, 0, true, true},
-		// восстановление из ⚪ без инцидента (была 🟢): события нет
+		// recovery from ⚪ without an incident (was 🟢): no event
 		{"unknown→green,no-inc", StatusUnknown, StatusOperational, "", 0, false, false},
-		// восстановление из ⚪ с открытым инцидентом: событие + закрытие
+		// recovery from ⚪ with an open incident: event + closing
 		{"unknown→green,inc", StatusUnknown, StatusOperational, StatusDown, 1, false, false},
-		// падение в слепое окно без инцидента: событие + инцидент (D2)
+		// a fall into the blind window without an incident: event + incident
 		{"unknown→red,no-inc", StatusUnknown, StatusDown, "", 1, true, false},
-		// 🔴 живёт через ⚪: инцидент тот же, события нет (Rev-5)
+		// Down lives through ⚪: same incident, no event
 		{"unknown→red,inc", StatusUnknown, StatusDown, StatusDown, 0, true, true},
 	}
 	for _, tc := range cases {
@@ -1403,7 +1411,7 @@ func TestTransitionMatrix(t *testing.T) {
 			f.hook = resultHook(tc.cur)
 
 			models := []storage.Model{{ID: "model-a", Family: "A"}}
-			r, _ := newRunner(t, f, models) // SyncModels здесь
+			r, _ := newRunner(t, f, models) // includes SyncModels
 			if err := r.Store().SetModelState("model-a", tc.prev, "", "", time.Now().Add(-time.Minute)); err != nil {
 				t.Fatal(err)
 			}
@@ -1445,7 +1453,7 @@ func TestTransitionMatrix(t *testing.T) {
 	}
 }
 
-// resultHook возвращает API-ответ, дающий нужный статус классификации.
+// resultHook returns an API answer yielding the wanted classification.
 func resultHook(st Status) func(string) *api.RawResult {
 	switch st {
 	case StatusOperational:
@@ -1457,11 +1465,12 @@ func resultHook(st Status) func(string) *api.RawResult {
 	}
 }
 
-// --- Этап A01-5: операционный сигнал при «всё ⚪» ---
+// --- Operational signal on "all Unknown" ---
 
-// A01-5: ключ умер — все модели ⚪, циклы успешны, heartbeat жив (контейнер
-// healthy). Оператор обязан видеть отдельный ERROR-сигнал: «осмысленных
-// проверок нет N циклов подряд». Это не меняет статусы моделей и /status.
+// The key is dead — all models ⚪, cycles succeed, the heartbeat is alive
+// (the container looks healthy). The operator must see a dedicated ERROR
+// signal: "no meaningful checks for N consecutive cycles". It changes
+// neither model statuses nor /status.
 func TestProlongedAllUnknownSignalsOperations(t *testing.T) {
 	var buf syncBuffer
 	log := slog.New(slog.NewJSONHandler(&buf, nil))
@@ -1486,10 +1495,10 @@ func TestProlongedAllUnknownSignalsOperations(t *testing.T) {
 			signal++
 		}
 	}
-	if signal < 2 { // второй и третий циклы подряд — сигнал на каждом
+	if signal < 2 { // the second and third consecutive cycles — a signal on each
 		t.Fatalf("operational ERROR signal expected on consecutive all-unknown cycles, got %d:\n%s", signal, buf.String())
 	}
-	// восстановление смысла: сигнал сбрасывается
+	// meaning restored: the signal resets
 	f.hook = func(id string) *api.RawResult { return okResult(id, 1_000_000, 40) }
 	if _, err := r.RunCycle(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1499,8 +1508,8 @@ func TestProlongedAllUnknownSignalsOperations(t *testing.T) {
 	}
 }
 
-// syncBuffer — потокобезопасный буфер для slog (цикл пишет из одной горутины,
-// но slog.NewJSONHandler требует Writer без гонок при -race).
+// syncBuffer is a goroutine-safe slog buffer (the cycle writes from one
+// goroutine, but slog.NewJSONHandler requires a race-free Writer).
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf strings.Builder

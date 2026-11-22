@@ -79,13 +79,13 @@ func cycle(checks map[string]storage.Check, transitions ...monitor.Transition) m
 	}
 }
 
-// check — успешная проверка «сейчас»; поля ошибки донастраиваются на месте.
+// check is a successful check "now"; error fields are tuned in place.
 func check(id string, st status.Status) storage.Check {
 	return storage.Check{ModelID: id, At: time.Now(), Status: st, HTTPStatus: 200}
 }
 
-// commitCycle повторяет фиксацию цикла раннером: бот готовит события,
-// а коммитит их вместе с состояниями одним ApplyCycle.
+// commitCycle replays the runner's cycle commit: the bot prepares the
+// events, and they are committed together with the states by one ApplyCycle.
 func commitCycle(t *testing.T, b *Bot, res monitor.CycleResult) {
 	t.Helper()
 	events, err := b.OnCycle(context.Background(), res)
@@ -97,8 +97,8 @@ func commitCycle(t *testing.T, b *Bot, res monitor.CycleResult) {
 	}
 }
 
-// seedCheck записывает проверки цикла в БД — как это делает продовый
-// монитор до OnCycle (воркер рендерит панели из store.LastChecks()).
+// seedCheck writes the cycle's checks to the DB — as the production monitor
+// does before OnCycle (the worker renders panels from store.LastChecks()).
 func seedCheck(t *testing.T, b *Bot, checks map[string]storage.Check) {
 	t.Helper()
 	for _, c := range checks {
@@ -108,7 +108,8 @@ func seedCheck(t *testing.T, b *Bot, checks map[string]storage.Check) {
 	}
 }
 
-// callIndex возвращает индекс первого вхождения метода в последовательности вызовов.
+// callIndex returns the index of a method's first occurrence in the call
+// sequence.
 func callIndex(m *mockTG, method string) int {
 	for i, c := range m.callList() {
 		if c == method {
@@ -118,7 +119,7 @@ func callIndex(m *mockTG, method string) int {
 	return -1
 }
 
-// Сценарий: /status отправляет rich-панель и закрепляет её.
+// Scenario: /status sends a rich panel and pins it.
 func TestStatusCommandPinsRichPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -151,7 +152,7 @@ func TestStatusCommandPinsRichPanel(t *testing.T) {
 	}
 }
 
-// Сценарий: /start — полный синоним /status.
+// Scenario: /start is a full synonym of /status.
 func TestStartIsStatusSynonym(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -167,8 +168,8 @@ func TestStartIsStatusSynonym(t *testing.T) {
 	}
 }
 
-// Сценарий 20: повторный /status — новая панель закрепляется, прежняя
-// открепляется только ПОСЛЕ этого; привязка обновляется.
+// Scenario 20: a repeated /status — the new panel is pinned, the old one is
+// unpinned only AFTER that; the binding updates.
 func TestRepeatStatusReplacesPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -192,7 +193,7 @@ func TestRepeatStatusReplacesPanel(t *testing.T) {
 	if unpinBody["message_id"].(float64) != 1 {
 		t.Fatalf("must unpin the OLD message, got %v", unpinBody["message_id"])
 	}
-	// новый pin раньше открепления старого: двух закреплённых панелей не бывает
+	// the new pin comes before the old unpin: never two pinned panels
 	if !(callIndex(m, "pinChatMessage") < callIndex(m, "unpinChatMessage")) {
 		t.Fatalf("new panel must be pinned before the old one is unpinned: %v", m.callList())
 	}
@@ -202,8 +203,8 @@ func TestRepeatStatusReplacesPanel(t *testing.T) {
 	}
 }
 
-// Закрепление новой панели не удалось — прежняя НЕ открепляется (никогда не
-// остаёмся без закреплённой панели), бот пробует её переподтвердить.
+// Pining the new panel failed — the old one is NOT unpinned (there is
+// never no pinned panel), the bot tries to re-confirm it.
 func TestPinFailureKeepsOldPanelPinned(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -227,8 +228,8 @@ func TestPinFailureKeepsOldPanelPinned(t *testing.T) {
 	if m.callCount("unpinChatMessage") != 0 {
 		t.Fatalf("old panel must stay pinned while the new one is not: %v", m.callList())
 	}
-	// прежняя панель переподтверждается попыткой повторного pin
-	if m.callCount("pinChatMessage") != 2 { // новый (упал) + старый (проба)
+	// the old panel is re-confirmed by a repeated pin attempt
+	if m.callCount("pinChatMessage") != 2 { // new (failed) + old (re-try)
 		t.Fatalf("pin calls = %d: %v", m.callCount("pinChatMessage"), m.callList())
 	}
 	sm, _ := store.StatusMessage(100)
@@ -237,7 +238,7 @@ func TestPinFailureKeepsOldPanelPinned(t *testing.T) {
 	}
 }
 
-// Сценарий 21: цикл мониторинга редактирует существующую панель rich-текстом.
+// Scenario 21: a monitoring cycle edits the existing panel with rich text.
 func TestCycleEditsPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -265,7 +266,7 @@ func TestCycleEditsPanel(t *testing.T) {
 	}
 }
 
-// Текст не изменился — лишнее редактирование не выполняется.
+// The text did not change — no needless edit is performed.
 func TestCycleSkipsUnchangedText(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -286,7 +287,7 @@ func TestCycleSkipsUnchangedText(t *testing.T) {
 	}
 }
 
-// «message is not modified» при редактировании панели — штатный случай (двойной цикл).
+// "message is not modified" on a panel edit is benign (a double cycle).
 func TestPanelEditNotModifiedIsBenign(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -315,7 +316,8 @@ func TestPanelEditNotModifiedIsBenign(t *testing.T) {
 	}
 }
 
-// Сценарий 22: панель удалена (edit → 400 not found) — бот создаёт новую и закрепляет.
+// Scenario 22: the panel was deleted (edit → 400 not found) — the bot
+// creates a new one and pins it.
 func TestDeletedPanelRecreated(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -350,11 +352,11 @@ func TestDeletedPanelRecreated(t *testing.T) {
 	}
 }
 
-// Сценарий 19: после рестарта панель восстанавливается из SQLite и редактируется.
+// Scenario 19: after a restart the panel is restored from SQLite and edited.
 func TestPanelRestoredAfterRestart(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
-	if err := store.SetStatusMessage(100, 77); err != nil { // состояние «до рестарта»
+	if err := store.SetStatusMessage(100, 77); err != nil { // the pre-restart state
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -374,7 +376,7 @@ func TestPanelRestoredAfterRestart(t *testing.T) {
 	}
 }
 
-// Сценарий: у бота нет права закреплять — сообщение сохраняется, пользователь уведомляется.
+// The bot has no pin right — the message is kept, the user is informed.
 func TestPinForbiddenStillBinds(t *testing.T) {
 	m := newMockTG(t)
 	m.handler = func(method string, body []byte) (any, int) {
@@ -409,7 +411,8 @@ func TestPinForbiddenStillBinds(t *testing.T) {
 	}
 }
 
-// Сценарий: /status model-id — rich-карточка, не закрепляется; неизвестный ID — сообщение.
+// Scenario: /status model-id — a rich card, not pinned; an unknown ID — a
+// message.
 func TestStatusModelDetail(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -447,7 +450,7 @@ func TestStatusModelDetail(t *testing.T) {
 	}
 }
 
-// Карточка без check-строк строится из состояния модели (last_check_at).
+// A card without check rows is built from the model state (last_check_at).
 func TestModelDetailFallsBackToModelState(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -469,13 +472,13 @@ func TestModelDetailFallsBackToModelState(t *testing.T) {
 	}
 }
 
-// Длинный ответ модели: карточка в лимите rich-сообщения, хвост — следующим
-// rich-сообщением; данные не теряются и не обрезаются молча.
+// A long model response: the card fits the rich-message limit, the tail goes
+// as the next rich message; no data is lost or silently truncated.
 func TestModelCardLongResponseSentAsFollowups(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
 	at := time.Now()
-	resp := strings.Repeat("ж", 40000) // «ж» не встречается в самом шаблоне карточки
+	resp := strings.Repeat("ж", 40000) // never appears in the card template itself
 	if err := store.SetModelState("gpt-6-astra", status.Down, "http", "upstream boom", at); err != nil {
 		t.Fatal(err)
 	}
@@ -506,9 +509,8 @@ func TestModelCardLongResponseSentAsFollowups(t *testing.T) {
 	}
 }
 
-// Регрессия: длинный ответ из экранируемых символов
-// («&», рост ×5) — каждое отправленное rich-сообщение обязано укладываться
-// в лимит 32768, данные не теряются.
+// Regression: a long response of escapable characters ("&", ×5 growth) —
+// every sent rich message must fit the 32768 limit, no data lost.
 func TestModelCardEscapableLongResponseFollowups(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -544,7 +546,7 @@ func TestModelCardEscapableLongResponseFollowups(t *testing.T) {
 	}
 }
 
-// Сценарий 23: в группах подписки меняют только администраторы.
+// Scenario 23: in groups only administrators change subscriptions.
 func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 	m := newMockTG(t)
 	m.handler = func(method string, body []byte) (any, int) {
@@ -564,7 +566,7 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 	b, _ := newBot(t, m)
 	ctx := context.Background()
 
-	// обычный участник не может открыть настройки
+	// a regular member cannot open the setup
 	if err := b.HandleUpdate(ctx, msgUpdate(-200, 56, "supergroup", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +575,7 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 		t.Fatalf("non-admin refusal expected: %q", last)
 	}
 
-	// администратор открывает
+	// an admin opens it
 	if err := b.HandleUpdate(ctx, msgUpdate(-200, 55, "supergroup", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +583,7 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 		t.Fatalf("admin must see the panel: %q", m.lastBody("sendMessage")["text"])
 	}
 
-	// колбэк от не-админа отклоняется
+	// a callback from a non-admin is rejected
 	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 56, "s:gpt-6-astra")); err != nil {
 		t.Fatal(err)
 	}
@@ -590,7 +592,7 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 		t.Fatalf("non-admin callback must be rejected: %q", answered)
 	}
 
-	// администратор переключает и сохраняет
+	// an admin toggles and saves
 	if err := b.HandleUpdate(ctx, cbUpdateGroup(-200, 55, "s:gpt-6-astra")); err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +608,7 @@ func TestSubscribeAdminOnlyInGroups(t *testing.T) {
 	}
 }
 
-// Сохранение подписок через /subscribe.
+// Saving subscriptions via /subscribe.
 func TestSubscribeSavePersists(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -627,7 +629,7 @@ func TestSubscribeSavePersists(t *testing.T) {
 	if len(subs) != 2 || subs[0] != "glm-5.3" || subs[1] != "gpt-6-astra" {
 		t.Fatalf("saved subscriptions = %v", subs)
 	}
-	// повторное открытие показывает текущее состояние
+	// reopening shows the current state
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
@@ -636,7 +638,7 @@ func TestSubscribeSavePersists(t *testing.T) {
 	}
 }
 
-// Сценарий: повторное открытие /subscribe без взаимодействия использует сохранённое состояние.
+// Scenario: reopening /subscribe without interaction uses the saved state.
 func TestSubscribeToggleIdempotent(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -647,7 +649,7 @@ func TestSubscribeToggleIdempotent(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
-	// повторный тогл той же кнопки снимает выбор
+	// a repeated toggle of the same button removes the selection
 	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:glm-5.3")); err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +662,7 @@ func TestSubscribeToggleIdempotent(t *testing.T) {
 	}
 }
 
-// Каналы: /status постит rich-панель в канал и закрепляет её.
+// Channels: /status posts a rich panel into the channel and pins it.
 func TestChannelStatusPanel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -703,21 +705,22 @@ func TestHelpCommand(t *testing.T) {
 	}
 }
 
-// Кнопка «Отменить»: сообщение меню удаляется, черновик сбрасывается,
-// сохранённые подписки не трогаются; повторное /subscribe — от сохранённого.
+// The "Cancel" button: the menu message is deleted, the draft is dropped,
+// saved subscriptions are untouched; a repeated /subscribe starts from the
+// saved state.
 func TestSubscribeCancel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
 	ctx := context.Background()
 
-	// уже сохранённая подписка — должна пережить отмену
+	// an already saved subscription must survive the cancel
 	if err := store.SetSubscription(100, "glm-5.3", true); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:gpt-6-astra")); err != nil { // включили gpt-6-astra в черновике
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "s:gpt-6-astra")); err != nil { // gpt-6-astra turned on in the draft
 		t.Fatal(err)
 	}
 	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "cancel")); err != nil {
@@ -735,7 +738,7 @@ func TestSubscribeCancel(t *testing.T) {
 	if len(subs) != 1 || subs[0] != "glm-5.3" {
 		t.Fatalf("cancel must not touch saved subscriptions: %v", subs)
 	}
-	// повторное открытие: черновик начинается заново от сохранённого состояния
+	// reopening: the draft starts anew from the saved state
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
@@ -745,7 +748,7 @@ func TestSubscribeCancel(t *testing.T) {
 	}
 }
 
-// Навигация меню подписок: f:<i> открывает экран семейства, back — корень.
+// Subscribe menu navigation: f:<family> opens the family screen, back — the root.
 func TestSubscribeFamilyNavigation(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -753,7 +756,7 @@ func TestSubscribeFamilyNavigation(t *testing.T) {
 	if err := b.HandleUpdate(ctx, msgUpdate(100, 1, "private", "/subscribe")); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "f:GPT")); err != nil { // GPT
+	if err := b.HandleUpdate(ctx, cbUpdate(100, 1, "f:GPT")); err != nil { // the GPT family
 		t.Fatal(err)
 	}
 	editText := fmt.Sprint(m.lastBody("editMessageText")["text"])
@@ -773,8 +776,8 @@ func TestSubscribeFamilyNavigation(t *testing.T) {
 	}
 }
 
-// /status <длинный аргумент>: ответ обрезается до 64 рун, чтобы после
-// экранирования не превысить лимит Telegram.
+// /status <long argument>: the reply is truncated to 64 runes so that it
+// does not exceed the Telegram limit after escaping.
 func TestStatusUnknownModelLongArgTruncated(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)

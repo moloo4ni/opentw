@@ -11,25 +11,25 @@ RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 opentw
 WORKDIR /app
 COPY --from=build /out/opentw /app/opentw
 COPY config.example.yaml /app/config.example.yaml
-# named volume наследует владелца этой директории при первой инициализации
+# the named volume inherits this directory's owner on first initialization
 RUN mkdir -p /data && chown opentw:opentw /data
 USER opentw
-# Живость мониторинга: heartbeat обновляется в конце успешного цикла
-# (и в начале цикла после успешного предыдущего). Порог приложение пишет в
-# /data/opentw.heartbeat.maxage из фактического interval — образ не нужно
-# пересобирать при смене конфигурации; фолбэк 2820с = maxage формулы для
-# поставляемого конфига (2×15м + худший цикл + минута), стартовое покрытие —
-# ниже.
+# Monitoring liveness: the heartbeat is updated at the end of a successful
+# cycle (and at the start of a cycle following a successful one). The app
+# writes the threshold to /data/opentw.heartbeat.maxage from the actual
+# interval — the image needs no rebuild when the config changes; the 2820s
+# fallback is the formula's maxage for the shipped config (2×15m + worst
+# cycle + one minute); startup coverage below.
 #
-# Худший первый цикл поставляемого конфига (config.example.yaml: 25 моделей,
-# concurrency 4, http_timeout 120s): запрос каталога + ceil(25/4)=7 волн
-# = (1+7)×120s = 960s — столько heartbeat может отсутствовать на живом
-# старте. start-period 1200s = 960s + 25% запаса: проверки до этого
-# момента не считаются провалом, ложного unhealthy нет.
-# ВАЖНО: при существенно большем N/concurrency/http_timeout задайте свой
-# start-period в конфигурации запуска контейнера (Quadlet: HealthStartPeriod=;
-# покрыть ceil(N/K)+1 волн таймаута) — значение в образе не угадает
-# произвольный конфиг автоматически.
+# Worst first cycle of the shipped config (config.example.yaml: 25 models,
+# concurrency 4, http_timeout 120s): catalog request + ceil(25/4)=7 waves
+# = (1+7)×120s = 960s — that is how long the heartbeat may be missing on a
+# healthy start. start-period 1200s = 960s + 25% headroom: checks before it
+# do not count as failures, no false unhealthy.
+# IMPORTANT: with a substantially larger N/concurrency/http_timeout set your
+# own start-period in the container run config (Quadlet: HealthStartPeriod=;
+# cover ceil(N/K)+1 timeout waves) — the image value cannot guess an
+# arbitrary config.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=1200s --retries=3 \
   CMD test $(( $(date +%s) - $(stat -c %Y /data/opentw.heartbeat) )) -lt $(cat /data/opentw.heartbeat.maxage 2>/dev/null || echo 2820)
 ENV TZ=Europe/Moscow

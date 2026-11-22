@@ -22,8 +22,8 @@ type streamChunk struct {
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *usage `json:"usage"`
-	// Error — ошибка шлюза, доставленная прямо в SSE-данных (HTTP 200):
-	// не то же самое, что транспортный сбой или пустая генерация.
+	// Error is a gateway error delivered inside SSE data (HTTP 200),
+	// distinct from a transport failure or an empty generation.
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -41,36 +41,37 @@ type usage struct {
 // a visible answer may never arrive at small max_tokens.
 // Individual malformed chunks are skipped: providers send keep-alive and odd
 // extensions; usable state is decided by the caller from the fields.
-// streamOutcome — итог чтения SSE-потока.
+
+// streamOutcome is the result of reading an SSE stream.
 type streamOutcome struct {
 	usage     *usage
 	sawData   bool
 	parsedAny bool
 	generated bool
-	// content — накопленный итоговый ответ (только delta.content,
-	// reasoning не считается ответом). При патологически длинном потоке
-	// обрезан по maxTextRunes с видимым «…» (contentFull).
+	// content is the accumulated final answer (delta.content only; reasoning
+	// is never an answer), capped at maxTextRunes with a visible "…"
+	// (contentFull).
 	content     string
 	contentFull bool
-	// finishReason — первый непустой finish_reason терминального чанка той
-	// же choice, из которой накоплен итоговый ответ. Usage-only чанки не могут
-	// его очистить; отсутствующее значение остаётся пустым.
+	// finishReason is the first non-empty finish_reason of the terminal chunk
+	// of the same choice the answer was accumulated from. Usage-only chunks
+	// cannot clear it; a missing value stays empty.
 	finishReason string
-	// finishReasons — непустые finish_reason по index choice. Итог берётся
-	// после чтения потока от той же choice, которая дала content.
+	// finishReasons holds non-empty finish_reasons by choice index; the final
+	// value is taken after the stream from the choice that produced content.
 	finishReasons     map[int]string
 	firstFinishChoice int
 	hasFinishChoice   bool
-	// selectedChoice — choice, из которой берётся content (или первая
-	// содержательная choice при его отсутствии); нужно для корректного
-	// finish_reason в ответах с несколькими choices.
+	// selectedChoice is the choice content is taken from (or the first
+	// choice with any content when there is none), so multi-choice responses
+	// carry the right finish_reason.
 	selectedChoice   int
 	hasChoice        bool
 	hasContentChoice bool
-	// dataErr — текст поля error из SSE-данных (первое непустое сообщение).
+	// dataErr is the error field text from SSE data (first non-empty message).
 	dataErr string
-	// rawPrefix — прочитанное до первого data: (≤ 8КБ): при stream:true
-	// шлюз может ответить обычным JSON с ошибкой вместо SSE.
+	// rawPrefix is what was read before the first "data:" (≤ 8KB): with
+	// stream:true a gateway may answer with plain JSON instead of SSE.
 	rawPrefix []byte
 	err       error
 }
@@ -110,9 +111,9 @@ func readStream(r io.Reader, onFirstContent func()) streamOutcome {
 					out.usage = chunk.Usage
 				}
 				for _, ch := range chunk.Choices {
-					// Сначала сохраняем reason по index choice. Источник итогового
-					// ответа может быть выбран позже, поэтому глобально присваивать
-					// reason до конца потока нельзя.
+					// Store reasons by choice index first: the source of the
+					// final answer may be picked later, so a global reason
+					// assignment before the end of the stream is not possible.
 					if ch.FinishReason != nil && *ch.FinishReason != "" {
 						if out.finishReasons == nil {
 							out.finishReasons = make(map[int]string)
@@ -126,7 +127,7 @@ func readStream(r io.Reader, onFirstContent func()) streamOutcome {
 						}
 					}
 					if ch.Delta.Content != "" {
-						// Первый непустой content — источник итогового ответа.
+						// The first non-empty content is the source of the final answer.
 						if !out.hasContentChoice {
 							out.hasContentChoice = true
 							out.selectedChoice = ch.Index
@@ -165,8 +166,8 @@ func readStream(r io.Reader, onFirstContent func()) streamOutcome {
 				}
 			}
 		} else if !out.sawData && raw.Len() < 8192 {
-			// не-data строка до первого SSE-события: сохраняем — возможно,
-			// это JSON-ответ шлюза (многострочный JSON собирается целиком)
+			// A non-data line before the first SSE event: keep it — it may be
+			// a multi-line JSON error body from the gateway.
 			raw.WriteString(line)
 		}
 		if readErr != nil {
@@ -181,7 +182,7 @@ func readStream(r io.Reader, onFirstContent func()) streamOutcome {
 			out.finishReason = reason
 		}
 	} else if out.hasFinishChoice {
-		// Нет ни content, ни reasoning: берём первый фактический finish_reason.
+		// Neither content nor reasoning: take the first actual finish_reason.
 		out.finishReason = out.finishReasons[out.firstFinishChoice]
 	}
 	out.rawPrefix = raw.Bytes()
@@ -230,8 +231,8 @@ func extractProviderError(body []byte, code int) string {
 	return truncate(trimmed, maxTextRunes)
 }
 
-// bodyGatewayError извлекает текст ошибки шлюза из не-SSE тела ответа при
-// stream:true (нет ни одного data:-события). "" — если это не JSON с ошибкой.
+// bodyGatewayError extracts the gateway error text from a non-SSE body
+// with stream:true (not a single data: event). "" when it is not a JSON error.
 func bodyGatewayError(raw []byte) string {
 	if len(raw) == 0 {
 		return ""
@@ -246,7 +247,7 @@ func bodyGatewayError(raw []byte) string {
 	return ""
 }
 
-// truncate обрезает по рунам: байтовый срез ломал бы многобайтовые символы.
+// truncate cuts by runes: a byte slice would split multibyte characters.
 func truncate(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
@@ -255,9 +256,9 @@ func truncate(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
-// appendCapped дописывает s к dst с пределом maxTextRunes рун: безграничный
-// поток не раздувает память и хранилище; обрезка видима («…»). Возвращает
-// накопленный текст и признак достижения предела.
+// appendCapped appends s to dst with a maxTextRunes rune limit: an endless
+// stream must not inflate memory and storage; truncation is visible ("…").
+// Returns the accumulated text and whether the cap was reached.
 func appendCapped(dst, s string) (string, bool) {
 	dstRunes := utf8.RuneCountInString(dst)
 	if dstRunes+utf8.RuneCountInString(s) <= maxTextRunes {

@@ -22,7 +22,7 @@ import (
 	"opentw/internal/telegram"
 )
 
-// testPrompt — стандартизированный запрос проверки, одинаковый для всех моделей.
+// testPrompt is the standardized probe request, identical for every model.
 const testPrompt = "Reply with exactly \"OK\""
 
 func main() {
@@ -33,8 +33,8 @@ func main() {
 }
 
 func run() error {
-	// отдельный FlagSet (не глобальный flag.CommandLine): run() вызывается
-	// повторно в тестах, глобальный ре-регистрирует флаги и паникует
+	// A separate FlagSet (not the global flag.CommandLine): run() is called
+	// repeatedly in tests, the global one re-registers flags and panics.
 	fs := flag.NewFlagSet("opentw", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", "config.yaml", "path to config.yaml")
@@ -64,8 +64,8 @@ func run() error {
 	defer store.Close()
 
 	if *backup != "" {
-		// VACUUM INTO: атомарный снапшот живой WAL-базы без остановки и без
-		// sqlite3 в образе; отказ, если файл уже существует (I3)
+		// VACUUM INTO: an atomic snapshot of a live WAL database, without
+		// stopping and without sqlite3 in the image; fails if the file exists.
 		if err := store.BackupTo(*backup); err != nil {
 			return err
 		}
@@ -102,9 +102,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Порог живости вычисляется из фактического конфига и пишется рядом с
-	// heartbeat: HEALTHCHECK читает его, образ не требует пересборки при
-	// смене интервала (I2). 2×интервал + худший возможный цикл + минута.
+	// The freshness threshold is computed from the actual config and written
+	// next to the heartbeat: the HEALTHCHECK reads it, so the image needs no
+	// rebuild when the interval changes. 2× interval + worst possible cycle
+	// + one minute.
 	worstCycle := worstCycleTime(len(models), cfg.Concurrency, cfg.HTTPTimeout)
 	maxAgePath := filepath.Join(filepath.Dir(cfg.SQLitePath), "opentw.heartbeat.maxage")
 	if err := os.WriteFile(maxAgePath, []byte(fmt.Sprintf("%d\n", int64((2*cfg.Interval+worstCycle+time.Minute).Seconds()))), 0o644); err != nil {
@@ -119,7 +120,8 @@ func run() error {
 		MaxTokens:     cfg.MaxTokens,
 		Interval:      cfg.Interval,
 		HeartbeatPath: filepath.Join(filepath.Dir(cfg.SQLitePath), "opentw.heartbeat"),
-		// События готовит бот; раннер зафиксирует их атомарно с состояниями
+		// The bot prepares the events; the runner commits them atomically with
+		// the states.
 		OnCycle: func(res monitor.CycleResult) ([]storage.OutboxEvent, error) {
 			return bot.OnCycle(context.Background(), res)
 		},
@@ -131,15 +133,16 @@ func run() error {
 		log.Info("opentw: shutting down")
 	}()
 
-	// RunDelivery: панели и уведомления доставляются асинхронно от циклов —
-	// недоступный Telegram не останавливает мониторинг, недоставленное уходит в outbox.
+	// RunDelivery: panels and notifications are delivered asynchronously
+	// from the cycles — an unreachable Telegram does not stop monitoring,
+	// undelivered work waits in the outbox.
 	return supervise(ctx, stop, []func(context.Context) error{bot.Run, bot.RunDelivery, runner.Run})
 }
 
-// worstCycleTime — подтверждённый максимум длительности одного цикла:
-// запрос каталога + волны проверок по ceil(N/concurrency), каждая волна
-// ограничена http_timeout. Формула согласована с HEALTHCHECK Containerfile
-// (start-period покрывает худший первый цикл) и с файлом maxage.
+// worstCycleTime is the confirmed maximum duration of one cycle: the
+// catalog request + waves of ceil(N/concurrency) checks, each wave bounded
+// by http_timeout. The formula matches the Containerfile HEALTHCHECK
+// (start-period covers the worst first cycle) and the maxage file.
 func worstCycleTime(models, concurrency int, httpTimeout time.Duration) time.Duration {
 	waves := (models + concurrency - 1) / concurrency
 	if waves < 1 {
@@ -148,11 +151,11 @@ func worstCycleTime(models, concurrency int, httpTimeout time.Duration) time.Dur
 	return time.Duration(waves+1) * httpTimeout
 }
 
-// supervise держит run() открытой до полного завершения обоих компонентов:
-// отмена (SIGINT/SIGTERM или падение одного из них) → затем wg.Wait() — и
-// только потом run() возвращает управление, где defer store.Close() закрывает
-// базу. Ожидание конечно: сетевые операции бота ограничены его HTTP-клиентом
-// и shutdownFlush.
+// supervise keeps run() open until both components fully finish: cancel
+// (SIGINT/SIGTERM or one component's failure) → then wg.Wait() — and only
+// then run() returns, where the deferred store.Close() closes the database.
+// The wait is finite: the bot's network operations are bounded by its HTTP
+// client and shutdownFlush.
 func supervise(ctx context.Context, stop context.CancelFunc, components []func(context.Context) error) error {
 	errCh := make(chan error, len(components))
 	var wg sync.WaitGroup
@@ -165,12 +168,12 @@ func supervise(ctx context.Context, stop context.CancelFunc, components []func(c
 	}
 	var runErr error
 	select {
-	case <-ctx.Done(): // сигнал остановки
-	case err := <-errCh: // компонент остановился сам
+	case <-ctx.Done(): // stop signal
+	case err := <-errCh: // a component stopped on its own
 		if err != nil {
 			runErr = fmt.Errorf("opentw: component stopped: %w", err)
 		}
-		stop() // отменяем второй компонент, чтобы run() не ждал его вечно
+		stop() // cancel the other component so run() does not wait for it forever
 	}
 	wg.Wait()
 	return runErr

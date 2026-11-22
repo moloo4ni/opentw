@@ -11,8 +11,8 @@ import (
 	"opentw/internal/storage"
 )
 
-// Панель обязана сохранять порядок моделей из конфигурации (семейства и
-// записи внутри семейства), а не алфавитный порядок БД.
+// The panel must keep the config's model order (families and entries within
+// families), not the database's alphabetical order.
 func TestPanelKeepsConfigOrder(t *testing.T) {
 	m := newMockTG(t)
 	store, err := storage.Open(t.TempDir() + "/order.db")
@@ -20,7 +20,7 @@ func TestPanelKeepsConfigOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	// порядок как в config.example.yaml: gpt-6-astra, gpt-6.1-sol, gpt-6-sol
+	// the order as in config.example.yaml: gpt-6-astra, gpt-6.1-sol, gpt-6-sol
 	models := []storage.Model{
 		{ID: "gpt-6-astra", Family: "GPT"},
 		{ID: "gpt-6.1-sol", Family: "GPT"},
@@ -46,8 +46,9 @@ func TestPanelKeepsConfigOrder(t *testing.T) {
 	}
 }
 
-// В канале /subscribe публикует панель с кнопками: channel_post не содержит
-// автора, поэтому права проверяются при нажатии кнопки (там автор известен).
+// In a channel, /subscribe publishes the panel with buttons: a channel_post
+// carries no author, so rights are checked on button press (the author is
+// known there).
 func TestChannelSubscribePublishesKeyboard(t *testing.T) {
 	m := newMockTG(t)
 	b, _ := newBot(t, m)
@@ -72,7 +73,8 @@ func TestChannelSubscribePublishesKeyboard(t *testing.T) {
 	}
 }
 
-// Нажатие кнопки в канале: администратор канала может менять подписки чата-канала.
+// A button press in a channel: a channel admin may change the channel
+// chat's subscriptions.
 func TestChannelCallbackAdminToggles(t *testing.T) {
 	m := newMockTG(t)
 	m.handler = func(method string, body []byte) (any, int) {
@@ -109,7 +111,7 @@ func TestChannelCallbackAdminToggles(t *testing.T) {
 	}
 }
 
-// Панель подписок в канале не должна показывать статусы моделей.
+// The subscribe panel in a channel must not show model statuses.
 func TestChannelSubscribePanelHasNoStatuses(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)

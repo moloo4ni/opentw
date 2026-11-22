@@ -1,14 +1,14 @@
 package telegram
 
-// Регрессионные тесты дефекта OPW-01: уведомление о падении терялось навсегда,
-// когда между созданием события и доставкой статус модели становился Unknown.
-// Delivery помечало строку отправленной (без сообщения и без chat_notified),
-// а последующий Unknown→Down при живом инциденте не создавал нового события.
+// Regression tests for a lost-notification defect: a down notification was
+// lost forever when the model's status became Unknown between the event and
+// delivery. Delivery marked the row sent (no message, no chat_notified),
+// and the later Unknown→Down with a live incident created no new event.
 //
-// Все сценарии гоняются через реальные методы компонентов: monitor.RunCycle с
-// scriptedUpstream (реальная классификация, инциденты, ApplyCycle), реальная
-// доставка deliverChat и настоящая SQLite-база. Проверяется фактическое
-// состояние БД (outbox, chat_notified) и реально ушедшие сообщения.
+// All scenarios run through the components' real methods: monitor.RunCycle
+// with scriptedUpstream (real classification, incidents, ApplyCycle), real
+// deliverChat delivery and a real SQLite database. The actual DB state
+// (outbox, chat_notified) and the actually sent messages are asserted.
 
 import (
 	"context"
@@ -27,9 +27,9 @@ import (
 	"opentw/internal/storage"
 )
 
-// scriptedUpstream — детерминированный upstream-провайдер для реального
-// раннера: ListModels всегда жив (нет гашения по catalogIssue), Generate
-// отдаёт назначенный результат модели.
+// scriptedUpstream is a deterministic upstream provider for a real runner:
+// ListModels is always alive (no catalogIssue masking), Generate returns
+// the scripted result for the model.
 type scriptedUpstream struct {
 	mu      sync.Mutex
 	results map[string]*api.RawResult
@@ -71,8 +71,8 @@ func (u *scriptedUpstream) set(id string, r *api.RawResult) {
 func (u *scriptedUpstream) setUp(id string)   { u.set(id, upstreamUp(id)) }
 func (u *scriptedUpstream) setDown(id string) { u.set(id, upstreamDown(id)) }
 func (u *scriptedUpstream) setUnknown(id string) {
-	// 401 — проблема ключа самого монитора: Classify даёт Unknown,
-	// каталог при этом жив, гашения по catalogIssue нет.
+	// 401 — the monitor's own key problem: Classify yields Unknown,
+	// the catalog stays alive, so no catalogIssue masking.
 	u.set(id, &api.RawResult{ModelID: id, Timestamp: time.Now(), HTTPStatus: 401,
 		ErrorKind: "http", ErrorMessage: "Unauthorized", Response: "Unauthorized", LatencyUS: 20_000})
 }
@@ -94,8 +94,8 @@ func upstreamDown(id string) *api.RawResult {
 	}
 }
 
-// newOPWBot собирает боевую связку: реальный раннер мониторинга + реальный
-// бот доставки на одной SQLite-базе (как в cmd/opentw/main.go).
+// newOPWBot assembles the production wiring: a real monitoring runner + a
+// real delivery bot on one SQLite database (as in cmd/opentw/main.go).
 func newOPWBot(t *testing.T, m *mockTG, u *scriptedUpstream, models []storage.Model) (*Bot, *storage.Store, *monitor.Runner) {
 	t.Helper()
 	store, err := storage.Open(t.TempDir() + "/bot.db")
@@ -157,19 +157,19 @@ func mustNotified(t *testing.T, store *storage.Store, chatID int64, modelID stri
 	}
 }
 
-// seedNotifiedUp доводит пару «чат—модель» до штатного состояния: last_status=Up,
-// chat_notified=Up (реально доставленным уведомлением о восстановлении),
-// очередь пуста, открытых инцидентов нет.
+// seedNotifiedUp brings a chat–model pair to the routine state: last_status=Up,
+// chat_notified=Up (via a really delivered recovery notification), empty
+// queue, no open incidents.
 func seedNotifiedUp(t *testing.T, m *mockTG, u *scriptedUpstream, b *Bot, r *monitor.Runner, chatID int64, modelIDs ...string) {
 	t.Helper()
 	for _, id := range modelIDs {
 		u.setDown(id)
 	}
-	mustCycle(t, r) // первое наблюдение Down — базлайн, события нет
+	mustCycle(t, r) // first sighting of Down — the baseline, no event
 	for _, id := range modelIDs {
 		u.setUp(id)
 	}
-	mustCycle(t, r) // восстановление: событие для всех подписанных чатов
+	mustCycle(t, r) // recovery: an event for every subscribed chat
 	b.deliveryTick(context.Background())
 	if n := m.callCount("sendRichMessage"); n == 0 {
 		t.Fatal("seed: recovery notification must be delivered")
@@ -183,13 +183,14 @@ func seedNotifiedUp(t *testing.T, m *mockTG, u *scriptedUpstream, b *Bot, r *mon
 	m.resetCalls()
 }
 
-// Основной сценарий OPW-01 (§6): подписка → chat_notified=Up → монитор
-// фиксирует Down (событие в outbox) → доставка задерживается → следующий
-// цикл даёт Unknown → delivery выполняется (тишина) → цикл снова даёт Down
-// (живой инцидент подавляет новое событие) → delivery выполняется →
-// подписчик получает уведомление о падении.
-// На исходной реализации тест падает: первый delivery помечал событие sent
-// при Unknown, второго события не существовало — подписчик не узнавал о Down.
+// Main scenario: subscription → chat_notified=Up → the monitor records
+// Down (an event in the outbox) → delivery is delayed → the next cycle
+// yields Unknown → delivery runs (silence) → the cycle yields Down again
+// (the live incident suppresses a new event) → delivery runs → the
+// subscriber receives the down notification.
+// On the original implementation this test fails: the first delivery
+// marked the event sent at Unknown, no second event existed — the
+// subscriber never learned about the Down.
 func TestOPW01UnknownBetweenCyclesKeepsDownNotification(t *testing.T) {
 	m := newMockTG(t)
 	u := newScriptedUpstream("gpt-6-astra")
@@ -200,7 +201,7 @@ func TestOPW01UnknownBetweenCyclesKeepsDownNotification(t *testing.T) {
 	}
 	seedNotifiedUp(t, m, u, b, r, 100, "gpt-6-astra")
 
-	// цикл 1: Up → Down, событие ложится в outbox
+	// cycle 1: Up → Down, the event lands in the outbox
 	u.setDown("gpt-6-astra")
 	mustCycle(t, r)
 	rows := pendingRows(t, store)
@@ -209,14 +210,14 @@ func TestOPW01UnknownBetweenCyclesKeepsDownNotification(t *testing.T) {
 	}
 	downRowID := rows[0].ID
 
-	// цикл 2: Unknown (доставка так и не состоялась — бэклог/недоступность)
+	// cycle 2: Unknown (delivery never happened — backlog/unavailability)
 	u.setUnknown("gpt-6-astra")
 	mustCycle(t, r)
 	if rows := pendingRows(t, store); len(rows) != 1 {
 		t.Fatalf("unknown cycle must not touch the queue: %+v", rows)
 	}
 
-	// delivery при cur=Unknown: тишина, но свидетельство обязано выжить
+	// delivery at cur=Unknown: silence, but the evidence must survive
 	b.deliveryTick(ctx)
 	if n := m.callCount("sendRichMessage"); n != 0 {
 		t.Fatalf("cur Unknown must stay silent, got %d sends", n)
@@ -233,14 +234,14 @@ func TestOPW01UnknownBetweenCyclesKeepsDownNotification(t *testing.T) {
 	}
 	mustNotified(t, store, 100, "gpt-6-astra", status.Operational)
 
-	// цикл 3: снова Down — живой инцидент подавляет повторное событие
+	// cycle 3: Down again — the live incident suppresses a repeated event
 	u.setDown("gpt-6-astra")
 	res := mustCycle(t, r)
 	if len(res.Transitions) != 0 {
 		t.Fatalf("live incident must suppress a duplicate transition: %+v", res.Transitions)
 	}
 
-	// delivery: уведомление о падении доезжает
+	// delivery: the down notification arrives
 	if err := store.DeferOutboxRetry(downRowID, -time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +258,7 @@ func TestOPW01UnknownBetweenCyclesKeepsDownNotification(t *testing.T) {
 	}
 	mustNotified(t, store, 100, "gpt-6-astra", status.Down)
 
-	// сходимость: дальнейшие Down-циклы не плодят строки
+	// convergence: further Down cycles grow no rows
 	mustCycle(t, r)
 	mustCycle(t, r)
 	if rows := pendingRows(t, store); len(rows) != 0 {
@@ -265,11 +266,11 @@ func TestOPW01UnknownBetweenCyclesKeepsDownNotification(t *testing.T) {
 	}
 }
 
-// TTL (§6): Unknown длится дольше TTL outbox — исходная строка истекла
-// и удалена, но актуальное уведомление о Down всё равно доходит: сверка
-// chat_notified ↔ last_status вооружается самостоятельно. Мусор в очереди
-// при этом не накапливается. Вторая фаза — то же для потерянного
-// восстановления.
+// TTL: the Unknown period outlives the outbox TTL — the original row
+// expired and was dropped, but the current down notification still
+// arrives: the chat_notified ↔ last_status reconciliation arms itself.
+// No garbage accumulates in the queue. The second phase is the same for
+// a lost recovery.
 func TestOPW01TTLExpiryStillNotifies(t *testing.T) {
 	m := newMockTG(t)
 	u := newScriptedUpstream("gpt-6-astra")
@@ -280,7 +281,7 @@ func TestOPW01TTLExpiryStillNotifies(t *testing.T) {
 	}
 	seedNotifiedUp(t, m, u, b, r, 100, "gpt-6-astra")
 
-	// падение → Unknown → тихий delivery (строка припаркована) → TTL истёк
+	// fall → Unknown → a silent delivery (the row is parked) → TTL expired
 	u.setDown("gpt-6-astra")
 	mustCycle(t, r)
 	u.setUnknown("gpt-6-astra")
@@ -289,23 +290,23 @@ func TestOPW01TTLExpiryStillNotifies(t *testing.T) {
 	if n := m.callCount("sendRichMessage"); n != 0 {
 		t.Fatalf("unknown must stay silent, got %d sends", n)
 	}
-	if _, err := store.DropStaleOutbox(time.Nanosecond); err != nil { // исходная запись истекла
+	if _, err := store.DropStaleOutbox(time.Nanosecond); err != nil { // the original row expired
 		t.Fatal(err)
 	}
 	if rows := pendingRows(t, store); len(rows) != 0 {
 		t.Fatalf("expired row must be gone: %+v", rows)
 	}
 
-	// длительный Unknown: сверка не вооружается (нет достоверного
-	// состояния), очередь не растёт
+	// prolonged Unknown: the reconciliation does not arm (no definitive
+	// state), the queue does not grow
 	mustCycle(t, r)
 	mustCycle(t, r)
 	if rows := pendingRows(t, store); len(rows) != 0 {
 		t.Fatalf("unknown must not grow the queue: %+v", rows)
 	}
 
-	// модель снова Down: состояние фиксируется, событие подавлено живым
-	// инцидентом — но сверочная строка вооружается со следующего цикла
+	// the model is Down again: the state is recorded, the event is suppressed
+	// by the live incident — but the reconciliation row arms on the next cycle
 	u.setDown("gpt-6-astra")
 	mustCycle(t, r)
 	if rows := pendingRows(t, store); len(rows) != 0 {
@@ -317,7 +318,7 @@ func TestOPW01TTLExpiryStillNotifies(t *testing.T) {
 		t.Fatalf("exactly one reconcile row expected: %+v", rows)
 	}
 
-	// доставка: пользователь всё равно получает актуальное уведомление
+	// delivery: the user still receives the current notification
 	b.deliveryTick(ctx)
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("down must reach the subscriber after TTL expiry, got %d sends", n)
@@ -327,22 +328,22 @@ func TestOPW01TTLExpiryStillNotifies(t *testing.T) {
 	}
 	mustNotified(t, store, 100, "gpt-6-astra", status.Down)
 
-	// сходимость: сверка не плодит строки, пока состояние совпадает
+	// convergence: the reconciliation grows no rows while the state matches
 	mustCycle(t, r)
 	mustCycle(t, r)
 	if rows := pendingRows(t, store); len(rows) != 0 {
 		t.Fatalf("no garbage after convergence: %+v", rows)
 	}
 
-	// фаза 2: потерянное ВОССТАНОВЛЕНИЕ тоже самовосстанавливается
+	// phase 2: a lost RECOVERY also self-heals
 	u.setUnknown("gpt-6-astra")
 	mustCycle(t, r)
 	u.setUp("gpt-6-astra")
-	mustCycle(t, r)                                                   // Unknown→Up: событие восстановления создано…
-	if _, err := store.DropStaleOutbox(time.Nanosecond); err != nil { // …и истекло недоставленным
+	mustCycle(t, r)                                                   // Unknown→Up: the recovery event was created…
+	if _, err := store.DropStaleOutbox(time.Nanosecond); err != nil { // …and expired undelivered
 		t.Fatal(err)
 	}
-	mustCycle(t, r) // сверка: last=Up ≠ notified=Down
+	mustCycle(t, r) // reconciliation: last=Up ≠ notified=Down
 	rows = pendingRows(t, store)
 	if len(rows) != 1 || rows[0].Kind != "reconcile" {
 		t.Fatalf("recovery reconcile row expected: %+v", rows)
@@ -357,9 +358,9 @@ func TestOPW01TTLExpiryStillNotifies(t *testing.T) {
 	mustNotified(t, store, 100, "gpt-6-astra", status.Operational)
 }
 
-// FIFO и изоляция моделей (§6): A=Unknown с ожидающим событием, B=Down —
-// оба в одном подписанном чате. B доставляется своевременно, свидетельство
-// A сохраняется и доезжает, когда A получает достоверный статус.
+// FIFO and model isolation: A=Unknown with a pending event, B=Down — both
+// in one subscribed chat. B is delivered on time, A's evidence survives
+// and arrives when A gets a definitive status.
 func TestOPW01UnknownModelDoesNotBlockChatPeer(t *testing.T) {
 	m := newMockTG(t)
 	u := newScriptedUpstream("a", "b")
@@ -372,19 +373,19 @@ func TestOPW01UnknownModelDoesNotBlockChatPeer(t *testing.T) {
 	}
 	seedNotifiedUp(t, m, u, b, r, 100, "a", "b")
 
-	// A падает, затем B падает (разные циклы — разные строки)
+	// A falls, then B falls (different cycles — different rows)
 	u.setDown("a")
 	mustCycle(t, r)
 	u.setDown("b")
 	mustCycle(t, r)
-	// A теряет достоверность
+	// A loses definitiveness
 	u.setUnknown("a")
 	mustCycle(t, r)
-	if rows := pendingRows(t, store); len(rows) != 2 { // событие A, событие B; сверка не дублирует живое свидетельство
+	if rows := pendingRows(t, store); len(rows) != 2 { // A's event, B's event; the reconciliation does not duplicate live evidence
 		t.Fatalf("queue = %+v", rows)
 	}
 
-	// delivery: B уезжает, A остаётся
+	// delivery: B leaves, A stays
 	b.deliveryTick(ctx)
 	bodies := m.callBodies("sendRichMessage")
 	if len(bodies) != 1 {
@@ -397,10 +398,10 @@ func TestOPW01UnknownModelDoesNotBlockChatPeer(t *testing.T) {
 	if len(rows) != 1 || rows[0].Attempts != 0 || rows[0].NextAttemptAt == nil {
 		t.Fatalf("A's evidence must stay pending, parked, not failed: %+v", rows)
 	}
-	mustNotified(t, store, 100, "a", status.Operational) // A не тронуто
-	mustNotified(t, store, 100, "b", status.Down)        // B доставлено
+	mustNotified(t, store, 100, "a", status.Operational) // A untouched
+	mustNotified(t, store, 100, "b", status.Down)        // B delivered
 
-	// A получает достоверный Down — его уведомление доезжает
+	// A gets a definitive Down — its notification arrives
 	u.setDown("a")
 	mustCycle(t, r)
 	if rows := pendingRows(t, store); len(rows) != 1 {
@@ -424,8 +425,8 @@ func TestOPW01UnknownModelDoesNotBlockChatPeer(t *testing.T) {
 	mustNotified(t, store, 100, "b", status.Down)
 }
 
-// Сворачивание актуального состояния (§6): Up→Down→Unknown→Up при
-// notified=Up — устаревшего уведомления о Down не приходит.
+// Freshness collapse: Up→Down→Unknown→Up with notified=Up — no stale
+// down notification arrives.
 func TestOPW01DownUnknownUpSendsNoStaleHistory(t *testing.T) {
 	m := newMockTG(t)
 	u := newScriptedUpstream("gpt-6-astra")
@@ -441,11 +442,11 @@ func TestOPW01DownUnknownUpSendsNoStaleHistory(t *testing.T) {
 	u.setUnknown("gpt-6-astra")
 	mustCycle(t, r)
 	u.setUp("gpt-6-astra")
-	mustCycle(t, r) // Down→Unknown→Up: падение и восстановление по дороге
+	mustCycle(t, r) // Down→Unknown→Up: the fall and recovery both passed
 
 	b.deliveryTick(ctx)
 	if n := m.callCount("sendRichMessage"); n != 0 {
-		t.Fatalf("cur == notified — устаревшая история не отправляется, got %d sends", n)
+		t.Fatalf("cur == notified — no stale history is sent, got %d sends", n)
 	}
 	if rows := pendingRows(t, store); len(rows) != 0 {
 		t.Fatalf("rows must resolve without a message: %+v", rows)
@@ -453,7 +454,7 @@ func TestOPW01DownUnknownUpSendsNoStaleHistory(t *testing.T) {
 	mustNotified(t, store, 100, "gpt-6-astra", status.Operational)
 }
 
-// Последовательности нескольких циклов (§6).
+// Sequences of several cycles.
 func TestOPW01SequenceDownUnknownUnknownDown(t *testing.T) {
 	m := newMockTG(t)
 	u := newScriptedUpstream("gpt-6-astra")
@@ -540,8 +541,8 @@ func TestOPW01SequenceDownUnknownUp(t *testing.T) {
 	mustNotified(t, store, 100, "gpt-6-astra", status.Operational)
 }
 
-// Если Down был успешно доставлен, последующее Unknown→Up рождает
-// уведомление о восстановлении (инвариант «в итоге дойти»).
+// After a successfully delivered Down, a later Unknown→Up produces a
+// recovery notification (the "eventually arrives" invariant).
 func TestOPW01RecoveryAfterDeliveredDownStillArrives(t *testing.T) {
 	m := newMockTG(t)
 	u := newScriptedUpstream("gpt-6-astra")
@@ -554,7 +555,7 @@ func TestOPW01RecoveryAfterDeliveredDownStillArrives(t *testing.T) {
 
 	u.setDown("gpt-6-astra")
 	mustCycle(t, r)
-	b.deliveryTick(ctx) // 🔴 доставлено
+	b.deliveryTick(ctx) // the down was delivered
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("down must be delivered, got %d sends", n)
 	}
@@ -575,10 +576,10 @@ func TestOPW01RecoveryAfterDeliveredDownStillArrives(t *testing.T) {
 	mustNotified(t, store, 100, "gpt-6-astra", status.Operational)
 }
 
-// Повторная доставка (§6): Telegram подтвердил отправку, но фиксация в
-// SQLite упала — свидетельство и chat_notified не «фиктивно доставлены»;
-// повторный delivery доезжает дублем (допустимый at-least-once) и
-// фиксирует корректное состояние.
+// Re-delivery: Telegram confirmed the send, but the SQLite commit failed —
+// the evidence and chat_notified are not "fictitiously delivered"; the
+// retried delivery arrives as a duplicate (the accepted at-least-once
+// trade-off) and records the correct state.
 func TestOPW01CommitFailureKeepsEvidenceAndRedelivers(t *testing.T) {
 	m := newMockTG(t)
 	path := t.TempDir() + "/bot.db"
@@ -591,7 +592,7 @@ func TestOPW01CommitFailureKeepsEvidenceAndRedelivers(t *testing.T) {
 	if err := store.SetChatNotifiedState(100, "gpt-6-astra", status.Operational); err != nil {
 		t.Fatal(err)
 	}
-	// падение → событие; Unknown: строка переживает тихий delivery
+	// fall → event; Unknown: the row survives a silent delivery
 	checks := downChecks("gpt-6-astra", 503, "http")
 	seedCheck(t, b, checks)
 	commitCycle(t, b, cycle(checks, transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
@@ -602,7 +603,7 @@ func TestOPW01CommitFailureKeepsEvidenceAndRedelivers(t *testing.T) {
 	if rows := pendingRows(t, store); len(rows) != 1 {
 		t.Fatalf("evidence must survive the unknown tick: %+v", rows)
 	}
-	// свидетельство истекло (TTL) → сверочная строка вооружается
+	// the evidence expired (TTL) → the reconciliation row arms
 	if err := store.SetModelState("gpt-6-astra", status.Down, "http", "HTTP 503", time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +616,7 @@ func TestOPW01CommitFailureKeepsEvidenceAndRedelivers(t *testing.T) {
 		t.Fatalf("reconcile row must replace the expired evidence: %+v", rows)
 	}
 
-	// отправка успешна, коммит — нет: SQLite закрыт прямо во время send
+	// the send succeeds, the commit does not: SQLite is closed mid-send
 	m.handler = func(method string, body []byte) (any, int) {
 		if method == "sendRichMessage" {
 			_ = store.Close()
@@ -628,15 +629,15 @@ func TestOPW01CommitFailureKeepsEvidenceAndRedelivers(t *testing.T) {
 		t.Fatalf("one send must happen, got %d", n)
 	}
 
-	// рестарт на том же файле: ничего не зафиксировано — ни пометок,
-	// ни уведомлённого состояния
+	// restart on the same file: nothing is recorded — neither marks,
+	// nor the notified state
 	b2, store2 := newBotAt(t, m, path, models)
 	if rows := pendingRows(t, store2); len(rows) != 1 {
 		t.Fatalf("failed commit must leave the row pending: %+v", rows)
 	}
 	mustNotified(t, store2, 100, "gpt-6-astra", status.Operational)
 
-	// повторный delivery: дубль (at-least-once) и корректная фиксация
+	// the retried delivery: a duplicate (at-least-once) and a correct commit
 	m.handler = nil
 	b2.deliveryTick(ctx)
 	if n := m.callCount("sendRichMessage"); n < 2 {
@@ -648,8 +649,8 @@ func TestOPW01CommitFailureKeepsEvidenceAndRedelivers(t *testing.T) {
 	mustNotified(t, store2, 100, "gpt-6-astra", status.Down)
 }
 
-// Несколько чатов (§6): подписанный и неподписанный чаты, успешная доставка
-// и ошибка в другом — состояния чатов независимы.
+// Several chats: a subscribed and an unsubscribed chat, a successful
+// delivery and a failure in another — chat states are independent.
 func TestOPW01MultiChatIsolation(t *testing.T) {
 	m := newMockTG(t)
 	u := newScriptedUpstream("gpt-6-astra")
@@ -664,7 +665,7 @@ func TestOPW01MultiChatIsolation(t *testing.T) {
 	mustNotified(t, store, 200, "gpt-6-astra", status.Operational)
 	m.resetCalls()
 
-	// падение: строки только подписанным чатам
+	// fall: rows only for subscribed chats
 	u.setDown("gpt-6-astra")
 	mustCycle(t, r)
 	rows := pendingRows(t, store)
@@ -677,7 +678,7 @@ func TestOPW01MultiChatIsolation(t *testing.T) {
 		}
 	}
 
-	// чат 200 errorит: чат 100 доставляется независимо от порядка обработки
+	// chat 200 errors: chat 100 is delivered independently of processing order
 	fail200 := true
 	m.handler = func(method string, body []byte) (any, int) {
 		if method == "sendRichMessage" && fail200 {
@@ -691,12 +692,12 @@ func TestOPW01MultiChatIsolation(t *testing.T) {
 		return map[string]any{"ok": true, "result": map[string]any{"message_id": m.nextMessageID()}}, http.StatusOK
 	}
 	b.deliveryTick(ctx)
-	mustNotified(t, store, 100, "gpt-6-astra", status.Down) // успех одного чата
+	mustNotified(t, store, 100, "gpt-6-astra", status.Down) // one chat's success
 	rows = pendingRows(t, store)
 	if len(rows) != 1 || rows[0].ChatID != 200 {
 		t.Fatalf("only the failed chat's row must stay: %+v", rows)
 	}
-	mustNotified(t, store, 200, "gpt-6-astra", status.Operational) // ошибка не двигает chat_notified
+	mustNotified(t, store, 200, "gpt-6-astra", status.Operational) // the failure does not move chat_notified
 	c100, c200 := 0, 0
 	for _, c := range m.sentChatIDs("sendRichMessage") {
 		switch c {
@@ -713,7 +714,7 @@ func TestOPW01MultiChatIsolation(t *testing.T) {
 		t.Fatalf("chat 200 must be attempted, got %d", c200)
 	}
 
-	// чат 200 оживает: его уведомление доезжает, чат 100 не дёргается
+	// chat 200 revives: its notification arrives, chat 100 is not touched
 	fail200 = false
 	m.handler = nil
 	m.resetCalls()
@@ -731,7 +732,7 @@ func TestOPW01MultiChatIsolation(t *testing.T) {
 	}
 }
 
-// parseBody — тело вызова как объект (чтобы читалось одной строкой).
+// parseBody parses a call body as an object (for one-line reads).
 func parseBody(t *testing.T, body []byte) map[string]any {
 	t.Helper()
 	var p map[string]any
@@ -741,11 +742,11 @@ func parseBody(t *testing.T, body []byte) map[string]any {
 	return p
 }
 
-// Ревью P2-3а: grouped-строка с ДВУМЯ моделями, одна из которых Unknown.
-// Строка гасится только целиком (частичная пометка невозможна), но свёртка
-// не удерживает достоверную модель: строки достоверных моделей уходят
-// сразу (chat_notified фиксирует только реально отправленное), строка
-// остаётся pending, пока все её модели не станут достоверными.
+// A grouped row with TWO models, one of which is Unknown. The row is
+// resolved only as a whole (a partial sent mark is impossible), but the
+// collapse does not hold back the definitive model: the definitive
+// models' lines leave at once (chat_notified records only what was really
+// sent), while the row stays pending until all its models are definitive.
 func TestOPW01MixedRowWaitsForAllItsModels(t *testing.T) {
 	m := newMockTG(t)
 	u := newScriptedUpstream("a", "b")
@@ -758,7 +759,7 @@ func TestOPW01MixedRowWaitsForAllItsModels(t *testing.T) {
 	}
 	seedNotifiedUp(t, m, u, b, r, 100, "a", "b")
 
-	// падение ОБЕИХ моделей одним циклом: одна строка с двумя переходами
+	// BOTH models fall in one cycle: one row with two transitions
 	u.setDown("a")
 	u.setDown("b")
 	mustCycle(t, r)
@@ -766,12 +767,12 @@ func TestOPW01MixedRowWaitsForAllItsModels(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("one grouped row expected: %+v", rows)
 	}
-	// a теряет достоверность
+	// a loses definitiveness
 	u.setUnknown("a")
 	mustCycle(t, r)
 
-	// delivery: строка b уходит (достоверна), сама строка НЕ гасится —
-	// свидетельство об a живо
+	// delivery: b's line leaves (definitive), the row itself is NOT resolved —
+	// the evidence about a stays alive
 	b.deliveryTick(ctx)
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("b's line must be delivered on time, got %d sends", n)
@@ -783,16 +784,16 @@ func TestOPW01MixedRowWaitsForAllItsModels(t *testing.T) {
 	if len(rows) != 1 || rows[0].Attempts != 0 || rows[0].NextAttemptAt == nil {
 		t.Fatalf("mixed row must stay pending, parked: %+v", rows)
 	}
-	mustNotified(t, store, 100, "a", status.Operational) // a не тронуто
-	mustNotified(t, store, 100, "b", status.Down)        // b реально доставлено
+	mustNotified(t, store, 100, "a", status.Operational) // a untouched
+	mustNotified(t, store, 100, "b", status.Down)        // b really delivered
 
-	// повторный тик при том же состоянии: без дублей, без спама
+	// a repeated tick at the same state: no duplicates, no spam
 	b.deliveryTick(ctx)
 	if n := m.callCount("sendRichMessage"); n != 1 {
 		t.Fatalf("no duplicate for the parked row, got %d sends", n)
 	}
 
-	// обе модели достоверны: строка a уходит, строка гасится целиком
+	// both models definitive: a's line leaves, the row resolves as a whole
 	u.setDown("a")
 	mustCycle(t, r)
 	if rows := pendingRows(t, store); len(rows) != 1 {
@@ -816,9 +817,9 @@ func TestOPW01MixedRowWaitsForAllItsModels(t *testing.T) {
 	mustNotified(t, store, 100, "b", status.Down)
 }
 
-// Ревью P2-3б: сверка перевооружается в НОВОМ процессе: последний коммит
-// старого процесса зафиксировал last=Down при notified=Up, исходная строка
-// истекла по TTL, рестарт — первый же цикл нового процесса вооружает сверку.
+// Reconciliation re-arms in a NEW process: the old process's last commit
+// recorded last=Down with notified=Up, the original row expired by TTL,
+// and the new process's first cycle arms the reconciliation.
 func TestOPW01ReconcileArmsAfterRestart(t *testing.T) {
 	m := newMockTG(t)
 	path := t.TempDir() + "/bot.db"
@@ -831,7 +832,7 @@ func TestOPW01ReconcileArmsAfterRestart(t *testing.T) {
 	if err := store.SetChatNotifiedState(100, "gpt-6-astra", status.Operational); err != nil {
 		t.Fatal(err)
 	}
-	// старый процесс: падение зафиксировано, строка событий истекла по TTL
+	// the old process: the fall is recorded, the event row expired by TTL
 	checks := downChecks("gpt-6-astra", 503, "http")
 	seedCheck(t, b, checks)
 	commitCycle(t, b, cycle(checks, transition("gpt-6-astra", status.Operational, status.Down, time.Now(), nil)))
@@ -842,7 +843,8 @@ func TestOPW01ReconcileArmsAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// новый процесс: первый цикл вооружает сверку (событие подавлено инцидентом)
+	// the new process: the first cycle arms the reconciliation (the event is
+	// suppressed by the incident)
 	b2, store2 := newBotAt(t, m, path, models)
 	commitCycle(t, b2, cycle(downChecks("gpt-6-astra", 503, "http")))
 	rows := pendingRows(t, store2)

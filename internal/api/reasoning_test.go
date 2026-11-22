@@ -10,9 +10,9 @@ import (
 	"time"
 )
 
-// Реальный ответ Tonworld: reasoning-модели шлют только reasoning_content
-// при небольшом max_tokens. Это НЕ пустая генерация (kind ""), но итогового
-// ответа нет: Content пуст — классификация даст Down.
+// A real Tonworld reply: at a small max_tokens reasoning models send only
+// reasoning_content. This is NOT an empty generation (kind ""), but there is
+// no final answer: Content is empty — classification will yield Down.
 func TestGenerateReasoningOnlyStreamNoContent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -50,8 +50,8 @@ func TestGenerateReasoningOnlyStreamNoContent(t *testing.T) {
 	}
 }
 
-// reasoning никогда не попадает в Content: итоговый ответ — только
-// конкатенация delta.content (даже когда reasoning осмыслен).
+// Reasoning never lands in Content: the final answer is only the
+// concatenation of delta.content (even when reasoning is meaningful).
 func TestGenerateStreamContentExcludesReasoning(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -73,7 +73,8 @@ func TestGenerateStreamContentExcludesReasoning(t *testing.T) {
 	}
 }
 
-// reasoning-мусор + итоговый «OK» (стрим): Content — ровно ответ модели.
+// Reasoning garbage + a final "OK" (stream): Content is exactly the model's
+// answer.
 func TestGenerateStreamReasoningGarbageFinalOK(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -93,8 +94,8 @@ func TestGenerateStreamReasoningGarbageFinalOK(t *testing.T) {
 	}
 }
 
-// reasoning «OK» + итоговый текст об ошибке (без стрима): Content —
-// message.content, reasoning не считается ответом.
+// Reasoning "OK" + a final error text (no stream): Content is
+// message.content; reasoning does not count as the answer.
 func TestGenerateNoStreamReasoningOKFinalErrorText(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":"Извините, я не могу выполнить этот запрос.","reasoning_content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}`)
@@ -110,8 +111,8 @@ func TestGenerateNoStreamReasoningOKFinalErrorText(t *testing.T) {
 	}
 }
 
-// Патологически длинный стрим: накопленный content обрезан по maxTextRunes
-// рун с видимым «…» (appendCapped).
+// A pathologically long stream: the accumulated content is capped at
+// maxTextRunes runes with a visible "…" (appendCapped).
 func TestGenerateStreamContentCapped(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -137,7 +138,7 @@ func TestGenerateStreamContentCapped(t *testing.T) {
 	}
 }
 
-// Пустая генерация: ни content, ни reasoning, completion_tokens == 0.
+// A truly empty generation: no content, no reasoning, completion_tokens == 0.
 func TestGenerateTrulyEmptyStream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -155,7 +156,7 @@ func TestGenerateTrulyEmptyStream(t *testing.T) {
 	}
 }
 
-// 200 без usage и без текста — пустая генерация, не Operational.
+// 200 without usage and without text — an empty generation, not Operational.
 func TestGenerateEmptyWithoutUsage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -171,8 +172,9 @@ func TestGenerateEmptyWithoutUsage(t *testing.T) {
 	}
 }
 
-// Не-stream ответ с reasoning непустой, content пуст: генерация была
-// (kind ""), итогового ответа нет — Content пуст, классификация даст Down.
+// A non-stream response with non-empty reasoning and empty content:
+// generation happened (kind ""), but there is no final answer — Content is
+// empty, classification will yield Down.
 func TestGenerateReasoningNoStream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"thinking"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}`)

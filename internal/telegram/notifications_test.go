@@ -29,17 +29,17 @@ func transition(id string, from, to status.Status, at time.Time, incident *stora
 	return monitor.Transition{ModelID: id, From: from, To: to, Check: c, Incident: incident}
 }
 
-// downChecks — состояние БД после падения модели с указанной ошибкой.
+// downChecks is the DB state after a model fall with the given error.
 func downChecks(id string, httpStatus int, errType string) map[string]storage.Check {
 	c := storage.Check{ModelID: id, At: time.Now(), Status: status.Down, HTTPStatus: httpStatus, ErrorType: errType}
 	return map[string]storage.Check{id: c}
 }
 
-// Уведомление получает только подписанный на модель чат.
+// Only a chat subscribed to the model receives the notification.
 func TestNotifyOnlySubscribedChats(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
-	// чат 100 подписан на gpt-6-astra, чат 200 — на glm-5.3
+	// chat 100 subscribes to gpt-6-astra, chat 200 — to glm-5.3
 	if err := store.SetSubscription(100, "gpt-6-astra", true); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestNotifyOnlySubscribedChats(t *testing.T) {
 	}
 }
 
-// Неподписанный чат не получает уведомлений.
+// An unsubscribed chat receives no notifications.
 func TestNotifySkipsUnsubscribed(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -79,8 +79,8 @@ func TestNotifySkipsUnsubscribed(t *testing.T) {
 	}
 }
 
-// Первый цикл (базлайн, без переходов) — без лавины сообщений: события
-// создаются только при смене состояния, prev=="" молчит.
+// The first cycle (a baseline, no transitions) — no message flood: events
+// are created only on a state change, prev=="" stays silent.
 func TestFirstCycleNoFlood(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -102,8 +102,8 @@ func TestFirstCycleNoFlood(t *testing.T) {
 	}
 }
 
-// Смешанные события цикла — ОДНО rich-сообщение на чат, строки в порядке
-// конфига: падение интерактивно, восстановление — без кнопки.
+// Mixed cycle events — ONE rich message per chat, lines in config order:
+// a fall is interactive, a recovery has no button.
 func TestMixedTransitionsOneMessageConfigOrder(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -131,7 +131,7 @@ func TestMixedTransitionsOneMessageConfigOrder(t *testing.T) {
 	if !strings.Contains(html, down) || !strings.Contains(html, rec) {
 		t.Fatalf("both lines expected:\n%s", html)
 	}
-	// порядок строк — порядок конфигурации: gpt-6-astra раньше glm-5.3
+	// line order follows the config order: gpt-6-astra before glm-5.3
 	if !(strings.Index(html, "gpt-6-astra") < strings.Index(html, "glm-5.3")) {
 		t.Fatalf("config order broken:\n%s", html)
 	}
@@ -140,8 +140,8 @@ func TestMixedTransitionsOneMessageConfigOrder(t *testing.T) {
 	}
 }
 
-// Никаких заголовков и футеров: ни «OpenTW», ни «недоступна», ни «Восстановились»,
-// Ни «Проверено», ни «Длительность», ни «Массовый», ни «ещё N».
+// No headers or footers: no "OpenTW", no availability words, no counts,
+// no durations, no bulk labels, no "more N" hints.
 func TestNotificationNoHeadersOrFooters(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -171,7 +171,8 @@ func TestNotificationNoHeadersOrFooters(t *testing.T) {
 	}
 }
 
-// Label кнопки уведомления — из ПОСЛЕДНЕЙ проверки модели: timeout → Timeout.
+// The notification's button label comes from the model's LATEST check:
+// timeout → Timeout.
 func TestNotificationTimeoutLabel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -188,7 +189,7 @@ func TestNotificationTimeoutLabel(t *testing.T) {
 	}
 }
 
-// 200 с неожиданным текстом: label «Unexpected response».
+// 200 with an unexpected text: the label "Unexpected response".
 func TestNotificationUnexpectedResponseLabel(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -205,8 +206,8 @@ func TestNotificationUnexpectedResponseLabel(t *testing.T) {
 	}
 }
 
-// Строка падения у уведомления — тот же HTML, что строит панель (общий
-// downModelLine); уведомление лишь оборачивает строку в <p>.
+// The notification's down line is the same HTML the panel builds (the shared
+// downModelLine); the notification only wraps the line in <p>.
 func TestDownLineMatchesModelLine(t *testing.T) {
 	m := storage.Model{ID: "gpt-6-astra", Family: "GPT"}
 	for _, c := range []storage.Check{
@@ -221,8 +222,8 @@ func TestDownLineMatchesModelLine(t *testing.T) {
 	}
 }
 
-// Бот больше не может писать в чат (403 blocked) — подписки мертвы,
-// из хранилища удаляются подписки и очередь чата.
+// The bot can no longer write to the chat (403 blocked) — subscriptions are
+// dead; the chat's subscriptions and queue are removed from the store.
 func TestNotifyDropsSubscriptionsOfDeadChat(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)
@@ -248,7 +249,7 @@ func TestNotifyDropsSubscriptionsOfDeadChat(t *testing.T) {
 	}
 }
 
-// Временный сбой сервера (5xx) не должен выбрасывать подписки.
+// A transient server failure (5xx) must not drop subscriptions.
 func TestNotifyKeepsSubscriptionsOnTransientError(t *testing.T) {
 	m := newMockTG(t)
 	b, store := newBot(t, m)

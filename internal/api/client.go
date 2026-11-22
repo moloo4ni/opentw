@@ -30,18 +30,16 @@ func (c *Client) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
-// minGenerationUS — минимальная длительность генерации, при которой TPS
-// считается достоверным (буферизованные SSE-потоки дают ~0).
+// minGenerationUS is the shortest generation time TPS is trustworthy for
+// (a fully buffered SSE stream yields ~0).
 const minGenerationUS = 100_000
 
-// maxTextRunes — предел для сохраняемого текста ответа/ошибки провайдера.
-// Заметно больше любых реальных тел (max_tokens ограничивает генерацию),
-// но ограничивает патологические страницы ошибок в хранилище. Обрезка
-// видима («…»), сырых данных больше, чем прочитано, всё равно не бывает:
-// тела ограничены maxBodyBytes.
+// maxTextRunes caps stored response/error text: far above real replies
+// (max_tokens bounds generation), but keeps pathological error pages out of
+// storage. Truncation is visible ("…"); raw bytes are bounded by maxBodyBytes.
 const maxTextRunes = 16384
 
-// maxBodyBytes — сколько байтов тела ответа читаем и сохраняем.
+// maxBodyBytes is how many response body bytes are read and kept.
 const maxBodyBytes = 1 << 16
 
 func readLimited(r io.Reader, limit int64) ([]byte, error) {
@@ -131,8 +129,7 @@ func (c *Client) Generate(ctx context.Context, modelID string, maxTokens int) *R
 		res.LatencyUS = usSince(start)
 		res.ErrorKind = "http"
 		res.ErrorMessage = extractProviderError(errBody, resp.StatusCode)
-		// диагностический ответ API — дословно (провайдерский текст либо
-		// «HTTP <код>», когда тело пусто)
+		// Diagnostic response, verbatim: provider text or "HTTP <code>".
 		res.Response = res.ErrorMessage
 		return res
 	}
@@ -146,10 +143,10 @@ func (c *Client) Generate(ctx context.Context, modelID string, maxTokens int) *R
 	return res
 }
 
-// classifyTransport — единая классификация транспортных сбоев: одинаковая
-// сетевая причина даёт одинаковый kind и до заголовков, и при чтении тела
-// ответа. Отмена → cancelled (штатная остановка не создаёт ложное состояние
-// модели), таймаут → timeout, прочий разрыв (refused/reset/DNS) → connrefused.
+// classifyTransport maps transport failures to one error kind, both before
+// headers and while reading the body. Cancelled → "cancelled" (a normal
+// shutdown must not fake a model state), timeout → "timeout", other
+// disconnects (refused/reset/DNS) → "connrefused".
 func classifyTransport(ctx context.Context, err error) string {
 	switch {
 	case errors.Is(ctx.Err(), context.Canceled), errors.Is(err, context.Canceled):
@@ -182,9 +179,8 @@ func (c *Client) consumeStream(ctx context.Context, body io.Reader, res *RawResu
 	}
 	res.FinishReason = out.finishReason
 	if out.dataErr != "" && !out.generated {
-		// Шлюз сообщил об ошибке прямо в SSE-данных: HTTP 200 без генерации —
-		// «empty» (паритет с non-stream), исходный текст провайдера
-		// сохраняется дословно.
+		// Gateway error inside SSE data: HTTP 200 without generation is
+		// "empty" (parity with non-stream); the provider text is kept verbatim.
 		res.ErrorKind, res.ErrorMessage = "empty", out.dataErr
 		res.Response = out.dataErr
 		return
@@ -193,14 +189,14 @@ func (c *Client) consumeStream(ctx context.Context, body io.Reader, res *RawResu
 	res.Response = out.content
 	if !out.sawData || !out.parsedAny {
 		if msg := bodyGatewayError(out.rawPrefix); msg != "" {
-			// stream:true, но SSE-данных не было: шлюз отдал JSON с ошибкой —
-			// это не «ошибка монитора» и не разрыв соединения
+			// stream:true with no SSE data: the gateway returned a JSON error,
+			// not a monitor failure or a disconnect.
 			res.ErrorKind, res.ErrorMessage = "empty", msg
 			res.Response = msg
 			return
 		}
 		res.ErrorKind, res.ErrorMessage = "invalid", "unparseable response body"
-		// исходное тело, как оно есть, — единственный достоверный след
+		// The raw body is the only reliable trace.
 		res.Response = truncate(strings.TrimSpace(string(bytes.ToValidUTF8(out.rawPrefix, nil))), maxTextRunes)
 		return
 	}
@@ -221,8 +217,8 @@ func (c *Client) consumeStream(ctx context.Context, body io.Reader, res *RawResu
 		gen = 0
 	}
 	res.GenUS = ptr64(gen)
-	// Буферизованный провайдер отдаёт весь ответ одним залпом: TPS по такому
-	// интервалу был бы выдумкой, поэтому требуется минимальная длительность.
+	// A buffered provider sends the whole reply at once; TPS over such an
+	// interval would be invented, hence the minimum duration.
 	if res.OutputTokens != nil && *res.OutputTokens > 0 && gen >= minGenerationUS {
 		res.TPS = ptrF64(float64(*res.OutputTokens) / (float64(gen) / 1e6))
 	}
@@ -231,8 +227,8 @@ func (c *Client) consumeStream(ctx context.Context, body io.Reader, res *RawResu
 func (c *Client) consumeFull(ctx context.Context, body io.Reader, res *RawResult) {
 	raw, err := readLimited(body, maxBodyBytes)
 	if err != nil {
-		// чтение тела после заголовков классифицируется транспортной причиной,
-		// а не «некорректным ответом» (1.2)
+		// A body-read failure after headers is a transport failure, not an
+		// invalid response.
 		res.ErrorKind, res.ErrorMessage = classifyTransport(ctx, err), errSummary(err)
 		return
 	}
@@ -253,9 +249,9 @@ func (c *Client) consumeFull(ctx context.Context, body io.Reader, res *RawResult
 	content := ""
 	generated := false
 	selected := -1
-	// Несколько choices: классифицируется та же choice, чей content фактически
-	// используется. При отсутствии content выбирается первая содержательная
-	// choice (reasoning-only), чтобы finish_reason относился к ней.
+	// With several choices, classify the choice whose content is used;
+	// without content pick the first choice with reasoning so its
+	// finish_reason is the one carried.
 	for i := range parsed.Choices {
 		msg := parsed.Choices[i].Message
 		if msg.Content != "" {
@@ -275,8 +271,8 @@ func (c *Client) consumeFull(ctx context.Context, body io.Reader, res *RawResult
 		}
 	}
 	if selected == -1 {
-		// Полностью пустой ответ тоже может сообщать причину завершения
-		// (например, length). Значение не выдумываем, а только переносим его.
+		// A fully empty response may still report a finish reason (e.g.
+		// length); pass it through as-is.
 		for i := range parsed.Choices {
 			if parsed.Choices[i].FinishReason != nil && *parsed.Choices[i].FinishReason != "" {
 				selected = i
@@ -287,14 +283,13 @@ func (c *Client) consumeFull(ctx context.Context, body io.Reader, res *RawResult
 	if selected >= 0 && parsed.Choices[selected].FinishReason != nil {
 		res.FinishReason = *parsed.Choices[selected].FinishReason
 	}
-	// Итоговый ответ — message.content (reasoning им не является);
-	// оригинальный ответ сохраняется дословно.
+	// The final answer is message.content (never reasoning); kept verbatim.
 	res.Content = content
 	res.Response = content
 	if !generated {
 		res.ErrorKind = "empty"
-		// некоторые шлюзы возвращают 200 с JSON-ошибкой: её дословный текст
-		// и есть диагностический ответ; без него quotes не будет вовсе
+		// Some gateways return 200 with a JSON error: its verbatim text is
+		// the diagnostic answer.
 		if parsed.Error != nil && parsed.Error.Message != "" {
 			res.ErrorMessage = truncate(parsed.Error.Message, maxTextRunes)
 			res.Response = res.ErrorMessage
@@ -326,8 +321,8 @@ func isTimeout(err error) bool {
 
 func errSummary(err error) string {
 	msg := err.Error()
-	// обрезка по рунам: байтовый срез мог бы ломать многобайтовые символы
-	// и отправлять в Telegram невалидный UTF-8
+	// Truncate by runes: a byte slice could split multibyte characters and
+	// send invalid UTF-8 to Telegram.
 	if r := []rune(msg); len(r) > maxTextRunes {
 		return string(r[:maxTextRunes])
 	}

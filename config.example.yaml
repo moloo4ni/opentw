@@ -1,34 +1,35 @@
-# OpenTW — конфигурация (без секретов; секреты только в .env).
+# OpenTW configuration (no secrets here; secrets live in .env only).
 
-# Базовый URL API; ENV API_BASE_URL имеет приоритет над этим значением.
+# API base URL; the API_BASE_URL env var takes precedence over this value.
 api_base_url: https://kube943.prod.tonworld.ru
 
-# Интервал мониторинга (первый цикл стартует сразу после запуска).
+# Monitoring interval (the first cycle starts right after startup).
 interval: 15m
 
-# HTTP timeout для одного запроса проверки. Reasoning-модели бывают
-# медленными (живой замер: до ~55с), поэтому запас обязателен.
+# HTTP timeout for one probe request. Reasoning models can be slow
+# (a live measurement showed up to ~55s), so headroom is mandatory.
 http_timeout: 120s
 
-# Максимум одновременных проверок моделей.
+# Maximum simultaneous model checks.
 concurrency: 4
 
-# Лимит выходных токенов тестового запроса.
-# 256 даёт reasoning-моделям бюджет успеть завершить рассуждение и выдать
-# итоговый ответ; успех по-прежнему требует ровно «OK» в пользовательском content.
+# Output token limit for the probe request. 256 gives reasoning models
+# the budget to finish reasoning and produce the final answer; success
+# still requires exactly "OK" in the user-facing content.
 max_tokens: 256
 
-# Использовать streaming: он измеряет TTFT/TPS (сохраняются в истории проверок).
-# false — только latency. Проверка успешности (ответ «OK») не зависит от этого.
+# Use streaming: it measures TTFT/TPS (stored in the check history).
+# false — latency only. The success check (the "OK" answer) does not
+# depend on this.
 streaming: true
 
-# Путь к SQLite.
+# SQLite database path.
 sqlite_path: /data/opentw.db
 
-# Мониторируемые модели: точные model ID из каталога API, сгруппированные
-# по семействам для отображения. Модель, исчезнувшая из каталога, всё
-# равно проверяется реальным запросом: фиксируется настоящий ответ API.
-# Новые модели добавляются правкой этого списка (перечень берётся из GET /v1/models).
+# Monitored models: exact model IDs from the API catalog, grouped into
+# families for display. A model that disappeared from the catalog is still
+# probed with a real request: the actual API answer is recorded. New models
+# are added by editing this list (the catalog comes from GET /v1/models).
 models:
   - family: GPT
     ids:

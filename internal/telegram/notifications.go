@@ -8,21 +8,21 @@ import (
 	"opentw/internal/storage"
 )
 
-// deliveryPayload — содержимое строки outbox: события цикла, адресованные
-// одному чату. Строки-этикетки (label) доставки строит по ТЕКУЩЕМУ состоянию
-// модели, payload нужен только для группировки по моделям.
+// deliveryPayload is the content of an outbox row: the cycle's events for one
+// chat. Delivery builds the line labels from the model's CURRENT state; the
+// payload is only needed for grouping by model.
 type deliveryPayload struct {
 	Trs []monitor.Transition `json:"trs"`
 }
 
-// prepareTransitions группирует переходы цикла по подписанным чатам и готовит
-// по одной outbox-строке на чат: события одного цикла приходят одним
-// сообщением. Записи не пишет — их фиксирует раннер через Store.ApplyCycle
-// атомарно с состояниями моделей. Ошибка чтения подписчиков — ошибка
-// всего цикла: следующий цикл переоткроет те же переходы, потери нет.
+// prepareTransitions groups the cycle's transitions by subscribed chat and
+// prepares one outbox row per chat: one cycle's events arrive as one message.
+// It performs no writes — the runner commits them via Store.ApplyCycle
+// atomically with the model states. A subscriber read failure fails the whole
+// cycle: the next cycle reopens the same transitions, nothing is lost.
 func (b *Bot) prepareTransitions(res monitor.CycleResult) ([]storage.OutboxEvent, error) {
 	var events []storage.OutboxEvent
-	covered := map[int64]map[string]bool{} // (чат, модель), уже покрытые событием цикла
+	covered := map[int64]map[string]bool{} // (chat, model) pairs already covered by a cycle event
 	if len(res.Transitions) > 0 {
 		perChat := map[int64][]monitor.Transition{}
 		for _, tr := range res.Transitions {
@@ -52,29 +52,29 @@ func (b *Bot) prepareTransitions(res monitor.CycleResult) ([]storage.OutboxEvent
 			events = append(events, storage.OutboxEvent{ChatID: chatID, Kind: kind, DedupeKey: dedupeKey, Payload: payload})
 		}
 	}
-	// Сверочный резерв (OPW-01): уведомление об актуальном достоверном
-	// состоянии не может зависеть от выживания исходной outbox-строки —
-	// истечение TTL, поглощение при смене состояния или подавление
-	// повторного события живым инцидентом не должны оставлять подписчика
-	// в неведении. Расхождение chat_notified с зафиксированным состоянием
-	// само по себе требует доставки: паре добавляется сверочная строка.
-	// Коммитит её раннер атомарно с состояниями цикла (ApplyCycle), поэтому
-	// «строка есть — состояния нет» невозможно. Дедуп-ключ несёт эпоху
-	// (updated_at chat_notified): пока уведомлённое состояние не менялось,
-	// строка одна и не плодится каждый цикл; после доставки эпоха новая —
-	// ключ не конфликтует с уже отправленными строками; TTL-удаление
-	// освобождает ключ. Сверка читает зафиксированные состояния ПРОШЛЫХ
-	// циклов (до коммита текущего): свежее расхождение вооружается
-	// следующим циклом — самовосстановление с задержкой ≤ Interval.
-	// Пара с живым недоставленным свидетельством в очереди сверкой
-	// НЕ дублируется: свёртка доставки всё равно даёт одну строку по
-	// текущему состоянию, дубль лишь удлинял бы очередь.
+	// Reconciliation fallback: a notification about the current definitive
+	// state must not depend on the survival of the original outbox row — TTL
+	// expiry, swallowing on a state change or suppression of a repeated event
+	// by a live incident must not leave the subscriber in the dark. A
+	// chat_notified divergence from the settled state warrants delivery by
+	// itself: the pair gets a reconciliation row. The runner commits it
+	// atomically with the cycle's states (ApplyCycle), so "row without state"
+	// is impossible. The dedupe key carries the epoch (chat_notified
+	// updated_at): while the notified state is unchanged there is one row, not
+	// a new one per cycle; after delivery the epoch is new — the key does not
+	// collide with already sent rows; TTL cleanup frees the key. The
+	// reconciliation reads states committed by PAST cycles (before the current
+	// commit): a fresh divergence arms on the next cycle — self-healing with
+	// a delay ≤ Interval. A pair with a live undelivered evidence row in the
+	// queue is NOT duplicated by reconciliation: the delivery collapse still
+	// yields one line for the current state, a duplicate would only lengthen
+	// the queue.
 	stale, err := b.store.StaleNotifyPairs()
 	if err != nil {
 		return nil, fmt.Errorf("notify: stale pairs: %w", err)
 	}
 	if len(stale) > 0 {
-		// модели, чьё свидетельство уже ждёт в очереди чата
+		// models whose evidence is already queued for the chat
 		pendingOf := map[int64]map[string]bool{}
 		for _, p := range stale {
 			if _, ok := pendingOf[p.ChatID]; ok {
@@ -97,10 +97,10 @@ func (b *Bot) prepareTransitions(res monitor.CycleResult) ([]storage.OutboxEvent
 		}
 		for _, p := range stale {
 			if covered[p.ChatID] != nil && covered[p.ChatID][p.ModelID] {
-				continue // событие этого цикла уже несёт актуальное состояние пары
+				continue // this cycle's event already carries the pair's current state
 			}
 			if pendingOf[p.ChatID][p.ModelID] {
-				continue // недоставленное свидетельство ещё живо в очереди
+				continue // undelivered evidence is still alive in the queue
 			}
 			payload, err := json.Marshal(deliveryPayload{Trs: []monitor.Transition{{
 				ModelID: p.ModelID, From: p.Notified, To: p.Current,
@@ -117,14 +117,14 @@ func (b *Bot) prepareTransitions(res monitor.CycleResult) ([]storage.OutboxEvent
 	return events, nil
 }
 
-// downLine — строка падения модели в уведомлении: общий с панелью HTML
-// строит downModelLine, кнопка — с подписью из ПОСЛЕДНЕЙ проверки;
-// доставщик передаёт актуальный check из БД.
+// downLine is a model-fall notification line: the HTML is shared with the
+// panel via downModelLine; the button carries the LAST check's label;
+// the delivery worker passes the current check from the DB.
 func downLine(modelID string, c storage.Check) string {
 	return "<p>" + downModelLine(modelID, shortErrorLabel(c)) + "</p>"
 }
 
-// recoveredLine — строка восстановления: без кнопки.
+// recoveredLine is a recovery line: no button.
 func recoveredLine(modelID string) string {
 	return "<p>🟢 " + codeID(modelID) + " - Восстановилась</p>"
 }

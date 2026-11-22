@@ -18,9 +18,9 @@ func contentOK(kind string, content string) api.RawResult {
 	return api.RawResult{ErrorKind: kind, HTTPStatus: 200, Content: content, Response: content}
 }
 
-// Матрица классификации 15.1: успешна только проверка с итоговым
-// содержимым «OK» (без reasoning); любой иной текст при HTTP 200 — Down;
-// проблемы самого монитора — Unknown.
+// Classification matrix: only a check whose final content is exactly "OK"
+// (reasoning excluded) succeeds; any other text with HTTP 200 is Down;
+// monitor-side problems are Unknown.
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		name string
@@ -55,8 +55,8 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// reasoning не является ответом: «мусор» в reasoning при итоговом «OK» —
-// Operational; «OK» в reasoning при ином итоговом тексте — Down.
+// Reasoning is not the answer: garbage in reasoning with a final "OK" is
+// Operational; "OK" in reasoning with a different final text is Down.
 func TestClassifyReasoningIgnoredForVerdict(t *testing.T) {
 	if got := Classify(contentOK("", "OK")); got != StatusOperational {
 		t.Errorf("reasoning мусора не видно: итог OK → %q", got)
@@ -69,9 +69,9 @@ func TestClassifyReasoningIgnoredForVerdict(t *testing.T) {
 	}
 }
 
-// Пользовательский контракт: отдельное служебное reasoning поле не меняет
-// классификацию; итоговый content обязан быть ровно OK после TrimSpace.
-// Reasoning непосредственно в content — это пользовательский текст и Down.
+// User contract: a separate service reasoning field does not change the
+// classification; the final content must be exactly OK after TrimSpace.
+// Reasoning directly in content is user text and Down.
 func TestClassifyStrictUserContent(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -112,8 +112,8 @@ func TestContentOK(t *testing.T) {
 		{"OK", true},
 		{"  OK  ", true},
 		{"\nOK\r\n", true},
-		{"ok", false},  // регистр важен
-		{"OK.", false}, // ровно «OK»
+		{"ok", false},  // case matters
+		{"OK.", false}, // exactly "OK"
 		{"", false},
 		{"OK OK", false},
 	} {
@@ -124,8 +124,8 @@ func TestContentOK(t *testing.T) {
 }
 
 func TestClassifySkipsCancelled(t *testing.T) {
-	// cancelled — не результат проверки вовсе; отдельного статуса не имеет
-	// (вызывающая сторона обязана отфильтровать его до записи)
+	// cancelled is not a check result at all; it has no separate status
+	// (the caller must filter it out before recording)
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("Classify panicked on cancelled: %v", r)
@@ -134,30 +134,30 @@ func TestClassifySkipsCancelled(t *testing.T) {
 	Classify(mk("cancelled", 0))
 }
 
-// Провайдер сам заявляет недоступность модели — живые формулировки live-аудита
-// (kimi-k2.6 «has been offline», kimi-k3 «model "..." not available», HTTP 400)
-// обязаны давать 🔴; похожие ошибки не про недоступность модели — остаются ⚪.
+// The provider itself declares the model unavailable — live audit wordings
+// (kimi-k2.6 "has been offline", kimi-k3 "model "..." not available", HTTP 400)
+// must yield Down; similar errors not about model unavailability stay Unknown.
 func TestClassifyProviderOfflineMessages(t *testing.T) {
 	cases := []struct {
 		name string
 		res  api.RawResult
 		want Status
 	}{
-		// живые формулировки аудита
+		// live audit wordings
 		{"400 kimi has been offline", msg("http", 400, "The model kimi-k2.6 has been offline"), StatusDown},
 		{"400 kimi not available", msg("http", 400, `model "<待填目标模型>" not available`), StatusDown},
-		// близкие варианты той же семантики
+		// close variants of the same semantics
 		{"400 is offline", msg("http", 400, "The model gpt-x is offline"), StatusDown},
 		{"400 was offline", msg("http", 400, "model was offline during maintenance"), StatusDown},
 		{"422 offline wording", msg("http", 422, "The model kimi-k3 has been offline"), StatusDown},
-		// похожие, но НЕ о недоступности модели
+		// similar, but NOT about model unavailability
 		{"400 upstream error", msg("http", 400, "Upstream error: 400"), StatusUnknown},
 		{"400 incompatible param", msg("http", 400, "Invalid request: parameter 'max_tokens' not available in this mode"), StatusUnknown},
 		{"400 not-available before model", msg("http", 400, "tool use is not available for this model"), StatusUnknown},
 		{"400 no available accounts", msg("http", 400, "No available accounts. Please retry after 12:34 MSK"), StatusUnknown},
 		{"400 request config", msg("http", 400, "Unknown request configuration"), StatusUnknown},
 		{"401 stays unknown despite wording", msg("http", 401, "The model x is offline"), StatusUnknown},
-		// существующие маркеры «модель не найдена» продолжают работать
+		// the existing "model not found" markers keep working
 		{"400 unknown provider", msg("http", 400, "Unknown provider for model 'kimi-k3'"), StatusDown},
 		{"400 invalid model", msg("http", 400, "Invalid model."), StatusDown},
 		{"400 no such model", msg("http", 400, "No such model: gpt-x"), StatusDown},
