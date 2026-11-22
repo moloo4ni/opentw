@@ -3,7 +3,7 @@ package monitor
 import (
 	"testing"
 
-	"opentw/internal/api"
+	"github.com/moloo4ni/opentw/internal/api"
 )
 
 // A router 400 with a missing model/provider message is effectively

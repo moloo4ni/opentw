@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/monitor"
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/monitor"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 func transition(id string, from, to status.Status, at time.Time, incident *storage.Incident) monitor.Transition {

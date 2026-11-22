@@ -4,8 +4,8 @@ package monitor
 import (
 	"strings"
 
-	"opentw/internal/api"
-	"opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/api"
+	"github.com/moloo4ni/opentw/internal/status"
 )
 
 // Status aliases the shared status type for monitor-internal use.

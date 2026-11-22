@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // supervise must return only after ALL components finished: only then is

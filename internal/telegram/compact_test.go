@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // The panel in the reference bot's style: model IDs monospaced (<code>),

@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"opentw/internal/api"
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/api"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // ErrCycleRunning means another monitoring cycle is in progress.

@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // BotCfg configures the bot.

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // A bot restart between opening /subscribe and "Save" does not wipe the

@@ -15,11 +15,11 @@ import (
 	"syscall"
 	"time"
 
-	"opentw/internal/api"
-	"opentw/internal/config"
-	"opentw/internal/monitor"
-	"opentw/internal/storage"
-	"opentw/internal/telegram"
+	"github.com/moloo4ni/opentw/internal/api"
+	"github.com/moloo4ni/opentw/internal/config"
+	"github.com/moloo4ni/opentw/internal/monitor"
+	"github.com/moloo4ni/opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/telegram"
 )
 
 // testPrompt is the standardized probe request, identical for every model.

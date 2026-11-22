@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/status"
 
 	_ "modernc.org/sqlite"
 )

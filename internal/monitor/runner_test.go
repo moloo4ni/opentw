@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/api"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/api"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // fakeAPI is a scriptable api.Client stand-in.

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // The panel must keep the config's model order (families and entries within

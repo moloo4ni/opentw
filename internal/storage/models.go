@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/status"
 )
 
 // Model is a monitored model with its last known state.

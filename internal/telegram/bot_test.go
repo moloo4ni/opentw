@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/monitor"
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/monitor"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 func newBot(t *testing.T, m *mockTG) (*Bot, *storage.Store) {

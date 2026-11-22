@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/api"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/api"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // TestLiveCycle runs one real cycle against the API from the environment.

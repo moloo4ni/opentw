@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"opentw/internal/monitor"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/monitor"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // deliveryPayload is the content of an outbox row: the cycle's events for one

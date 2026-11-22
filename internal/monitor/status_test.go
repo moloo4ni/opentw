@@ -3,7 +3,7 @@ package monitor
 import (
 	"testing"
 
-	"opentw/internal/api"
+	"github.com/moloo4ni/opentw/internal/api"
 )
 
 func mk(kind string, httpStatus int) api.RawResult {

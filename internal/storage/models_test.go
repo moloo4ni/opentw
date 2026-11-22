@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/status"
 )
 
 // Outbox: enqueue → read → mark → empty; dedupe on (chat_id, dedupe_key).

@@ -9,8 +9,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // MSK is the timezone of all times shown in the OpenTW UI.

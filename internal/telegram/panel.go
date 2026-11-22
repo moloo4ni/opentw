@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"opentw/internal/monitor"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/monitor"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 var (

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/status"
 )
 
 // StaleNotifyPairs: a settled state diverging from the notified one is

@@ -1,4 +1,4 @@
-module opentw
+module github.com/moloo4ni/opentw
 
 go 1.27.4
 

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"opentw/internal/status"
-	"opentw/internal/storage"
+	"github.com/moloo4ni/opentw/internal/status"
+	"github.com/moloo4ni/opentw/internal/storage"
 )
 
 // seedModelDetail — a model with a check, so the st: card is complete.
