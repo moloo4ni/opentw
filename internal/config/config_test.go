@@ -19,7 +19,7 @@ func writeFile(t *testing.T, name, content string) string {
 func setEnv(t *testing.T) {
 	t.Setenv("BOT_TOKEN", "123:test-token")
 	t.Setenv("API_KEY", "test-api-key")
-	t.Setenv("API_BASE_URL", "https://kube943.prod.tonworld.ru")
+	t.Setenv("API_BASE_URL", "https://api.example.com")
 }
 
 func TestLoadFullConfig(t *testing.T) {
@@ -51,7 +51,7 @@ models:
 	if cfg.BotToken != "123:test-token" || cfg.APIKey != "test-api-key" {
 		t.Fatalf("secrets not loaded from env")
 	}
-	if cfg.APIBaseURL != "https://kube943.prod.tonworld.ru" {
+	if cfg.APIBaseURL != "https://api.example.com" {
 		t.Fatalf("env must override yaml, got %q", cfg.APIBaseURL)
 	}
 	if cfg.Interval != 10*time.Minute {
